@@ -11483,7 +11483,7 @@ async def stripe_auth_single_check_logic(update: Update, context: ContextTypes.D
         print(f"❌ [Stripe Auth Single] Error: {traceback.format_exc()}")
 
 # --- CONFIG ---
-BOT_TOKEN = "8695085393:AAGXcYIwVXiw1PtQ1CqFusHNaCHeazDL2Ho"
+BOT_TOKEN = "8240924682:AAEq3wiuVUrvEJO6ZuT6LEdq8X8UYIGrHSY"
 OWNER_ID = 6299808404
 PAYPAL_API_BASE = "https://web-production-9c43d.up.railway.app"
 
@@ -19839,16 +19839,14 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ═══════════════════════════════════════════════════════════════════
     #  Build message body — same format as real hits
     # ═══════════════════════════════════════════════════════════════════
+    sparkle_emoji = premium_emoji("5893321843149902412", "✨")
+
     def build_hit_message(username: str, price_display: str, response_text: str) -> str:
         return (
-            f'{pe("diamond", "💎")} '
-            f'<b>Gateway</b> ➛ {gateway_display}\n'
-            f'{pe("flower", "🌸")} '
-            f'<b>Price</b> ➛ {price_display}\n'
-            f'{pe("doller", "💵")} '
-            f'<b>Response</b> ➛ {response_text}\n'
-            f'{pe("toy", "📍")} '
-            f'<b>User</b> ➛ {username}\n'
+            f'<b>{gateway_display}</b> {pe("diamond", "💎")}\n'
+            f'{sparkle_emoji} <b>Price</b> ➛ {price_display}\n'
+            f'{sparkle_emoji} <b>Response</b> ➛ {response_text}\n'
+            f'{sparkle_emoji} <b>User</b> ➛ {username}\n'
         )
         
        
@@ -23072,11 +23070,13 @@ async def send_hit_notification(context: ContextTypes.DEFAULT_TYPE,
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
+    sparkle_emoji = premium_emoji("5893321843149902412", "✨")
+
     hit_message = (
-        f'<tg-emoji emoji-id="{PREMIUM_EMOJI_IDS["diamond"]}">💎</tg-emoji> <b>Gateway</b> ➛ {gateway}\n'
-        f'<tg-emoji emoji-id="{PREMIUM_EMOJI_IDS["flower"]}">🌸</tg-emoji> <b>Price</b> ➛ {price_display}\n'
-        f'<tg-emoji emoji-id="{PREMIUM_EMOJI_IDS["doller"]}">💵</tg-emoji> <b>Response</b> ➛ {clean_response}\n'
-        f'<tg-emoji emoji-id="{PREMIUM_EMOJI_IDS["toy"]}">📍</tg-emoji> <b>User</b> ➛ {user_display}'
+        f'<b>{gateway}</b> <tg-emoji emoji-id="{PREMIUM_EMOJI_IDS["diamond"]}">💎</tg-emoji>\n'
+        f'{sparkle_emoji} <b>Price</b> ➛ {price_display}\n'
+        f'{sparkle_emoji} <b>Response</b> ➛ {clean_response}\n'
+        f'{sparkle_emoji} <b>User</b> ➛ {user_display}'
     )
     
     try:
@@ -32511,14 +32511,13 @@ def strip5_format_result(status_category: str, response_text: str,
     country_name = (country or "Unknown").replace("🌐", "").strip()
 
     return (
-        f"<b>Strip £5</b> {diamond_emoji}\n\n"
-        f"{flower_emoji} 𝗖𝗔𝗥𝗗  ↣ <code>{card}</code>\n\n"
-        f"{emoji} 𝗦𝘁𝗮𝘁𝘂𝘀  ↣ {label}\n"
-        f"{toy_emoji} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲  ↣  {clean_resp}\n"
-        f"{doller_emoji} 𝗣𝗿𝗶𝗰𝗲  ↣  £5.00\n\n"
-        f"{id_emoji} 𝗕𝗜𝗡  ↣  {bin_info_text}\n"
-        f"{bank_emoji} 𝗕𝗮𝗻𝗸  ↣  {bank}\n"
-        f"{star_emoji} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆  ↣  {country_name}"
+        f"<b>Strip £5</b> {premium_emoji('5895770017458294953', '💫')}\n\n"
+        f"{premium_emoji('5893494861612455015', '⭐️')} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+        f"{emoji} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_resp}</code>\n"
+        f"{premium_emoji('6039802097916974085', '🪙')} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>£5.00</b>\n\n"
+        f"{premium_emoji('5902242339899838759', '🌐')} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{premium_emoji('6041705726206808304', '🚀')} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+        f"{premium_emoji('5904542823167824187', '🗑')} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
 # ============================================================
 #   /st  —  SINGLE CHECK
@@ -35942,14 +35941,17 @@ def format_paypal_key_response(result: Dict, card: str, bin_info: tuple,
                 break
         country_display = f"{flag}  {country_name}"
 
+    _sc = str(status_category).lower()
+    resp_icon = premium_emoji("5902002809573740949", "✅") if any(k in _sc for k in ("approved", "charged", "success", "live")) else ("❌" if "declin" in _sc else "⚠️")
+
     ui = (
-        f"<b>{PAYPAL_KEY_LABEL}</b> {diamond_emoji}\n\n"
-        f"{flower_emoji} 𝗖𝗔𝗥𝗗  ↣ <code>{card}</code>\n\n"
-        f"{toy_emoji} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲  ↣  {clean_response}\n"
-        f"{doller_emoji} 𝗣𝗿𝗶𝗰𝗲  ↣  {price_str}\n\n"
-        f"{id_emoji} 𝗕𝗜𝗡  ↣  {bin_info_text}\n"
-        f"{bank_emoji} 𝗕𝗮𝗻𝗸  ↣  {bank_display}\n"
-        f" {star_emoji} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆  ↣  {country_display}"
+        f"<b>{PAYPAL_KEY_LABEL}</b> {premium_emoji('5895770017458294953', '💫')}\n\n"
+        f"{premium_emoji('5893494861612455015', '⭐️')} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+        f"{resp_icon} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_response}</code>\n"
+        f"{premium_emoji('6039802097916974085', '🪙')} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price_str}</b>\n\n"
+        f"{premium_emoji('5902242339899838759', '🌐')} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{premium_emoji('6041705726206808304', '🚀')} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{premium_emoji('5904542823167824187', '🗑')} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_display}</b>"
     )
     return ui, status_category
 
@@ -41838,14 +41840,17 @@ def format_shopify_mass_response(result: Dict, card: str, bin_info: tuple) -> Tu
     # ─────────────────────────────────────────────────────────────────
     #  8) BUILD FINAL STYLISH OUTPUT
     # ─────────────────────────────────────────────────────────────────
+    _sc = str(status_category).lower()
+    resp_icon = premium_emoji("5902002809573740949", "✅") if any(k in _sc for k in ("approved", "charged", "success", "live")) else ("❌" if "declin" in _sc else "⚠️")
+
     ui = (
-        f"<b>{gateway}</b> {diamond_emoji}\n\n"
-        f"{flower_emoji} 𝗖𝗔𝗥𝗗  ↣ <code>{card}</code>\n\n"
-        f"{toy_emoji} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲  ↣  {clean_response}\n"
-        f"{doller_emoji} 𝗣𝗿𝗶𝗰𝗲  ↣  {price_display}\n\n"
-        f"{id_emoji} 𝗕𝗜𝗡  ↣  {bin_info_text}\n"
-        f"{bank_emoji} 𝗕𝗮𝗻𝗸  ↣  {bank_display}\n"
-        f"{star_emoji} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆  ↣  {country_display}"
+        f"<b>{gateway}</b> {premium_emoji('5895770017458294953', '💫')}\n\n"
+        f"{premium_emoji('5893494861612455015', '⭐️')} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+        f"{resp_icon} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_response}</code>\n"
+        f"{premium_emoji('6039802097916974085', '🪙')} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price_display}</b>\n\n"
+        f"{premium_emoji('5902242339899838759', '🌐')} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{premium_emoji('6041705726206808304', '🚀')} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{premium_emoji('5904542823167824187', '🗑')} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_display}</b>"
     )
 
     return ui, status_category
@@ -44274,14 +44279,17 @@ def _sk_format_result(result: dict, card: str, bin_info: tuple) -> tuple:
     price_str = "0.65$"
 
     # ── Same layout as Shopify ──────────────────────────────────────────
+    _sc = str(category).lower()
+    resp_icon = premium_emoji("5902002809573740949", "✅") if any(k in _sc for k in ("approved", "charged", "success", "live")) else ("❌" if "declin" in _sc else "⚠️")
+
     ui = (
-        f"<b>Stripe SK Charge</b> {diamond_emoji}\n\n"
-        f"{flower_emoji} 𝗖𝗔𝗥𝗗  ↣ <code>{card}</code>\n\n"
-        f"{toy_emoji} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲  ↣  {clean_response}\n"
-        f"{doller_emoji} 𝗣𝗿𝗶𝗰𝗲  ↣  {price_str}\n\n"
-        f"{id_emoji} 𝗕𝗜𝗡  ↣  {brand}\n"
-        f"{bank_emoji} 𝗕𝗮𝗻𝗸  ↣  {bank_display}\n"
-        f" {star_emoji} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆  ↣  {country_display}"
+        f"<b>Stripe SK Charge</b> {premium_emoji('5895770017458294953', '💫')}\n\n"
+        f"{premium_emoji('5893494861612455015', '⭐️')} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+        f"{resp_icon} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_response}</code>\n"
+        f"{premium_emoji('6039802097916974085', '🪙')} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price_str}</b>\n\n"
+        f"{premium_emoji('5902242339899838759', '🌐')} 𝗕𝗜𝗡 ↣ <b>{brand}</b>\n"
+        f"{premium_emoji('6041705726206808304', '🚀')} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{premium_emoji('5904542823167824187', '🗑')} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_display}</b>"
     )
 
     return ui, category
@@ -47386,15 +47394,17 @@ def format_bt_kaffn8_response(result: Dict, card: str, bin_info: tuple) -> Tuple
     bank_emoji    = premium_emoji(PREMIUM_EMOJI_IDS.get("bank",    "5332455502917949981"), "🏦")
     star_emoji    = premium_emoji(PREMIUM_EMOJI_IDS.get("star",    "6282793227057632654"), "⭐")
 
-    # ── Output (Shopify-style layout) ─────────────────────────────────────
+    # ── Output (new sparkle-style layout) ───────────────────────────────
+    resp_icon = premium_emoji("5902002809573740949", "✅") if status_key == "approved" else ("❌" if status_key == "declined" else "⚠️")
+
     ui = (
-        f"<b>{gateway_name}</b> {diamond_emoji}\n\n"
-        f"{flower_emoji} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
-        f"{toy_emoji} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ {clean_response}\n"
-        f"{doller_emoji} 𝗣𝗿𝗶𝗰𝗲 ↣ 0$\n\n"
-        f"{id_emoji} 𝗕𝗜𝗡 ↣ {bin_info_text}\n"
-        f"{bank_emoji} 𝗕𝗮𝗻𝗸 ↣ {bank_display}\n"
-        f"{star_emoji} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ {country_display}"
+        f"<b>{gateway_name}</b> {premium_emoji('5895770017458294953', '💫')}\n\n"
+        f"{premium_emoji('5893494861612455015', '⭐️')} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
+        f"{resp_icon} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_response}</code>\n"
+        f"{premium_emoji('6039802097916974085', '🪙')} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>0$</b>\n\n"
+        f"{premium_emoji('5902242339899838759', '🌐')} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{premium_emoji('6041705726206808304', '🚀')} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{premium_emoji('5904542823167824187', '🗑')} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_display}</b>"
     )
 
     return ui, status_key
@@ -48427,14 +48437,17 @@ def format_shopify_single_response(result: Dict, card: str, bin_info: tuple) -> 
         country_display = f"{flag}  {country_name}"
 
     # ── Build the output ────────────────────────────────────────────
+    _sc = str(status_category).lower()
+    resp_icon = premium_emoji("5902002809573740949", "✅") if any(k in _sc for k in ("approved", "charged", "success", "live")) else ("❌" if "declin" in _sc else "⚠️")
+
     ui = (
-        f"<b>{gateway}</b> {DIAMOND}\n\n"
-        f"{FLOWER} 𝗖𝗔𝗥𝗗  ↣ <code>{card}</code>\n\n"
-        f"{TOY} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲  ↣  {clean_response}\n"
-        f"{DOLLER} 𝗣𝗿𝗶𝗰𝗲  ↣  {price_str}\n\n"
-        f"{ID} 𝗕𝗜𝗡  ↣  {bin_info_text}\n"
-        f"{BANK} 𝗕𝗮𝗻𝗸  ↣  {bank_display}\n"
-        f"{SUCCESS} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆  ↣  {country_display}"
+        f"<b>{gateway}</b> {premium_emoji('5895770017458294953', '💫')}\n\n"
+        f"{premium_emoji('5893494861612455015', '⭐️')} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+        f"{resp_icon} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_response}</code>\n"
+        f"{premium_emoji('6039802097916974085', '🪙')} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price_str}</b>\n\n"
+        f"{premium_emoji('5902242339899838759', '🌐')} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{premium_emoji('6041705726206808304', '🚀')} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{premium_emoji('5904542823167824187', '🗑')} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_display}</b>"
     )
 
     return ui, status_category
@@ -48566,14 +48579,17 @@ async def single_check_shopify_pool(update: Update, context: ContextTypes.DEFAUL
         # ══════════════════════════════════════════════════════════════
         #  BUILD STYLISH OUTPUT (with premium emojis)
         # ══════════════════════════════════════════════════════════════
+        _sc = str(status_category).lower()
+        resp_icon = premium_emoji("5902002809573740949", "✅") if any(k in _sc for k in ("approved", "charged", "success", "live")) else ("❌" if "declin" in _sc else "⚠️")
+
         output = (
-            f"<b>{gateway_name}</b> {diamond_emoji}\n\n"
-            f"{flower_emoji} 𝗖𝗔𝗥𝗗  ↣ <code>{card}</code>\n\n"
-            f"{toy_emoji} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲  ↣  {clean_response}\n"
-            f"{doller_emoji} 𝗣𝗿𝗶𝗰𝗲  ↣  {price_str}\n\n"
-            f"{id_emoji} 𝗕𝗜𝗡  ↣  {bin_info_text}\n"
-            f"{bank_emoji} 𝗕𝗮𝗻𝗸  ↣  {bank_display}\n"
-            f" {star_emoji} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆  ↣  {country_display}"
+            f"<b>{gateway_name}</b> {premium_emoji('5895770017458294953', '💫')}\n\n"
+            f"{premium_emoji('5893494861612455015', '⭐️')} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+            f"{resp_icon} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_response}</code>\n"
+            f"{premium_emoji('6039802097916974085', '🪙')} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price_str}</b>\n\n"
+            f"{premium_emoji('5902242339899838759', '🌐')} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+            f"{premium_emoji('6041705726206808304', '🚀')} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+            f"{premium_emoji('5904542823167824187', '🗑')} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_display}</b>"
         )
 
         # ── Delete "Checking..." and send result ──────────────────────
@@ -48868,43 +48884,33 @@ async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     username = user.username or user.first_name
     
-    diamond_emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("diamond", "5427168083074628963"), "💎")
-    
+    money_emoji  = premium_emoji(PREMIUM_EMOJI_IDS.get("money", "5197434882321567830"), "💰")
+    fire_emoji   = premium_emoji(PREMIUM_EMOJI_IDS.get("fire",  "5211438057774783669"), "🔥")
+
     message = (
-        f"{diamond_emoji} <b>P R E M I U M  P L A N S</b>\n"
-        f"\n\n"
-        f"<b>ᴘʟᴀɴ 0: Tᴇsᴛ</b> 🔥\n"
-        f"   Aᴄᴄᴇꜱꜱ ➺ Test\n"
-        f"   Sᴘᴀɴ ➺ 1 Dᴀʏ\n"
-        f"   Pʀɪᴄᴇ ➺ $2\n"
-        f"\n\n"
-        f"<b>ᴘʟᴀɴ 1: Lɪᴛᴇ</b> 🔥\n"
-        f"   Aᴄᴄᴇꜱꜱ ➺ Lite\n"
-        f"   Sᴘᴀɴ ➺ 7 Dᴀʏꜱ\n"
-        f"   Pʀɪᴄᴇ ➺ $5\n"
-        f"\n\n"
-        f"<b>ᴘʟᴀɴ 2: Cʀᴏᴡɴ</b> 🔥\n"
-        f"   Aᴄᴄᴇꜱꜱ ➺ Crown\n"
-        f"   Sᴘᴀɴ ➺ 15 Dᴀʏꜱ\n"
-        f"   Pʀɪᴄᴇ ➺ $10\n"
-        f"\n\n"
-        f"<b>ᴘʟᴀɴ 3: Mᴇᴍʙᴇʀ</b> 🔥\n"
-        f"   Aᴄᴄᴇꜱꜱ ➺ Member\n"
-        f"   Sᴘᴀɴ ➺ 30 Dᴀʏꜱ\n"
-        f"   Pʀɪᴄᴇ ➺ $20\n"
-
-
+        f"{money_emoji} <b>PREMIUM PLANS</b>\n"
+        f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+        f"{fire_emoji}  <b>Test</b>\n"
+        f"<code>    $2  ·  1 day  ·  Trial</code>\n\n"
+        f"⚡  <b>Lite</b>\n"
+        f"<code>    $5  ·  7 days</code>\n\n"
+        f"👑  <b>Crown</b>\n"
+        f"<code>    $10 ·  15 days</code>\n\n"
+        f"😈  <b>Member</b>\n"
+        f"<code>    $20 ·  30 days</code>\n"
+        f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+        f"Select a plan below to continue"
     )
-    
+
     keyboard = [
         [
-            InlineKeyboardButton(" Test ", callback_data='buy_plan_test', style='primary'),
-            InlineKeyboardButton(" Lite ", callback_data='buy_plan_lite', style='primary')
+            InlineKeyboardButton("🔥 Test  · $2",  callback_data='buy_plan_test',   style='primary'),
+            InlineKeyboardButton("⚡ Lite  · $5",  callback_data='buy_plan_lite',   style='primary'),
         ],
         [
-            InlineKeyboardButton(" Crown ", callback_data='buy_plan_crown', style='success'),
-            InlineKeyboardButton(" Member ", callback_data='buy_plan_member', style='success')
-        ]
+            InlineKeyboardButton("👑 Crown · $10", callback_data='buy_plan_crown',  style='success'),
+            InlineKeyboardButton("😈 Member· $20", callback_data='buy_plan_member', style='success'),
+        ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -65004,13 +65010,13 @@ async def autosopi_mass_check_logic(update: Update, context: ContextTypes.DEFAUL
 
                 # ── Stylish output ───────────────────────────────────
                 output = (
-                    f"<b>{gateway_from_response}</b> {diamond_emoji}\n\n"
-                    f"{flower_emoji} 𝗖𝗔𝗥𝗗  ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
-                    f"{toy_emoji} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲  ↣  {clean_response}\n"
-                    f"{doller_emoji} 𝗣𝗿𝗶𝗰𝗲  ↣  {price_str}\n\n"
-                    f"{id_emoji_r} 𝗕𝗜𝗡  ↣  {bin_text}\n"
-                    f"{bank_emoji} 𝗕𝗮𝗻𝗸  ↣  {bank_display}\n"
-                    f"{star_emoji} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆  ↣  {country_display}"
+                    f"<b>{gateway_from_response}</b> {premium_emoji('5895770017458294953', '💫')}\n\n"
+                    f"{premium_emoji('5893494861612455015', '⭐️')} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
+                    f"{premium_emoji('5902002809573740949', '✅')} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_response}</code>\n"
+                    f"{premium_emoji('6039802097916974085', '🪙')} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price_str}</b>\n\n"
+                    f"{premium_emoji('5902242339899838759', '🌐')} 𝗕𝗜𝗡 ↣ <b>{bin_text}</b>\n"
+                    f"{premium_emoji('6041705726206808304', '🚀')} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+                    f"{premium_emoji('5904542823167824187', '🗑')} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_display}</b>"
                 )
 
                 await message.reply_text(output, parse_mode=ParseMode.HTML)
@@ -73490,33 +73496,38 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     skull_emoji     = premium_emoji(PREMIUM_EMOJI_IDS.get("skull",   "5042167377869932162"), "💀")
     fllower_emoji     = premium_emoji(PREMIUM_EMOJI_IDS.get("fllower",   "6269135402855044481"), "📍")
 
-    # ============ MESSAGE ============
+    # New premium emojis for the dark-minimal header card
+    online_emoji = premium_emoji("6235252066554484059", "🟢")
+    tag_emoji    = premium_emoji("6235459831302460476", "🏷")
+    wallet_emoji = premium_emoji("6266967801580231067", "💳")
+    badge_emoji  = premium_emoji("6266858606331696360", "🆔")
+
+    # ============ MESSAGE — dark minimal style ============
+    tier_badge = {
+        "free": "FREE", "premium": "PREMIUM",
+        "ultimate": "ULTIMATE", "admin": "ADMIN"
+    }.get(tier, tier_upper)
+
     message = (
-        f"{diamond_emoji} <b>Welcome to BLADESARKS</b>\n\n"
-        f"{star_emoji} <b>Status :</b> Active ✔️\n\n"
-        f"{user_emoji} <b>User :</b> {display_name}\n"
-        f"{id_emoji} <b>ID :</b> <code>{user.id}</code>\n"
-        f"\n"
-        f"<b>Access ➳</b> {tier_upper}\n"
-        f"<b>Credits ➳</b> {credits_display}\n\n"
-        f"{fllower_emoji} <b>Dev ➳</b> <a href=\"https://t.me/lencax\">lencax</a>"
+        f"{online_emoji} <b>BLADESARKS</b> · <i>ACTIVE</i>\n\n"
+        f"Hello, <b>{display_name}</b>\n"
+        f"<code>━━━━━━━━━━━━━━━━━</code>\n"
+        f"{tag_emoji} Tier: <b>{tier_badge}</b>    {wallet_emoji} Credits: <b>{credits_display}</b>\n\n"
+        f"{badge_emoji} <code>{user.id}</code>  ·  <a href=\"https://t.me/lencax\">Dev</a>"
     )
 
     # ============ KEYBOARD ============
     keyboard = [
         [
-            InlineKeyboardButton(" Checker", callback_data='show_checker', style='primary'),
-            InlineKeyboardButton(" Hitter",  callback_data='show_hitter',  style='danger'),
+            InlineKeyboardButton("⚡ Checker", callback_data='show_checker', style='primary'),
+            InlineKeyboardButton("💀 Hitter",  callback_data='show_hitter',  style='danger'),
         ],
         [
-            InlineKeyboardButton(" Buy Now",  callback_data='show_plans',   style='success'),
-            InlineKeyboardButton(" Contact",  callback_data='show_contact', style='primary'),
+            InlineKeyboardButton("💰 Buy Now",  callback_data='show_plans',   style='success'),
+            InlineKeyboardButton("🔮 Contact",  callback_data='show_contact', style='primary'),
         ],
         [
-            InlineKeyboardButton(" 🎁 Refer & Earn", callback_data='show_refer', style='success'),
-        ],
-        [
-            InlineKeyboardButton(" ⚙️ Settings", callback_data='settings_menu', style='primary'),
+            InlineKeyboardButton("🎁 Refer & Earn", callback_data='show_refer', style='success'),
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -73696,18 +73707,22 @@ def build_referral_text(user_id: int, bot_username: str) -> str:
         recent = "\n\n🧾 <b>Recent</b>\n" + "\n".join(lines)
 
     return (
-        f"🎁 <b>Refer & Earn</b>\n\n"
-        f"Share your link — when a friend starts the bot with it, "
-        f"<b>you</b> get <b>3 hours</b> of Ultimate tier, free.\n\n"
-        f"If they later buy a plan, you get an even bigger bonus:\n"
-        f"   🔥 Lite   ➛ +1 day Ultimate\n"
-        f"   🔥 Crown  ➛ +3 days Ultimate\n"
-        f"   🔥 Member ➛ +5 days Ultimate\n\n"
-        f"🔗 <b>Your link</b>\n<code>{ref_link}</code>\n\n"
-        f"👥 <b>Friends referred</b> ➛ {total_referrals}\n"
-        f"✅ <b>Confirmed (bought)</b> ➛ {confirmed}\n"
-        f"🕓 <b>Pending</b> ➛ {pending}\n"
-        f"💎 <b>Total bonus earned</b> ➛ {bonus_hours_total}h"
+        f"<b>🎁 REFER & EARN</b>\n"
+        f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+        f"Share your link. When a friend joins:\n"
+        f"  → You get <b>3h Ultimate</b> instantly\n\n"
+        f"When they buy a plan:\n"
+        f"  🔥 Lite   → <b>+1 day</b> Ultimate\n"
+        f"  👑 Crown  → <b>+3 days</b> Ultimate\n"
+        f"  😈 Member → <b>+5 days</b> Ultimate\n"
+        f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+        f"🔗 <b>Your link</b>\n"
+        f"<code>{ref_link}</code>\n"
+        f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+        f"👥  Referred   <b>{total_referrals}</b>\n"
+        f"✅  Confirmed  <b>{confirmed}</b>\n"
+        f"🕓  Pending    <b>{pending}</b>\n"
+        f"⏱   Bonus earned  <b>{bonus_hours_total}h</b>"
         f"{active_boost}"
         f"{recent}"
     )
@@ -73872,25 +73887,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ============ CHECKER ============
     if query.data == 'show_checker':
         text = (
-            f'{premium_emoji(PREMIUM_EMOJI_IDS["card"], "🛍️")} '
-            f'<b>CHECKER GATEWAYS</b>\n\n'
-            f'\n'
-            f' <b>Shopify</b>\n'
-            f'   /sh - Single check\n'
-            f'   /msh - Mass check\n\n'
-            f' <b> Stripe Auth </b>\n'
-            f'   /chk - Single check\n'
-            f'   /mchk - Mass check\n\n'
-            f' <b>Strip_5$</b>\n'
-            f'   /st - Single check\n'
-            f'   /mst - Mass check\n\n'
-            f' <b>Stripe SK Charge</b>\n'
-            f'   /sk - Single check\n'
-            f'   /msk - Mass check\n\n'
-            f' <b>Braintree Auth</b>\n'
-            f'   /bt - Single check\n\n'
+            f"<b>⚡ CHECKER GATEWAYS</b>\n"
+            f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+            f"🛍  <b>Shopify</b>\n"
+            f"<code>   /sh</code>  single   <code>/msh</code>  mass\n\n"
+            f"💳  <b>Stripe Auth</b>\n"
+            f"<code>   /chk</code> single   <code>/mchk</code> mass\n\n"
+            f"💵  <b>Strip $5</b>\n"
+            f"<code>   /st</code>  single   <code>/mst</code>  mass\n\n"
+            f"🔑  <b>Stripe SK Charge</b>\n"
+            f"<code>   /sk</code>  single   <code>/msk</code>  mass\n\n"
+            f"🌿  <b>Braintree Auth</b>\n"
+            f"<code>   /bt</code>  single\n"
+            f"<code>━━━━━━━━━━━━━━━━━━━━━</code>"
         )
-        
         keyboard = [
             [InlineKeyboardButton("🔙 Back", callback_data='back_main', style='danger')]
         ]
@@ -73900,27 +73910,40 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ============ HITTER ============
     elif query.data == 'show_hitter':
         text = (
-            f' /stco - Strip Hitter\n\n'
-            f' /jhit - Jio Hitter \n\n'
-            f' /whoop - Whoop Hitter\n'
+            f"<b>💀 HITTER TOOLS</b>\n"
+            f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+            f"🔥  <b>Strip Hitter</b>\n"
+            f"<code>   /stco</code>\n\n"
+            f"📡  <b>Jio Hitter</b>\n"
+            f"<code>   /jhit</code>\n\n"
+            f"🎯  <b>Whoop Hitter</b>\n"
+            f"<code>   /whoop</code>\n"
+            f"<code>━━━━━━━━━━━━━━━━━━━━━</code>"
         )
-        
         keyboard = [
             [InlineKeyboardButton("🔙 Back", callback_data='back_main', style='danger')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
     
-    # ============ PLANS (SAME AS /buy) ============
+    # ============ PLANS ============
     elif query.data == 'show_plans':
-        fire_emoji = premium_emoji(PREMIUM_EMOJI_IDS["fire"], "🔥")
-        
+        money_emoji  = premium_emoji(PREMIUM_EMOJI_IDS.get("money", "5197434882321567830"), "💰")
+        fire_emoji   = premium_emoji(PREMIUM_EMOJI_IDS.get("fire",  "5211438057774783669"), "🔥")
+
         text = (
-            f" USE /buy"
+            f"{money_emoji} <b>PREMIUM PLANS</b>\n"
+            f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+            f"{fire_emoji}  <b>Test</b>    · $2  · 1 day\n"
+            f"⚡  <b>Lite</b>    · $5  · 7 days\n"
+            f"👑  <b>Crown</b>   · $10 · 15 days\n"
+            f"😈  <b>Member</b>  · $20 · 30 days\n"
+            f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+            f"Use <code>/buy</code> to purchase a plan"
         )
-        
         keyboard = [
-            [InlineKeyboardButton("🔙 Back", callback_data='back_main', style='danger')]
+            [InlineKeyboardButton("🛒 Open /buy", callback_data='goto_buy', style='success')],
+            [InlineKeyboardButton("🔙 Back", callback_data='back_main', style='danger')],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
@@ -73929,30 +73952,24 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == 'show_profile':
         stats = user_manager.get_user_stats(user.id)
         tier = stats['tier']
-        tier_emojis = {"free": "🆓", "premium": "🔥", "ultimate": "😈", "admin": "🏴"}
-        tier_emoji = tier_emojis.get(tier, "🆓")
-        
+        tier_icons = {"free": "🆓", "premium": "⚡", "ultimate": "😈", "admin": "🏴"}
+        tier_icon = tier_icons.get(tier, "🆓")
+
         text = (
-            f'{premium_emoji(PREMIUM_EMOJI_IDS["users"], "👤")} '
-            f'<b>YOUR PROFILE</b>\n\n'
-            f'{premium_emoji(PREMIUM_EMOJI_IDS["bin"], "🆔")} '
-            f'<b>ID</b> <code>{user.id}</code>\n'
-            f'{premium_emoji(PREMIUM_EMOJI_IDS["users"], "👤")} '
-            f'<b>User</b> @{user.username or "None"}\n'
-            f'{premium_emoji(PREMIUM_EMOJI_IDS["card"], "📛")} '
-            f'<b>Name</b> {user.first_name} [ {tier_emoji} {tier.upper()} ]\n\n'
-            f'{premium_emoji(PREMIUM_EMOJI_IDS["stats"], "📊")} '
-            f'<b>Stats</b>\n'
-            f'   Total Checks: {stats["total_checks"]}\n'
-            f'   Total Hits: {stats["total_hits"]}\n'
-            f'   Today: {stats["daily_checks"]}\n\n'
-            f'{premium_emoji(PREMIUM_EMOJI_IDS["money"], "💎")} '
-            f'<b>Credits</b>\n'
-            f'   {stats.get("credits", 0)} credits\n\n'
-            f'{premium_emoji(PREMIUM_EMOJI_IDS["clock"], "⏱️")} '
-            f'<b>Joined</b> {stats["joined"]}'
+            f"<b>👤 YOUR PROFILE</b>\n"
+            f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+            f"🆔  ID       <code>{user.id}</code>\n"
+            f"👤  User     <code>@{user.username or 'None'}</code>\n"
+            f"📛  Name     <code>{user.first_name}</code>\n"
+            f"🏷  Tier     <b>{tier_icon} {tier.upper()}</b>\n"
+            f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+            f"📊  Checks   <b>{stats['total_checks']}</b>  (today: {stats['daily_checks']})\n"
+            f"🎯  Hits     <b>{stats['total_hits']}</b>\n"
+            f"💳  Credits  <b>{stats.get('credits', 0)}</b>\n"
+            f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+            f"📅  Joined   <code>{stats['joined']}</code>"
         )
-        
+
         keyboard = [
             [InlineKeyboardButton("🔙 Back", callback_data='back_main', style='danger')]
         ]
@@ -73962,67 +73979,54 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ============ COMMANDS ============
     elif query.data == 'show_commands':
         text = (
-            f'{premium_emoji(PREMIUM_EMOJI_IDS["toy"], "⌨️")} '
-            f'<b>ALL COMMANDS</b>\n\n'
-            f'{premium_emoji(PREMIUM_EMOJI_IDS["card"], "🛍️")} '
-            f'<b>Gateways</b>\n'
-            f'   /sh, /msh - Shopify\n'
-            f'   /st, /mst - Stripe $1\n'
-            f'   /rz, /mrz - Razorpay\n'
-            f'   /pp, /mpp - PayPal\n'
-            f'   /chk, /mchk - Auto Stripe\n'
-            f'   /btn, /btnm - Braintree\n\n'
-            f'{premium_emoji(PREMIUM_EMOJI_IDS["target"], "🎯")} '
-            f'<b>Tools</b>\n'
-            f'   /bin - BIN Lookup\n'
-            f'   /dork - Smart Dork\n'
-            f'   /me - Your Stats\n'
-            f'   /top - Leaderboard\n\n'
-            f'{premium_emoji(PREMIUM_EMOJI_IDS["money"], "💎")} '
-            f'<b>Credits</b>\n'
-            f'   /credits - Check balance\n'
-            f'   /redeemcredits - Redeem key\n\n'
-            f'{premium_emoji(PREMIUM_EMOJI_IDS["lock"], "🔐")} '
-            f'<b>Proxy</b>\n'
-            f'   /addmyproxy - Add proxy\n'
-            f'   /pt - Test proxies\n\n'
-            f'{premium_emoji(PREMIUM_EMOJI_IDS["skull"], "💀")} '
-            f'<b>Admin</b>\n'
-            f'   /genkey - Generate key\n'
-            f'   /users - List users'
+            f"<b>⌨️ ALL COMMANDS</b>\n"
+            f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+            f"⚡ <b>Checkers</b>\n"
+            f"<code>  /sh /msh</code>   Shopify\n"
+            f"<code>  /st /mst</code>   Stripe $5\n"
+            f"<code>  /chk /mchk</code> Stripe Auth\n"
+            f"<code>  /pp /mpp</code>   PayPal\n"
+            f"<code>  /btn /btnm</code> Braintree\n"
+            f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+            f"🛠 <b>Tools</b>\n"
+            f"<code>  /bin</code>  BIN Lookup\n"
+            f"<code>  /me</code>   Your Stats\n"
+            f"<code>  /top</code>  Leaderboard\n"
+            f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+            f"💳 <b>Credits</b>\n"
+            f"<code>  /credits  /redeemcredits</code>\n"
+            f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+            f"🔌 <b>Proxy</b>\n"
+            f"<code>  /addmyproxy  /pt</code>"
         )
-        
         keyboard = [
             [InlineKeyboardButton("🔙 Back", callback_data='back_main', style='danger')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+
+    # ============ GOTO BUY ============
+    elif query.data == 'goto_buy':
+        await buy_command(update, context)
     
     # ============ CONTACT ============
     elif query.data == 'show_contact':
         text = (
-            f'{premium_emoji(PREMIUM_EMOJI_IDS["diamond"], "📞")} '
-            f'<b>CONTACT</b>\n\n'
-            f'{premium_emoji(PREMIUM_EMOJI_IDS["skull"], "💀")} '
-            f'<b>Bot</b> @BLADESARKS_V3bot\n\n'
-            f'{premium_emoji(PREMIUM_EMOJI_IDS["users"], "👤")} '
-            f'<b>Developer</b>\n'
-            f'   @lencax\n\n'
-            f'{premium_emoji(PREMIUM_EMOJI_IDS["globe"], "🌐")} '
-            f'<b>Group</b>\n'
-            f'   <a href="https://t.me/+a-_7PTkBTe81MGY1">Join Group</a>\n\n'
-            f'{premium_emoji(PREMIUM_EMOJI_IDS["info"], "ℹ️")} '
-            f'<b>Support</b>\n'
-            f'   For issues, feedback or upgrades\n'
-            f'   Contact @lencax'
+            f"<b>🔮 CONTACT</b>\n"
+            f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+            f"🤖  Bot     <code>@BLADESARKS_V3bot</code>\n"
+            f"👤  Dev     <a href=\"https://t.me/lencax\">@lencax</a>\n"
+            f"🌐  Group   <a href=\"https://t.me/+a-_7PTkBTe81MGY1\">Join here</a>\n"
+            f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+            f"ℹ️  For issues, upgrades or feedback\n"
+            f"    DM <a href=\"https://t.me/lencax\">@lencax</a> directly"
         )
-        
         keyboard = [
             [
-                InlineKeyboardButton("📞 Contact @lencax", url="https://t.me/lencax", style='primary'),
-                InlineKeyboardButton("📢 Join Group", url="https://t.me/+a-_7PTkBTe81MGY1", style='success')
+                InlineKeyboardButton("💬 DM Dev", url="https://t.me/lencax", style='primary'),
+                InlineKeyboardButton("📢 Join Group", url="https://t.me/+a-_7PTkBTe81MGY1", style='success'),
             ],
-            [InlineKeyboardButton("🔙 Back", callback_data='back_main', style='danger')]
+            [InlineKeyboardButton("🔙 Back", callback_data='back_main', style='danger')],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
@@ -74065,36 +74069,41 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         money_emoji     = premium_emoji(PREMIUM_EMOJI_IDS.get("money",   "5438548621127615575"), "💰")
         skull_emoji     = premium_emoji(PREMIUM_EMOJI_IDS.get("skull",   "5042167377869932162"), "💀")
         fllower_emoji   = premium_emoji(PREMIUM_EMOJI_IDS.get("fllower", "6269135402855044481"), "📍")
-        
+
+        # New premium emojis for the dark-minimal header card
+        online_emoji = premium_emoji("6235252066554484059", "🟢")
+        tag_emoji    = premium_emoji("6235459831302460476", "🏷")
+        wallet_emoji = premium_emoji("6266967801580231067", "💳")
+        badge_emoji  = premium_emoji("6266858606331696360", "🆔")
+
+        tier_badge = {
+            "free": "FREE", "premium": "PREMIUM",
+            "ultimate": "ULTIMATE", "admin": "ADMIN"
+        }.get(tier, tier_upper)
+
         text = (
-            f"{diamond_emoji} <b>Welcome to BLADESARKS</b>\n\n"
-            f"{star_emoji} <b>Status :</b> Active ✔️\n\n"
-            f"{user_emoji} <b>User :</b> {display_name}\n"
-            f"{id_emoji} <b>ID :</b> <code>{user.id}</code>\n"
-            f"\n"
-            f"<b>Access ➳</b> {tier_upper}\n"
-            f"<b>Credits ➳</b> {credits_display}\n\n"
-            f"{fllower_emoji} <b>Dev ➳</b> <a href=\"https://t.me/lencax\">lencax</a>"
+            f"{online_emoji} <b>BLADESARKS</b> · <i>ACTIVE</i>\n\n"
+            f"Hello, <b>{display_name}</b>\n"
+            f"<code>━━━━━━━━━━━━━━━━━</code>\n"
+            f"{tag_emoji} Tier: <b>{tier_badge}</b>    {wallet_emoji} Credits: <b>{credits_display}</b>\n\n"
+            f"{badge_emoji} <code>{user.id}</code>  ·  <a href=\"https://t.me/lencax\">Dev</a>"
         )
-        
+
         keyboard = [
             [
-                InlineKeyboardButton(" Checker", callback_data='show_checker', style='primary'),
-                InlineKeyboardButton(" Hitter",  callback_data='show_hitter',  style='danger'),
+                InlineKeyboardButton("⚡ Checker", callback_data='show_checker', style='primary'),
+                InlineKeyboardButton("💀 Hitter",  callback_data='show_hitter',  style='danger'),
             ],
             [
-                InlineKeyboardButton(" Buy Now",   callback_data='show_plans',   style='success'),
-                InlineKeyboardButton(" Contact", callback_data='show_contact', style='primary'),
+                InlineKeyboardButton("💰 Buy Now",  callback_data='show_plans',   style='success'),
+                InlineKeyboardButton("🔮 Contact",  callback_data='show_contact', style='primary'),
             ],
             [
-                InlineKeyboardButton(" 🎁 Refer & Earn", callback_data='show_refer', style='success'),
-            ],
-            [
-                InlineKeyboardButton(" ⚙️ Settings", callback_data='settings_menu', style='primary'),
+                InlineKeyboardButton("🎁 Refer & Earn", callback_data='show_refer', style='success'),
             ],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
+
         await query.edit_message_text(
             text=text,
             parse_mode=ParseMode.HTML,
@@ -82114,7 +82123,7 @@ def main():
     app.add_handler(CommandHandler("feedback_text", feedback_text_command))
     
     # ============ BUTTON CALLBACKS ============
-    app.add_handler(CallbackQueryHandler(button_callback, pattern='^(show_checker|show_hitter|show_plans|show_profile|show_commands|show_contact|show_refer|back_main)$'))
+    app.add_handler(CallbackQueryHandler(button_callback, pattern='^(show_checker|show_hitter|show_plans|show_profile|show_commands|show_contact|show_refer|goto_buy|back_main)$'))
     
     # ============ TEXT HANDLER ============
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
@@ -82273,3 +82282,4 @@ def main():
             pass
 if __name__ == '__main__':
     main()
+A
