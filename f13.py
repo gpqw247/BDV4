@@ -13743,7 +13743,24 @@ class ShopifyAPIPool:
                     continue
 
                 if result.get("result") == "NO_PRODUCT_ERROR":
-                    print(f"🔄 [NO PRODUCT] {current_site} — trying next site")
+                    print(f"🔄 [NO PRODUCT] {current_site} — removed and trying next site")
+                    # site already removed from rotation inside _make_api_request;
+                    # remove from tried_sites so the pool doesn't count it as
+                    # "already tried" — it's gone, a fresh site should take its place.
+                    if current_site in tried_sites:
+                        tried_sites.remove(current_site)
+                    continue
+
+                # UNKNOWN gateway with 0.0 price that slipped through
+                if (result.get("gateway", "").upper() in ("UNKNOWN", "GATEWAY UNKNOWN", "UNKNOWN GATEWAY")
+                        and float(result.get("price", "0") or "0") == 0.0):
+                    print(f"🔄 [UNKNOWN GW / 0 PRICE] {current_site} — removing and retrying")
+                    if current_site in site_quality_tracker.good_sites:
+                        site_quality_tracker.good_sites.remove(current_site)
+                    if current_site in site_quality_tracker.site_quality:
+                        site_quality_tracker.site_quality[current_site]['is_good'] = False
+                    site_quality_tracker.save_stats()
+                    autosopi_site_manager.remove_site(current_site, OWNER_ID)
                     if current_site in tried_sites:
                         tried_sites.remove(current_site)
                     continue
@@ -13858,6 +13875,7 @@ class ShopifyAPIPool:
             "No products found",
             "No products under $10 ound!",
             "<b>No products under $10 ound!</b>",
+            "No Products!", "No Products",  # new API's exact wording ("⤷ No Products! ❌")
         ]
 
         fake_gateway_patterns = [
@@ -14061,9 +14079,12 @@ class ShopifyAPIPool:
                 }
 
             # -------- NO PRODUCT ----------
-            if any(err in response_text for err in no_product_errors):
-                print(f"🗑️ [NO PRODUCT] Removing {site_clean}")
-                autosopi_site_manager.remove_site(site_clean, OWNER_ID)
+            if any(err.upper() in response_upper for err in no_product_errors):
+                print(f"🗑️ [NO PRODUCT] Removing {site_clean} (rotation + GOOD list, like /rgood)")
+                # Full purge, same as /rgood — even if this site was
+                # previously marked GOOD, it comes out of both lists so
+                # it can never come back into rotation on its own.
+                full_remove_site_from_rotation(site_clean, OWNER_ID)
                 self.site_performance.pop(site_clean, None)
                 self.good_sites_cache_time = 0
                 return {
@@ -14239,6 +14260,35 @@ class ShopifyAPIPool:
                     "elapsed": elapsed, "price": str(price),
                     "gateway": gateway, "site": site_clean,
                     "proxy_used": proxy, "api_name": api.get('name', 'Unknown')
+                }
+
+            # -------- No-product → remove site, get a real response --------
+            # These mean this site has no usable products for our price range.
+            # Mark site_removed=True so check_card_with_pool strips the site
+            # from rotation (same path as DELIVERY_DELIVERY_LINE_DETAIL_CHANGED)
+            # and immediately retries with a fresh site. We also force-strip the
+            # good-site flag first so remove_site() doesn't silently no-op.
+            if any(p in response_upper for p in [e.upper() for e in no_product_errors]) or \
+               (gateway.upper() in ("UNKNOWN", "GATEWAY UNKNOWN", "UNKNOWN GATEWAY") and float(price) == 0.0):
+                print(f"🗑️ [NO PRODUCT / UNKNOWN GW] Removing {site_clean} from rotation")
+                if site_clean in site_quality_tracker.good_sites:
+                    site_quality_tracker.good_sites.remove(site_clean)
+                if site_clean in site_quality_tracker.site_quality:
+                    site_quality_tracker.site_quality[site_clean]['is_good'] = False
+                site_quality_tracker.save_stats()
+                autosopi_site_manager.remove_site(site_clean, OWNER_ID)
+                self.site_performance.pop(site_clean, None)
+                self.good_sites_cache_time = 0
+                return {
+                    "status": "error",
+                    "result": "NO_PRODUCT_ERROR",
+                    "message": response_text or "No products under $3 found",
+                    "status_display": "⚠️ NO PRODUCT",
+                    "status_category": "retryable",
+                    "elapsed": elapsed, "price": str(price),
+                    "gateway": gateway, "site_removed": True,
+                    "site": site_clean, "proxy_used": proxy,
+                    "api_name": api.get('name', 'Unknown')
                 }
 
             # -------- Retryable patterns ----------
@@ -27616,13 +27666,14 @@ async def settime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(args) < 2:
         await update.message.reply_text(
             "⏱️ <b>Set Time (silent)</b>\n\n"
-            "Usage: <code>/settime &lt;user_id|@username&gt; &lt;amount&gt; [unit]</code>\n"
-            "Units: m/min/minutes, h/hr/hours, d/day/days (default: days)\n\n"
+            "Usage: <code>/settime &lt;user_id|@username&gt; &lt;amount&gt;&lt;unit&gt;</code>\n"
+            "Units: m (minutes), h (hours), d (days) — default is days if omitted\n\n"
             "Examples:\n"
             "<code>/settime 6299808404 7</code> — 7 days\n"
-            "<code>/settime 6299808404 30 minutes</code> — 30 minutes\n"
-            "<code>/settime 6299808404 12 hours</code> — 12 hours\n"
-            "<code>/settime @shaharear22 7 days</code> — 7 days",
+            "<code>/settime 6299808404 7d</code> — 7 days\n"
+            "<code>/settime 6299808404 5m</code> — 5 minutes\n"
+            "<code>/settime 6299808404 12h</code> — 12 hours\n"
+            "<code>/settime @shaharear22 7d</code> — 7 days",
             parse_mode=ParseMode.HTML
         )
         return
@@ -27643,14 +27694,27 @@ async def settime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             target_id = found_id
 
-        # ── Amount ──
-        amount = float(args[1])
+        # ── Amount + unit, either combined ("5m", "7d") or split ("5", "minutes") ──
+        amount_raw = args[1].strip().lower()
+        match = re.match(r'^(\d+(?:\.\d+)?)\s*([a-zA-Z]*)$', amount_raw)
+        if not match:
+            await update.message.reply_text("❌ Invalid amount. Example: 5m, 7d, 12h, or just 7")
+            return
+
+        amount = float(match.group(1))
+        suffix_unit = match.group(2)
+
+        if suffix_unit:
+            unit_raw = suffix_unit
+        elif len(args) >= 3:
+            unit_raw = args[2].lower()
+        else:
+            unit_raw = "days"
+
         if amount <= 0:
             await update.message.reply_text("❌ Amount must be positive.")
             return
 
-        # ── Unit (default: days) ──
-        unit_raw = args[2].lower() if len(args) >= 3 else "days"
         if unit_raw not in _SETTIME_UNITS:
             await update.message.reply_text(
                 f"❌ Unknown unit '{unit_raw}'. Use: m/min/minutes, h/hr/hours, d/day/days"
@@ -40799,6 +40863,26 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ FIXED FEEDBACK COMMAND - WITH PROPER ROUTING ============
 
+# ============ FEEDBACK APPROVAL QUEUE ============
+# Feedback no longer goes straight to the group — it goes to the admin
+# first with Approve/Decline buttons, and only reaches FEEDBACK_GROUP_ID
+# once approved.
+FEEDBACK_PENDING = {}
+_feedback_id_counter = {"n": 0}
+
+
+def _next_feedback_id() -> int:
+    _feedback_id_counter["n"] += 1
+    return _feedback_id_counter["n"]
+
+
+def _feedback_review_keyboard(fid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"fbrev_approve_{fid}", style='success'),
+        InlineKeyboardButton("❌ Decline", callback_data=f"fbrev_decline_{fid}", style='danger'),
+    ]])
+
+
 async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Send feedback with ANY media to feedback group - /fb or /feedback (reply to any message)
@@ -40870,207 +40954,235 @@ async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         feedback_header += f"📧 <b>Message</b> ➛ {user_extra_text}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     
     feedback_header += f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
-    
+
+    fid = _next_feedback_id()
+    review_kb = _feedback_review_keyboard(fid)
+
     success = False
     error_msgs = []
-    
+
     try:
         # ============ HANDLE DIFFERENT MEDIA TYPES ============
-        
+        # NOTE: everything below now goes to the ADMIN (OWNER_ID) for
+        # review, not straight to FEEDBACK_GROUP_ID. It only reaches the
+        # group once the admin taps ✅ Approve.
+
         # ============ PHOTO ============
         if replied_msg.photo:
             # Get the largest photo
             photo = replied_msg.photo[-1]
             caption_text = replied_msg.caption or ""
-            
+
             # Build the full caption
             if caption_text:
                 final_caption = f"{feedback_header}\n📝 <b>Caption</b> ➛ {caption_text}"
             else:
                 final_caption = feedback_header
-            
-            # Send the photo with caption
+
             await context.bot.send_photo(
-                chat_id=FEEDBACK_GROUP_ID,
+                chat_id=OWNER_ID,
                 photo=photo.file_id,
                 caption=final_caption,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=review_kb
             )
-            print(f"✅ Photo feedback sent to group {FEEDBACK_GROUP_ID}!")
+            FEEDBACK_PENDING[fid] = {"type": "photo", "file_id": photo.file_id, "caption": final_caption}
+            print(f"✅ Photo feedback sent to admin {OWNER_ID} for review!")
             success = True
-        
+
         # ============ VIDEO ============
         elif replied_msg.video:
             video = replied_msg.video
             caption_text = replied_msg.caption or ""
-            
+
             if caption_text:
                 final_caption = f"{feedback_header}\n📝 <b>Caption</b> ➛ {caption_text}"
             else:
                 final_caption = feedback_header
-            
+
             await context.bot.send_video(
-                chat_id=FEEDBACK_GROUP_ID,
+                chat_id=OWNER_ID,
                 video=video.file_id,
                 caption=final_caption,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=review_kb
             )
-            print(f"✅ Video feedback sent to group {FEEDBACK_GROUP_ID}!")
+            FEEDBACK_PENDING[fid] = {"type": "video", "file_id": video.file_id, "caption": final_caption}
+            print(f"✅ Video feedback sent to admin {OWNER_ID} for review!")
             success = True
-        
+
         # ============ DOCUMENT / FILE ============
         elif replied_msg.document:
             document = replied_msg.document
             file_name = document.file_name or "file"
             caption_text = replied_msg.caption or ""
-            
+
             if caption_text:
                 final_caption = f"{feedback_header}\n📝 <b>Caption</b> ➛ {caption_text}"
             else:
                 final_caption = feedback_header
-            
+            final_caption = f"{final_caption}\n📎 <b>File</b> ➛ {file_name}"
+
             await context.bot.send_document(
-                chat_id=FEEDBACK_GROUP_ID,
+                chat_id=OWNER_ID,
                 document=document.file_id,
-                caption=f"{final_caption}\n📎 <b>File</b> ➛ {file_name}",
-                parse_mode="HTML"
+                caption=final_caption,
+                parse_mode="HTML",
+                reply_markup=review_kb
             )
-            print(f"✅ Document feedback sent to group {FEEDBACK_GROUP_ID}!")
+            FEEDBACK_PENDING[fid] = {"type": "document", "file_id": document.file_id, "caption": final_caption}
+            print(f"✅ Document feedback sent to admin {OWNER_ID} for review!")
             success = True
-        
+
         # ============ ANIMATION / GIF ============
         elif replied_msg.animation:
             animation = replied_msg.animation
             caption_text = replied_msg.caption or ""
-            
+
             if caption_text:
                 final_caption = f"{feedback_header}\n📝 <b>Caption</b> ➛ {caption_text}"
             else:
                 final_caption = feedback_header
-            
+
             await context.bot.send_animation(
-                chat_id=FEEDBACK_GROUP_ID,
+                chat_id=OWNER_ID,
                 animation=animation.file_id,
                 caption=final_caption,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=review_kb
             )
-            print(f"✅ Animation/GIF feedback sent to group {FEEDBACK_GROUP_ID}!")
+            FEEDBACK_PENDING[fid] = {"type": "animation", "file_id": animation.file_id, "caption": final_caption}
+            print(f"✅ Animation/GIF feedback sent to admin {OWNER_ID} for review!")
             success = True
-        
+
         # ============ STICKER ============
         elif replied_msg.sticker:
             sticker = replied_msg.sticker
-            
-            # Send sticker first
+
+            # Send sticker first (no caption support), then the header
+            # with the Approve/Decline buttons attached.
             await context.bot.send_sticker(
-                chat_id=FEEDBACK_GROUP_ID,
+                chat_id=OWNER_ID,
                 sticker=sticker.file_id
             )
-            # Then send text
             await context.bot.send_message(
-                chat_id=FEEDBACK_GROUP_ID,
+                chat_id=OWNER_ID,
                 text=feedback_header,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=review_kb
             )
-            print(f"✅ Sticker feedback sent to group {FEEDBACK_GROUP_ID}!")
+            FEEDBACK_PENDING[fid] = {"type": "sticker", "file_id": sticker.file_id, "caption": feedback_header}
+            print(f"✅ Sticker feedback sent to admin {OWNER_ID} for review!")
             success = True
-        
+
         # ============ VOICE ============
         elif replied_msg.voice:
             voice = replied_msg.voice
             caption_text = replied_msg.caption or ""
-            
+
             if caption_text:
                 final_caption = f"{feedback_header}\n📝 <b>Caption</b> ➛ {caption_text}"
             else:
                 final_caption = feedback_header
-            
+
             await context.bot.send_voice(
-                chat_id=FEEDBACK_GROUP_ID,
+                chat_id=OWNER_ID,
                 voice=voice.file_id,
                 caption=final_caption,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=review_kb
             )
-            print(f"✅ Voice feedback sent to group {FEEDBACK_GROUP_ID}!")
+            FEEDBACK_PENDING[fid] = {"type": "voice", "file_id": voice.file_id, "caption": final_caption}
+            print(f"✅ Voice feedback sent to admin {OWNER_ID} for review!")
             success = True
-        
+
         # ============ AUDIO ============
         elif replied_msg.audio:
             audio = replied_msg.audio
             caption_text = replied_msg.caption or ""
-            
+
             if caption_text:
                 final_caption = f"{feedback_header}\n📝 <b>Caption</b> ➛ {caption_text}"
             else:
                 final_caption = feedback_header
-            
+
             await context.bot.send_audio(
-                chat_id=FEEDBACK_GROUP_ID,
+                chat_id=OWNER_ID,
                 audio=audio.file_id,
                 caption=final_caption,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=review_kb
             )
-            print(f"✅ Audio feedback sent to group {FEEDBACK_GROUP_ID}!")
+            FEEDBACK_PENDING[fid] = {"type": "audio", "file_id": audio.file_id, "caption": final_caption}
+            print(f"✅ Audio feedback sent to admin {OWNER_ID} for review!")
             success = True
-        
+
         # ============ TEXT ============
         elif replied_msg.text:
             original_text = replied_msg.text
-            
+
             full_message = (
                 f"{feedback_header}\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📝 <b>Original Message:</b>\n"
                 f"{original_text}"
             )
-            
+
             # Split if too long (Telegram limit 4096)
             if len(full_message) > 4000:
                 full_message = full_message[:4000] + "...\n(truncated)"
-            
+
             await context.bot.send_message(
-                chat_id=FEEDBACK_GROUP_ID,
+                chat_id=OWNER_ID,
                 text=full_message,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=review_kb
             )
-            print(f"✅ Text feedback sent to group {FEEDBACK_GROUP_ID}!")
+            FEEDBACK_PENDING[fid] = {"type": "text", "text": full_message}
+            print(f"✅ Text feedback sent to admin {OWNER_ID} for review!")
             success = True
-        
+
         # ============ UNKNOWN TYPE ============
         else:
+            fallback_text = f"{feedback_header}\n\n⚠️ <i>Unsupported media type: {type(replied_msg).__name__}</i>"
             await context.bot.send_message(
-                chat_id=FEEDBACK_GROUP_ID,
-                text=f"{feedback_header}\n\n⚠️ <i>Unsupported media type: {type(replied_msg).__name__}</i>",
-                parse_mode="HTML"
+                chat_id=OWNER_ID,
+                text=fallback_text,
+                parse_mode="HTML",
+                reply_markup=review_kb
             )
-            print(f"⚠️ Unknown type feedback sent to group {FEEDBACK_GROUP_ID}!")
+            FEEDBACK_PENDING[fid] = {"type": "text", "text": fallback_text}
+            print(f"⚠️ Unknown type feedback sent to admin {OWNER_ID} for review!")
             success = True
-            
+
     except Exception as e:
         error_msg = str(e)
         print(f"❌ Feedback send failed: {error_msg}")
         print(f"❌ Traceback: {traceback.format_exc()}")
         error_msgs.append(error_msg[:100])
-        
+
         # Try sending just text as fallback
         try:
+            fallback_text = f"{feedback_header}\n\n❌ Error sending media: {error_msg[:200]}"
             await context.bot.send_message(
-                chat_id=FEEDBACK_GROUP_ID,
-                text=f"{feedback_header}\n\n❌ Error sending media: {error_msg[:200]}",
-                parse_mode="HTML"
+                chat_id=OWNER_ID,
+                text=fallback_text,
+                parse_mode="HTML",
+                reply_markup=review_kb
             )
+            FEEDBACK_PENDING[fid] = {"type": "text", "text": fallback_text}
             success = True
-            print(f"✅ Fallback text sent!")
+            print(f"✅ Fallback text sent to admin for review!")
         except Exception as e2:
             print(f"❌ Fallback also failed: {e2}")
             error_msgs.append(str(e2)[:100])
-    
+
     # Update user
     if success:
         await processing_msg.edit_text(
             f"✅ <b>Feedback Sent!</b>\n\n"
             f"Thank you for your feedback, {first_name}!\n"
-            f"The admin team has received your message.",
+            f"It's been sent to the admin for review.",
             parse_mode=ParseMode.HTML
         )
     else:
@@ -41080,6 +41192,78 @@ async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Please try again or contact @Cypher099 directly.",
             parse_mode=ParseMode.HTML
         )
+
+
+async def feedback_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles ✅ Approve / ❌ Decline buttons on pending /fb feedback (admin only)."""
+    query = update.callback_query
+
+    if query.from_user.id != OWNER_ID:
+        await query.answer("❌ Admin only.", show_alert=True)
+        return
+
+    data = query.data  # "fbrev_approve_<fid>" or "fbrev_decline_<fid>"
+    try:
+        fid = int(data.rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        await query.answer("❌ Invalid feedback id.", show_alert=True)
+        return
+
+    pending = FEEDBACK_PENDING.get(fid)
+    if not pending:
+        await query.answer("❌ Already handled or expired.", show_alert=True)
+        return
+
+    is_approve = data.startswith("fbrev_approve_")
+    ftype = pending.get("type")
+
+    if is_approve:
+        try:
+            if ftype == "photo":
+                await context.bot.send_photo(chat_id=FEEDBACK_GROUP_ID, photo=pending["file_id"],
+                                              caption=pending.get("caption"), parse_mode="HTML")
+            elif ftype == "video":
+                await context.bot.send_video(chat_id=FEEDBACK_GROUP_ID, video=pending["file_id"],
+                                              caption=pending.get("caption"), parse_mode="HTML")
+            elif ftype == "document":
+                await context.bot.send_document(chat_id=FEEDBACK_GROUP_ID, document=pending["file_id"],
+                                                 caption=pending.get("caption"), parse_mode="HTML")
+            elif ftype == "animation":
+                await context.bot.send_animation(chat_id=FEEDBACK_GROUP_ID, animation=pending["file_id"],
+                                                  caption=pending.get("caption"), parse_mode="HTML")
+            elif ftype == "sticker":
+                await context.bot.send_sticker(chat_id=FEEDBACK_GROUP_ID, sticker=pending["file_id"])
+                await context.bot.send_message(chat_id=FEEDBACK_GROUP_ID,
+                                                text=pending.get("caption") or "", parse_mode="HTML")
+            elif ftype == "voice":
+                await context.bot.send_voice(chat_id=FEEDBACK_GROUP_ID, voice=pending["file_id"],
+                                              caption=pending.get("caption"), parse_mode="HTML")
+            elif ftype == "audio":
+                await context.bot.send_audio(chat_id=FEEDBACK_GROUP_ID, audio=pending["file_id"],
+                                              caption=pending.get("caption"), parse_mode="HTML")
+            else:  # text / fallback
+                await context.bot.send_message(chat_id=FEEDBACK_GROUP_ID,
+                                                text=pending.get("text") or "(empty)", parse_mode="HTML")
+            result_text = "✅ <b>Feedback Approved — posted to group</b>"
+            print(f"✅ [FEEDBACK] #{fid} approved by admin, posted to {FEEDBACK_GROUP_ID}")
+        except Exception as e:
+            result_text = f"⚠️ Approved, but failed to post to group: {str(e)[:150]}"
+            print(f"❌ [FEEDBACK] #{fid} approve-post failed: {e}")
+    else:
+        result_text = "❌ <b>Feedback Declined</b> — not posted to group."
+        print(f"🚫 [FEEDBACK] #{fid} declined by admin")
+
+    FEEDBACK_PENDING.pop(fid, None)
+    await query.answer("Done")
+
+    try:
+        if query.message.photo or query.message.video or query.message.document or \
+           query.message.animation or query.message.voice or query.message.audio:
+            await query.edit_message_caption(caption=result_text, parse_mode=ParseMode.HTML)
+        else:
+            await query.edit_message_text(text=result_text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        print(f"⚠️ Could not edit feedback review message: {e}")
 
 
 # ============ FEEDBACK TEXT COMMAND (without reply) ============
@@ -41119,7 +41303,9 @@ async def feedback_text_command(update: Update, context: ContextTypes.DEFAULT_TY
     tier = user_manager.get_tier(user_id)
     tier_emoji = user_manager.TIERS.get(tier, {}).get('emoji', '🆓')
     
-    # Build feedback message
+    # Build feedback message (now routed through admin approval too)
+    fid = _next_feedback_id()
+    review_kb = _feedback_review_keyboard(fid)
     feedback_message = (
         f" #  <b>FEEDBACK RECEIVED</b>\n"
         f"<b>From</b> ➛ {user_mention}\n"
@@ -41128,18 +41314,21 @@ async def feedback_text_command(update: Update, context: ContextTypes.DEFAULT_TY
     
     try:
         await context.bot.send_message(
-            chat_id=FEEDBACK_GROUP_ID,
+            chat_id=OWNER_ID,
             text=feedback_message,
-            parse_mode="HTML"
+            parse_mode="HTML",
+            reply_markup=review_kb
         )
+        FEEDBACK_PENDING[fid] = {"type": "text", "text": feedback_message}
         
         await message.reply_text(
             f"✅ <b>Feedback Sent!</b>\n\n"
-            f"Thank you for your feedback, {first_name}!",
+            f"Thank you for your feedback, {first_name}!\n"
+            f"It's been sent to the admin for review.",
             parse_mode=ParseMode.HTML
         )
         
-        print(f"✅ Text feedback sent successfully to group {FEEDBACK_GROUP_ID}!")
+        print(f"✅ Text feedback sent to admin {OWNER_ID} for review!")
         
     except Exception as e:
         print(f"❌ Text feedback error: {e}")
@@ -43054,6 +43243,46 @@ async def set_site_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
 # ============ REMOVE GOOD SITE COMMAND ============
+
+def full_remove_site_from_rotation(site_clean: str, user_id: int = None) -> tuple:
+    """
+    Fully purge a site -- same removal /rgood performs:
+    1. Remove it from the GOOD sites list
+    2. Reset its GOOD/quality status
+    3. Remove it from rotation (autosopi_site_manager)
+    4. Clear cached price/good-sites data
+
+    Used both by /rgood itself and automatically whenever a site needs
+    to be force-removed elsewhere (e.g. a "No Products" response),
+    so a site can never linger in the GOOD list after being purged.
+
+    Returns (removed_from_good: bool, removed_from_rotation: bool).
+    """
+    removed_from_good = False
+    if site_clean in site_quality_tracker.good_sites:
+        site_quality_tracker.good_sites.remove(site_clean)
+        removed_from_good = True
+
+    if site_clean in site_quality_tracker.site_quality:
+        site_quality_tracker.site_quality[site_clean]['is_good'] = False
+        site_quality_tracker.site_quality[site_clean]['good_responses'] = max(
+            0, site_quality_tracker.site_quality[site_clean].get('good_responses', 0) - 1
+        )
+
+    if site_clean in site_quality_tracker.price_cache:
+        del site_quality_tracker.price_cache[site_clean]
+
+    removed_from_rotation = False
+    if site_clean in autosopi_site_manager.sites:
+        success, _msg = autosopi_site_manager.remove_site(site_clean, user_id or OWNER_ID)
+        removed_from_rotation = success
+
+    site_rotation_manager.cache_time = 0
+    site_quality_tracker.save_stats()
+    autosopi_site_manager.save_sites()
+
+    return removed_from_good, removed_from_rotation
+
 
 async def rgood_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -49355,13 +49584,15 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         f"🔐 <b>Address:</b> <code>{wallet['address']}</code>\n"
         f"📅 <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"\n\n"
-        f"📌 <b>Actions:</b>\n"
-        f"<code>/confirmpayment {user_id}</code> - Confirm payment\n"
-        f"<code>/rejectpayment {user_id}</code> - Reject payment\n"
-        f"\n"
+        f"👇 Use the buttons below to confirm or reject.\n"
         f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
     )
-    
+
+    payment_action_keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Confirm Payment", callback_data=f"confirm_payment_{user_id}", style='success'),
+        InlineKeyboardButton("❌ Reject Payment", callback_data=f"reject_payment_{user_id}", style='danger'),
+    ]])
+
     # ============ SEND TO OWNER'S PRIVATE CHAT ============
     try:
         if file_type == "photo":
@@ -49369,14 +49600,16 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
                 chat_id=OWNER_ID,  # This sends ONLY to the owner
                 photo=file_id,
                 caption=notification,
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
+                reply_markup=payment_action_keyboard
             )
         else:
             await context.bot.send_document(
                 chat_id=OWNER_ID,  # This sends ONLY to the owner
                 document=file_id,
                 caption=notification,
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
+                reply_markup=payment_action_keyboard
             )
         print(f"✅ Payment proof forwarded to admin {OWNER_ID}")
     except Exception as e:
@@ -49386,141 +49619,87 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
             await context.bot.send_message(
                 chat_id=OWNER_ID,
                 text=notification,
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
+                reply_markup=payment_action_keyboard
             )
             print(f"✅ Notification sent to admin (without file)")
         except Exception as e2:
             print(f"❌ Failed to send to admin: {e2}")
 
-async def confirmpayment_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Confirm a payment and upgrade user (admin only)"""
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("❌ Admin only command.")
-        return
-    
-    if not context.args:
-        await update.message.reply_text(
-            "✅ <b>Confirm Payment</b>\n\n"
-            "Usage: <code>/confirmpayment &lt;user_id&gt;</code>\n"
-            "Example: <code>/confirmpayment 123456789</code>\n\n"
-            "This will upgrade the user to their purchased plan.",
-            parse_mode=ParseMode.HTML
-        )
-        return
-    
-    try:
-        target_user_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user ID.")
-        return
-    
+async def _confirm_payment_core(context: ContextTypes.DEFAULT_TYPE, target_user_id: int):
+    """
+    Shared confirm-payment logic used by both /confirmpayment and the
+    inline 'Confirm Payment' button. Returns (success: bool, admin_text: str).
+    """
     session = payment_session_manager.get_session(target_user_id)
     if not session:
-        await update.message.reply_text(
-            f"❌ No active payment session found for user {target_user_id}.",
-            parse_mode=ParseMode.HTML
-        )
-        return
-    
-    if session["status"] != "paid":
-        await update.message.reply_text(
-            f"❌ Payment session is not in 'paid' status. Current status: {session['status']}",
-            parse_mode=ParseMode.HTML
-        )
-        return
-    
-    # Confirm payment
-    if payment_session_manager.confirm_payment(target_user_id):
-        plan = PAYMENT_PLANS[session["plan_key"]]
-        wallet = PAYMENT_WALLETS[session["wallet_key"]]
-        
-        # Get username
-        try:
-            target_user = await context.bot.get_chat(target_user_id)
-            username = target_user.username or target_user.first_name or f"User {target_user_id}"
-        except Exception:
-            username = f"User {target_user_id}"
-        
-        # Send confirmation to user
-        try:
-            await context.bot.send_message(
-                chat_id=target_user_id,
-                text=(
-                    f"🎉 <b>Payment Confirmed!</b>\n"
-                    f"\n"
-                    f"👑 <b>Plan:</b> {plan['display_name']}\n"
-                    f"⏱️ <b>Duration:</b> {plan['duration']} Days\n"
-                    f"💰 <b>Amount:</b> ${plan['price']:.2f}\n"
-                ),
-                parse_mode=ParseMode.HTML
-            )
-        except Exception as e:
-            print(f"⚠️ Could not notify user: {e}")
-        
-        # Send confirmation to admin
-        await update.message.reply_text(
-            f"✅ <b>Payment Confirmed!</b>\n\n"
-            f"👤 User: <code>{target_user_id}</code> ({username})\n"
-            f"👑 Plan: {plan['display_name']}\n"
-            f"💰 Amount: ${plan['price']:.2f}\n"
-            f"⏱️ Duration: {plan['duration']} Days\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ User upgraded to <b>{plan['tier'].upper()}</b> tier!",
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_menu()
-        )
-        
-        # ============ SEND CLEAN PLAN PURCHASE NOTIFICATION ============
-        await send_plan_purchase_notification_clean(
-            context=context,
-            user_id=target_user_id,
-            username=username,
-            first_name=target_user.first_name if target_user else "User",
-            plan_name=plan["display_name"],
-            plan_key=session["plan_key"],
-            duration_days=plan["duration"],
-            amount=plan["price"]
-        )
-        
-    else:
-        await update.message.reply_text("❌ Failed to confirm payment.")
+        return False, f"❌ No active payment session found for user {target_user_id}."
 
-async def rejectpayment_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reject a payment (admin only)"""
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("❌ Admin only command.")
-        return
-    
-    if not context.args:
-        await update.message.reply_text(
-            "❌ <b>Reject Payment</b>\n\n"
-            "Usage: <code>/rejectpayment &lt;user_id&gt; [reason]</code>\n"
-            "Example: <code>/rejectpayment 123456789 Invalid screenshot</code>",
+    if session["status"] != "paid":
+        return False, f"❌ Payment session is not in 'paid' status. Current status: {session['status']}"
+
+    if not payment_session_manager.confirm_payment(target_user_id):
+        return False, "❌ Failed to confirm payment."
+
+    plan = PAYMENT_PLANS[session["plan_key"]]
+
+    try:
+        target_user = await context.bot.get_chat(target_user_id)
+        username = target_user.username or target_user.first_name or f"User {target_user_id}"
+    except Exception:
+        target_user = None
+        username = f"User {target_user_id}"
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text=(
+                f"🎉 <b>Payment Confirmed!</b>\n"
+                f"\n"
+                f"👑 <b>Plan:</b> {plan['display_name']}\n"
+                f"⏱️ <b>Duration:</b> {plan['duration']} Days\n"
+                f"💰 <b>Amount:</b> ${plan['price']:.2f}\n"
+            ),
             parse_mode=ParseMode.HTML
         )
-        return
-    
-    try:
-        target_user_id = int(context.args[0])
-        reason = " ".join(context.args[1:]) if len(context.args) > 1 else "Payment verification failed."
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user ID.")
-        return
-    
+    except Exception as e:
+        print(f"⚠️ Could not notify user: {e}")
+
+    await send_plan_purchase_notification_clean(
+        context=context,
+        user_id=target_user_id,
+        username=username,
+        first_name=target_user.first_name if target_user else "User",
+        plan_name=plan["display_name"],
+        plan_key=session["plan_key"],
+        duration_days=plan["duration"],
+        amount=plan["price"]
+    )
+
+    admin_text = (
+        f"✅ <b>Payment Confirmed!</b>\n\n"
+        f"👤 User: <code>{target_user_id}</code> ({username})\n"
+        f"👑 Plan: {plan['display_name']}\n"
+        f"💰 Amount: ${plan['price']:.2f}\n"
+        f"⏱️ Duration: {plan['duration']} Days\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ User upgraded to <b>{plan['tier'].upper()}</b> tier!"
+    )
+    return True, admin_text
+
+
+async def _reject_payment_core(context: ContextTypes.DEFAULT_TYPE, target_user_id: int, reason: str):
+    """
+    Shared reject-payment logic used by both /rejectpayment and the
+    inline 'Reject Payment' button. Returns (success: bool, admin_text: str).
+    """
     session = payment_session_manager.get_session(target_user_id)
     if not session:
-        await update.message.reply_text(
-            f"❌ No active payment session found for user {target_user_id}.",
-            parse_mode=ParseMode.HTML
-        )
-        return
-    
+        return False, f"❌ No active payment session found for user {target_user_id}."
+
     plan = PAYMENT_PLANS[session["plan_key"]]
-    
-    # Expire the session
     payment_session_manager.expire_session(target_user_id)
-    
-    # Notify user
+
     try:
         await context.bot.send_message(
             chat_id=target_user_id,
@@ -49539,15 +49718,103 @@ async def rejectpayment_command(update: Update, context: ContextTypes.DEFAULT_TY
         )
     except:
         pass
-    
-    await update.message.reply_text(
+
+    admin_text = (
         f"❌ <b>Payment Rejected</b>\n\n"
         f"👤 User: <code>{target_user_id}</code>\n"
         f"👑 Plan: {plan['display_name']}\n"
-        f"📝 Reason: {reason}",
-        parse_mode=ParseMode.HTML,
-        reply_markup=back_menu()
+        f"📝 Reason: {reason}"
     )
+    return True, admin_text
+
+
+async def confirmpayment_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirm a payment and upgrade user (admin only) — text command, kept for compatibility"""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Admin only command.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "✅ <b>Confirm Payment</b>\n\n"
+            "Usage: <code>/confirmpayment &lt;user_id&gt;</code>\n"
+            "Example: <code>/confirmpayment 123456789</code>\n\n"
+            "This will upgrade the user to their purchased plan.\n\n"
+            "💡 Tip: you can also just tap the ✅ Confirm Payment button on the payment proof message.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID.")
+        return
+
+    success, admin_text = await _confirm_payment_core(context, target_user_id)
+    await update.message.reply_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=back_menu())
+
+
+async def rejectpayment_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reject a payment (admin only) — text command, kept for compatibility"""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Admin only command.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "❌ <b>Reject Payment</b>\n\n"
+            "Usage: <code>/rejectpayment &lt;user_id&gt; [reason]</code>\n"
+            "Example: <code>/rejectpayment 123456789 Invalid screenshot</code>\n\n"
+            "💡 Tip: you can also just tap the ❌ Reject Payment button on the payment proof message.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+        reason = " ".join(context.args[1:]) if len(context.args) > 1 else "Payment verification failed."
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID.")
+        return
+
+    success, admin_text = await _reject_payment_core(context, target_user_id, reason)
+    await update.message.reply_text(admin_text, parse_mode=ParseMode.HTML, reply_markup=back_menu())
+
+
+async def payment_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the ✅ Confirm Payment / ❌ Reject Payment buttons on the admin proof message."""
+    query = update.callback_query
+
+    if query.from_user.id != OWNER_ID:
+        await query.answer("❌ Admin only.", show_alert=True)
+        return
+
+    data = query.data  # "confirm_payment_<id>" or "reject_payment_<id>"
+    try:
+        target_user_id = int(data.rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        await query.answer("❌ Invalid payment data.", show_alert=True)
+        return
+
+    if data.startswith("confirm_payment_"):
+        success, admin_text = await _confirm_payment_core(context, target_user_id)
+    else:
+        success, admin_text = await _reject_payment_core(
+            context, target_user_id, "Payment verification failed."
+        )
+
+    await query.answer("Done" if success else "Failed")
+
+    # The proof message may be a photo/document caption or plain text —
+    # edit whichever one applies, and drop the buttons once actioned.
+    try:
+        if query.message.photo or query.message.document:
+            await query.edit_message_caption(caption=admin_text, parse_mode=ParseMode.HTML)
+        else:
+            await query.edit_message_text(text=admin_text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        print(f"⚠️ Could not edit payment proof message: {e}")
 
 
 async def buy_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -82282,6 +82549,8 @@ def main():
     app.add_handler(CallbackQueryHandler(buy_cancel_callback, pattern='^buy_cancel$'))
     app.add_handler(CallbackQueryHandler(buy_back_callback, pattern='^buy_back$'))
     app.add_handler(CallbackQueryHandler(buy_back_plan_callback, pattern='^buy_back_plan_'))
+    app.add_handler(CallbackQueryHandler(payment_action_callback, pattern='^(confirm|reject)_payment_'))
+    app.add_handler(CallbackQueryHandler(feedback_approval_callback, pattern='^fbrev_(approve|decline)_'))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_payment_proof_message))
 
 
