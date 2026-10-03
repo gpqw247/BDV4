@@ -13322,7 +13322,7 @@ class ShopifyAPIPool:
     """
     Rotates between multiple Shopify APIs.
     - GOOD sites are prioritised
-    - 429 errors → 30s cooldown on the SITE (never removed unless 20× 429)
+    - 429 errors → 30s cooldown on the SITE (NEVER removed, no matter how many)
     - 429 errors → 30s cooldown on the PROXY (never removed)
     - Other site errors are logged but don't remove the site
     """
@@ -13359,7 +13359,9 @@ class ShopifyAPIPool:
         # ============ 429 SITE COOLDOWN ============
         self.site_cooldown = {}          # site -> cooldown_until timestamp
         self.SITE_429_COOLDOWN = 30      # 30-second cooldown
-        self.SITE_429_REMOVAL_THRESHOLD = 20  # only remove after 20× 429
+        # NOTE: 429 errors NEVER remove a site, no matter the count.
+        # SITE_429_REMOVAL_THRESHOLD intentionally removed — do not re-add
+        # removal-on-429 logic here.
 
         self._load_site_performance()
 
@@ -13381,7 +13383,7 @@ class ShopifyAPIPool:
         for api in self.apis:
             print(f"   • {api['name']}: {api['url']} (weight: {api.get('weight', 1)})")
         print(f"📊 Loaded performance data for {len(self.site_performance)} sites")
-        print(f"⏸️ 429 site cooldown: {self.SITE_429_COOLDOWN}s (removal after {self.SITE_429_REMOVAL_THRESHOLD}×429)")
+        print(f"⏸️ 429 site cooldown: {self.SITE_429_COOLDOWN}s (sites are NEVER removed for 429)")
 
     # ---------------------------------------------------------------
     #  PERSISTENCE
@@ -13459,17 +13461,11 @@ class ShopifyAPIPool:
             stats['rate_limits'] += 1
             print(f"🚫 [SITE TRACKING] Rate limit #{stats['rate_limits']} for {site}")
 
-            # ============ 30-SECOND COOLDOWN INSTEAD OF REMOVAL ============
+            # ============ 30-SECOND COOLDOWN — NEVER REMOVE FOR 429 ============
+            # 429 is just the site being busy; it is NOT a reason to remove
+            # the site from rotation, no matter how many times it happens.
             self.mark_site_rate_limited(site, self.SITE_429_COOLDOWN)
-            # ==============================================================
-
-            # Only remove after threshold (20×)
-            if stats['rate_limits'] >= self.SITE_429_REMOVAL_THRESHOLD:
-                print(f"🗑️ [SITE REMOVAL] {site} removed — {self.SITE_429_REMOVAL_THRESHOLD}+ 429 errors")
-                autosopi_site_manager.remove_site(site, OWNER_ID)
-                self.site_performance.pop(site, None)
-                self.site_cooldown.pop(site, None)
-                self.good_sites_cache_time = 0
+            # =====================================================================
 
         if stats['total_checks'] % 50 == 0:
             self._save_site_performance()
@@ -23840,6 +23836,25 @@ class UserManager:
         user["first_name"] = first_name
         self.save_users()
 
+    def find_by_username(self, username: str):
+        """
+        Look up a stored user by @username (case-insensitive).
+        Returns the int user_id, or None if no match is found.
+        Only finds users who have interacted with the bot before
+        (i.e. their username was recorded via update_user_info).
+        """
+        uname = username.lstrip('@').strip().lower()
+        if not uname:
+            return None
+        for uid_str, data in self.users.items():
+            stored = (data.get("username") or "").lstrip('@').strip().lower()
+            if stored and stored == uname:
+                try:
+                    return int(uid_str)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
     # ═════════════════════════════════════════════════════════════
     # Tier resolution
     # ═════════════════════════════════════════════════════════════
@@ -24995,22 +25010,17 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target_id = int(context.args[0])
                 is_admin_checking_other = True
             except ValueError:
-                # If not a number, maybe it's a username
-                try:
-                    # Try to get user by username
-                    username = context.args[0].replace('@', '')
-                    # You'd need to look up user by username from your database
-                    # For now, just show error
+                # Not a number — look it up as a @username
+                username_arg = context.args[0].lstrip('@').strip()
+                found_id = user_manager.find_by_username(username_arg)
+                if found_id is not None:
+                    target_id = found_id
+                    is_admin_checking_other = True
+                else:
                     await update.message.reply_text(
-                        "❌ Please provide a numeric user ID.\n"
-                        "Example: /info 8250282523",
-                        parse_mode=ParseMode.HTML
-                    )
-                    return
-                except:
-                    await update.message.reply_text(
-                        "❌ Invalid user ID. Please provide a numeric ID.\n"
-                        "Example: /info 8250282523",
+                        f"❌ No user found for @{username_arg}.\n"
+                        f"They need to have used the bot at least once, or use their numeric ID.\n"
+                        f"Example: /info 8250282523",
                         parse_mode=ParseMode.HTML
                     )
                     return
@@ -27576,6 +27586,116 @@ async def set_tier_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid user ID")
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)[:100]}")
+
+_SETTIME_UNITS = {
+    "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+    "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+    "d": 86400, "day": 86400, "days": 86400,
+}
+
+
+async def settime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Silently set a user's plan duration (admin only).
+    No message is sent to the target user, no group notification —
+    just a quiet confirmation back to the admin.
+
+    Usage: /settime <user_id|@username> <amount> [unit]
+      unit: m/min/minutes, h/hr/hours, d/day/days (default: days)
+
+    Examples:
+      /settime 6299808404 7          -> 7 days
+      /settime 6299808404 30 minutes -> 30 minutes
+      /settime 6299808404 12 hours   -> 12 hours
+      /settime @shaharear22 7 days   -> 7 days
+    """
+    if update.effective_user.id != OWNER_ID:
+        return  # silent — no "admin only" leak either
+
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "⏱️ <b>Set Time (silent)</b>\n\n"
+            "Usage: <code>/settime &lt;user_id|@username&gt; &lt;amount&gt; [unit]</code>\n"
+            "Units: m/min/minutes, h/hr/hours, d/day/days (default: days)\n\n"
+            "Examples:\n"
+            "<code>/settime 6299808404 7</code> — 7 days\n"
+            "<code>/settime 6299808404 30 minutes</code> — 30 minutes\n"
+            "<code>/settime 6299808404 12 hours</code> — 12 hours\n"
+            "<code>/settime @shaharear22 7 days</code> — 7 days",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    try:
+        # ── Resolve target (numeric ID or @username) ──
+        raw_target = args[0]
+        try:
+            target_id = int(raw_target)
+        except ValueError:
+            username_arg = raw_target.lstrip('@').strip()
+            found_id = user_manager.find_by_username(username_arg)
+            if found_id is None:
+                await update.message.reply_text(
+                    f"❌ No user found for @{username_arg}. "
+                    f"They need to have used the bot at least once, or use their numeric ID."
+                )
+                return
+            target_id = found_id
+
+        # ── Amount ──
+        amount = float(args[1])
+        if amount <= 0:
+            await update.message.reply_text("❌ Amount must be positive.")
+            return
+
+        # ── Unit (default: days) ──
+        unit_raw = args[2].lower() if len(args) >= 3 else "days"
+        if unit_raw not in _SETTIME_UNITS:
+            await update.message.reply_text(
+                f"❌ Unknown unit '{unit_raw}'. Use: m/min/minutes, h/hr/hours, d/day/days"
+            )
+            return
+        seconds = amount * _SETTIME_UNITS[unit_raw]
+
+        # ── Apply silently ──
+        user = user_manager.get_user(target_id)
+        current_tier = user.get("tier", "free")
+
+        # If they're on free, give them premium for the duration.
+        # If already on a paid tier, just reset their expiry window.
+        if current_tier == "free":
+            user["upgraded_from"] = "free"
+            user["tier"] = "premium"
+            applied_tier = "premium"
+        else:
+            applied_tier = current_tier
+
+        user["tier_expiry"] = time.time() + seconds
+        user_manager.save_users()
+        if hasattr(user_manager, "cache"):
+            user_manager.cache[target_id] = user
+
+        # ── Quiet confirmation to admin only ──
+        expiry_dt = datetime.now() + timedelta(seconds=seconds)
+        if unit_raw.startswith("m") and not unit_raw.startswith("mo"):
+            dur_text = f"{amount:g} minute(s)"
+        elif unit_raw.startswith("h"):
+            dur_text = f"{amount:g} hour(s)"
+        else:
+            dur_text = f"{amount:g} day(s)"
+
+        await update.message.reply_text(
+            f"✅ (silent) {target_id} → {applied_tier.upper()} for {dur_text}\n"
+            f"📅 Expires: {expiry_dt.strftime('%Y-%m-%d %H:%M')}",
+            parse_mode=ParseMode.HTML
+        )
+
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount. Use a number.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)[:100]}")
+
 
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """List all users (admin only)"""
@@ -81889,6 +82009,7 @@ def main():
     app.add_handler(CommandHandler("price", price_command))
     app.add_handler(CommandHandler("tier", tier_command))
     app.add_handler(CommandHandler("settier", set_tier_command))
+    app.add_handler(CommandHandler("settime", settime_command))
     app.add_handler(CommandHandler("setlimit", setlimit_command))
     app.add_handler(CommandHandler("settop", settop_command))
     app.add_handler(CommandHandler("pt", pt_command))
@@ -82282,4 +82403,3 @@ def main():
             pass
 if __name__ == '__main__':
     main()
-A
