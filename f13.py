@@ -13369,6 +13369,32 @@ class ShopifyAPIPool:
         # SITE_429_REMOVAL_THRESHOLD intentionally removed — do not re-add
         # removal-on-429 logic here.
 
+        # ============ BUILT-IN PROXY POOL (for /sh and /msh) ============
+        # These get forwarded to the checker API's own Shopify-facing
+        # requests (via params["proxy"], which api_test.py's parse_proxy
+        # already understands) so checks don't all hit Shopify from the
+        # bare server IP and trip anti-bot/rate-limit blocks. Rotated
+        # round-robin, independent of any user's personal proxy list.
+        self.BUILTIN_PROXIES = [
+            "http://xCCeDDxGajnHMMP:GJXacZHRxo2lWy8@51.194.81.95:42142",
+            "http://OsrF7cw1vd6pWCG:WwtL6DL3mrras9g@178.93.24.39:46268",
+            "http://oUTa8NYWUrUh1DW:zWWI5ciraWNKGje@178.93.24.47:48331",
+            "http://BiWxEfc6Cv0Nf5s:W5St0Z5A0dQTJXW@178.93.24.186:49666",
+            "http://S1d8W4F03wLvMBu:BAJJfBuVt7FGgvx@51.146.83.102:45001",
+            "http://7qrRYKjtXncpCCS:6brV6m4mS3mmuQj@178.93.24.98:43148",
+            "http://D8Qi3bkztktFyGG:qcWe3JWNvTNl6c0@51.146.83.33:41999",
+            "http://J77MWmNMbyHshQx:qxLr1gzMscqTBSS@51.194.81.213:42742",
+            "http://b87Ybxrdpiyruz6:fNTpAnEiFsAUMv1@51.194.81.234:46409",
+            "http://glgJw95Xv3dn6wE:2Eby9L9WDgq82UY@51.194.81.47:42198",
+            "http://CevpkxREzsiQDHT:rZjY418wMWZ09mx@178.93.24.8:41365",
+        ]
+        self._builtin_proxy_index = 0
+        self._builtin_proxy_lock = asyncio.Lock()
+        # proxy -> cooldown_until timestamp (same idea as site_cooldown,
+        # so a single proxy getting 407/429'd doesn't keep getting picked)
+        self.builtin_proxy_cooldown = {}
+        self.BUILTIN_PROXY_COOLDOWN = 60
+
         self._load_site_performance()
 
         for api in self.apis:
@@ -13390,6 +13416,31 @@ class ShopifyAPIPool:
             print(f"   • {api['name']}: {api['url']} (weight: {api.get('weight', 1)})")
         print(f"📊 Loaded performance data for {len(self.site_performance)} sites")
         print(f"⏸️ 429 site cooldown: {self.SITE_429_COOLDOWN}s (sites are NEVER removed for 429)")
+
+    # ---------------------------------------------------------------
+    #  BUILT-IN PROXY POOL
+    # ---------------------------------------------------------------
+    async def get_builtin_proxy(self) -> Optional[str]:
+        """Round-robin pick from BUILTIN_PROXIES, skipping any on cooldown."""
+        if not self.BUILTIN_PROXIES:
+            return None
+        now = time.time()
+        async with self._builtin_proxy_lock:
+            n = len(self.BUILTIN_PROXIES)
+            for _ in range(n):
+                proxy = self.BUILTIN_PROXIES[self._builtin_proxy_index % n]
+                self._builtin_proxy_index += 1
+                cooldown_until = self.builtin_proxy_cooldown.get(proxy, 0)
+                if now >= cooldown_until:
+                    return proxy
+            # Every proxy is on cooldown — just hand back the next one anyway
+            # rather than checking with no proxy at all.
+            return self.BUILTIN_PROXIES[self._builtin_proxy_index % n]
+
+    def mark_builtin_proxy_cooldown(self, proxy: str):
+        """Put a built-in proxy on a short cooldown after a 407/429/error."""
+        if proxy in self.BUILTIN_PROXIES:
+            self.builtin_proxy_cooldown[proxy] = time.time() + self.BUILTIN_PROXY_COOLDOWN
 
     # ---------------------------------------------------------------
     #  PERSISTENCE
@@ -13658,9 +13709,9 @@ class ShopifyAPIPool:
         attempt = 0
         max_attempts = 5000
 
-        # Proxy support removed from Shopify checks entirely — every
-        # attempt runs on a direct connection regardless of what's
-        # configured for this user or globally.
+        # Per-user personal proxies stay disabled here (unchanged, as before).
+        # Every check now falls back to the built-in rotating proxy pool
+        # below instead of hitting Shopify from a bare direct connection.
         user_proxies = []
 
         if site:
@@ -13713,6 +13764,11 @@ class ShopifyAPIPool:
                     current_proxy = proxy
             elif proxy:
                 current_proxy = proxy
+            else:
+                # No per-user proxy configured/given — use the built-in pool.
+                current_proxy = await self.get_builtin_proxy()
+                if current_proxy:
+                    print(f"🔄 [BUILTIN PROXY] {mask_proxy(current_proxy)}")
 
             print(f"\n🔍 [API POOL] Attempt {attempt} — site: {current_site}")
             print(f"📊 Sites tried: {len(tried_sites)}/{len(autosopi_site_manager.sites)}")
@@ -14006,6 +14062,8 @@ class ShopifyAPIPool:
                     await autosopi_proxy_tracker.record_proxy_result(
                         user_id, proxy, "407 Proxy Authentication Required", elapsed
                     )
+                if proxy:
+                    self.mark_builtin_proxy_cooldown(proxy)
                 return {
                     "status": "error", "result": "PROXY_AUTH_FAILED",
                     "message": "407 Proxy Authentication Required — trying next proxy",
