@@ -13369,32 +13369,6 @@ class ShopifyAPIPool:
         # SITE_429_REMOVAL_THRESHOLD intentionally removed — do not re-add
         # removal-on-429 logic here.
 
-        # ============ BUILT-IN PROXY POOL (for /sh and /msh) ============
-        # These get forwarded to the checker API's own Shopify-facing
-        # requests (via params["proxy"], which api_test.py's parse_proxy
-        # already understands) so checks don't all hit Shopify from the
-        # bare server IP and trip anti-bot/rate-limit blocks. Rotated
-        # round-robin, independent of any user's personal proxy list.
-        self.BUILTIN_PROXIES = [
-            "http://xCCeDDxGajnHMMP:GJXacZHRxo2lWy8@51.194.81.95:42142",
-            "http://OsrF7cw1vd6pWCG:WwtL6DL3mrras9g@178.93.24.39:46268",
-            "http://oUTa8NYWUrUh1DW:zWWI5ciraWNKGje@178.93.24.47:48331",
-            "http://BiWxEfc6Cv0Nf5s:W5St0Z5A0dQTJXW@178.93.24.186:49666",
-            "http://S1d8W4F03wLvMBu:BAJJfBuVt7FGgvx@51.146.83.102:45001",
-            "http://7qrRYKjtXncpCCS:6brV6m4mS3mmuQj@178.93.24.98:43148",
-            "http://D8Qi3bkztktFyGG:qcWe3JWNvTNl6c0@51.146.83.33:41999",
-            "http://J77MWmNMbyHshQx:qxLr1gzMscqTBSS@51.194.81.213:42742",
-            "http://b87Ybxrdpiyruz6:fNTpAnEiFsAUMv1@51.194.81.234:46409",
-            "http://glgJw95Xv3dn6wE:2Eby9L9WDgq82UY@51.194.81.47:42198",
-            "http://CevpkxREzsiQDHT:rZjY418wMWZ09mx@178.93.24.8:41365",
-        ]
-        self._builtin_proxy_index = 0
-        self._builtin_proxy_lock = asyncio.Lock()
-        # proxy -> cooldown_until timestamp (same idea as site_cooldown,
-        # so a single proxy getting 407/429'd doesn't keep getting picked)
-        self.builtin_proxy_cooldown = {}
-        self.BUILTIN_PROXY_COOLDOWN = 60
-
         self._load_site_performance()
 
         for api in self.apis:
@@ -13416,31 +13390,6 @@ class ShopifyAPIPool:
             print(f"   • {api['name']}: {api['url']} (weight: {api.get('weight', 1)})")
         print(f"📊 Loaded performance data for {len(self.site_performance)} sites")
         print(f"⏸️ 429 site cooldown: {self.SITE_429_COOLDOWN}s (sites are NEVER removed for 429)")
-
-    # ---------------------------------------------------------------
-    #  BUILT-IN PROXY POOL
-    # ---------------------------------------------------------------
-    async def get_builtin_proxy(self) -> Optional[str]:
-        """Round-robin pick from BUILTIN_PROXIES, skipping any on cooldown."""
-        if not self.BUILTIN_PROXIES:
-            return None
-        now = time.time()
-        async with self._builtin_proxy_lock:
-            n = len(self.BUILTIN_PROXIES)
-            for _ in range(n):
-                proxy = self.BUILTIN_PROXIES[self._builtin_proxy_index % n]
-                self._builtin_proxy_index += 1
-                cooldown_until = self.builtin_proxy_cooldown.get(proxy, 0)
-                if now >= cooldown_until:
-                    return proxy
-            # Every proxy is on cooldown — just hand back the next one anyway
-            # rather than checking with no proxy at all.
-            return self.BUILTIN_PROXIES[self._builtin_proxy_index % n]
-
-    def mark_builtin_proxy_cooldown(self, proxy: str):
-        """Put a built-in proxy on a short cooldown after a 407/429/error."""
-        if proxy in self.BUILTIN_PROXIES:
-            self.builtin_proxy_cooldown[proxy] = time.time() + self.BUILTIN_PROXY_COOLDOWN
 
     # ---------------------------------------------------------------
     #  PERSISTENCE
@@ -13703,7 +13652,7 @@ class ShopifyAPIPool:
     # ---------------------------------------------------------------
     #  MAIN CARD CHECK (skips cooldown sites & proxies)
     # ---------------------------------------------------------------
-    async def check_card_with_pool(self, card: str, site: str, proxy: str = None, user_id: int = None) -> Dict:
+    async def check_card_with_pool(self, card: str, site: str, proxy: str = None, user_id: int = None, use_global_proxy: bool = False) -> Dict:
         tried_sites = []
         tried_proxies = []
         attempt = 0
@@ -13764,11 +13713,13 @@ class ShopifyAPIPool:
                     current_proxy = proxy
             elif proxy:
                 current_proxy = proxy
-            else:
-                # No per-user proxy configured/given — use the built-in pool.
-                current_proxy = await self.get_builtin_proxy()
+            elif use_global_proxy:
+                # Mass check (/msh) only — rotate through the bot's global
+                # proxy pool. /sh (single + multi) stays on a direct
+                # connection; this flag is never set for those paths.
+                current_proxy = global_proxy_pool.get_next_proxy()
                 if current_proxy:
-                    print(f"🔄 [BUILTIN PROXY] {mask_proxy(current_proxy)}")
+                    print(f"🔄 [GLOBAL PROXY] {mask_proxy(current_proxy)}")
 
             print(f"\n🔍 [API POOL] Attempt {attempt} — site: {current_site}")
             print(f"📊 Sites tried: {len(tried_sites)}/{len(autosopi_site_manager.sites)}")
@@ -14063,7 +14014,7 @@ class ShopifyAPIPool:
                         user_id, proxy, "407 Proxy Authentication Required", elapsed
                     )
                 if proxy:
-                    self.mark_builtin_proxy_cooldown(proxy)
+                    global_proxy_pool.record_result(proxy, False, elapsed, "407 Proxy Authentication Required")
                 return {
                     "status": "error", "result": "PROXY_AUTH_FAILED",
                     "message": "407 Proxy Authentication Required — trying next proxy",
@@ -25785,7 +25736,13 @@ def format_proxy(proxy: str) -> str:
         return proxy
     parts = proxy.split(':')
     if len(parts) == 4:
-        user, password, host, port = parts
+        # Canonical 4-part order everywhere else in this bot is
+        # host:port:user:password (e.g. "brd.superproxy.io:44445:user:pass").
+        # This used to unpack as user:password:host:port, which silently
+        # built a garbage URL (zone name as host, password as port) that
+        # could never connect — every proxy tested this way looked dead
+        # even when it was perfectly live.
+        host, port, user, password = parts
         return f"http://{user}:{password}@{host}:{port}"
     if len(parts) == 2:
         return f"http://{proxy}"
@@ -30366,6 +30323,59 @@ async def removeglobalproxy_command(update: Update, context: ContextTypes.DEFAUL
             f"❌ Proxy not found in global pool.",
             parse_mode=ParseMode.HTML
         )
+
+
+async def gclear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove ALL proxies from the global pool - /gclear (admin only, USE WITH CAUTION)"""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Admin only command.")
+        return
+
+    total = len(global_proxy_pool.proxies)
+    if total == 0:
+        await update.message.reply_text("📋 Global proxy pool is already empty.")
+        return
+
+    keyboard = [[
+        InlineKeyboardButton("✅ YES, CLEAR ALL", callback_data='confirm_gclear', style='danger'),
+        InlineKeyboardButton("❌ CANCEL", callback_data='cancel_gclear', style='primary')
+    ]]
+
+    await update.message.reply_text(
+        f"⚠️ <b>WARNING: Clear Global Proxy Pool</b>\n\n"
+        f"This will remove ALL {total} proxies from the global pool.\n"
+        f"<code>/sh</code> and <code>/msh</code> will fall back to direct connections "
+        f"until new proxies are added.\n\n"
+        f"<b>This action cannot be undone!</b>\n\n"
+        f"Are you sure?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def gclear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the confirm/cancel buttons for /gclear."""
+    query = update.callback_query
+
+    if query.from_user.id != OWNER_ID:
+        await query.answer("❌ Admin only.", show_alert=True)
+        return
+
+    if query.data == 'cancel_gclear':
+        await query.answer("Cancelled")
+        await query.edit_message_text("❌ Cancelled — no proxies were removed.", reply_markup=back_menu())
+        return
+
+    await query.answer("Clearing global proxy pool...")
+    removed = global_proxy_pool.clear_all()
+
+    await query.edit_message_text(
+        f"🗑️ <b>Global Proxy Pool Cleared!</b>\n\n"
+        f"✅ Removed {removed} proxies\n\n"
+        f"Use <code>/addglobalproxy</code> or <code>/massglobalproxy</code> to add more.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=back_menu()
+    )
 
 
 async def globalproxies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -65470,7 +65480,9 @@ async def autosopi_mass_check_logic(update: Update, context: ContextTypes.DEFAUL
                 start_time_card = time.time()
 
                 try:
-                    result = await shopify_api_pool.check_card_with_pool(card, site, current_proxy, u_id)
+                    result = await shopify_api_pool.check_card_with_pool(
+                        card, site, current_proxy, u_id, use_global_proxy=True
+                    )
                     elapsed = time.time() - start_time_card
                 except Exception as api_error:
                     print(f"❌ [CARD #{idx}] API error: {api_error}")
@@ -82616,6 +82628,9 @@ def main():
     app.add_handler(CommandHandler("addglobalproxy", addglobalproxy_command))
     app.add_handler(CommandHandler("massglobalproxy", massglobalproxy_command))
     app.add_handler(CommandHandler("removeglobalproxy", removeglobalproxy_command))
+    app.add_handler(CommandHandler("gclear", gclear_command))
+    app.add_handler(CallbackQueryHandler(gclear_callback, pattern='confirm_gclear'))
+    app.add_handler(CallbackQueryHandler(gclear_callback, pattern='cancel_gclear'))
     app.add_handler(CommandHandler("globalproxies", globalproxies_command))
     app.add_handler(CommandHandler("globalproxy_on", globalproxy_enable_command))
     app.add_handler(CommandHandler("globalproxy_off", globalproxy_disable_command))
