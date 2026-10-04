@@ -42683,8 +42683,8 @@ async def shopify_mass_check_logic(update: Update, context: ContextTypes.DEFAULT
         CONCURRENCY = {
             "free": 1,
             "premium": 1,
-            "ultimate": 2,
-            "admin": 2,
+            "ultimate": 50,
+            "admin": 50,
         }.get(tier, 1)
         
         stats = {
