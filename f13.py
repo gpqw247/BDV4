@@ -13657,6 +13657,12 @@ class ShopifyAPIPool:
         tried_proxies = []
         attempt = 0
         max_attempts = 5000
+        # Dedicated retry cap — ONLY for "Gateway: UNKNOWN, Price: 0.0" and
+        # "No Products" responses. Nothing else is capped by this counter;
+        # every other retryable condition still runs through the full
+        # max_attempts site rotation as before.
+        no_product_or_unknown_retries = 0
+        NO_PRODUCT_OR_UNKNOWN_RETRY_LIMIT = 3
 
         # Per-user personal proxies stay disabled here (unchanged, as before).
         # Every check now falls back to the built-in rotating proxy pool
@@ -13714,9 +13720,8 @@ class ShopifyAPIPool:
             elif proxy:
                 current_proxy = proxy
             elif use_global_proxy:
-                # Mass check (/msh) only — rotate through the bot's global
-                # proxy pool. /sh (single + multi) stays on a direct
-                # connection; this flag is never set for those paths.
+                # /sh and /msh both rotate through the bot's global proxy
+                # pool here (round-robin, a different proxy per attempt).
                 current_proxy = global_proxy_pool.get_next_proxy()
                 if current_proxy:
                     print(f"🔄 [GLOBAL PROXY] {mask_proxy(current_proxy)}")
@@ -13756,12 +13761,17 @@ class ShopifyAPIPool:
                     continue
 
                 if result.get("result") == "NO_PRODUCT_ERROR":
-                    print(f"🔄 [NO PRODUCT] {current_site} — removed and trying next site")
-                    # site already removed from rotation inside _make_api_request;
-                    # remove from tried_sites so the pool doesn't count it as
-                    # "already tried" — it's gone, a fresh site should take its place.
+                    no_product_or_unknown_retries += 1
                     if current_site in tried_sites:
                         tried_sites.remove(current_site)
+                    if no_product_or_unknown_retries >= NO_PRODUCT_OR_UNKNOWN_RETRY_LIMIT:
+                        print(f"🔄 [NO PRODUCT] {current_site} — hit {NO_PRODUCT_OR_UNKNOWN_RETRY_LIMIT}x retry limit, giving up")
+                        result["api_used"] = api_name
+                        result["api_attempt"] = attempt
+                        result["site_used"] = current_site
+                        result["proxy_used"] = current_proxy
+                        return result
+                    print(f"🔄 [NO PRODUCT] {current_site} — retry {no_product_or_unknown_retries}/{NO_PRODUCT_OR_UNKNOWN_RETRY_LIMIT}, trying next site")
                     continue
 
                 # 429 → retry with different site & proxy. This MUST run before
@@ -13795,11 +13805,20 @@ class ShopifyAPIPool:
                 if (result.get("gateway", "").upper() in ("UNKNOWN", "GATEWAY UNKNOWN", "UNKNOWN GATEWAY")
                         and float(result.get("price", "0") or "0") == 0.0
                         and not any(p in _unk_gw_response_upper for p in _unk_gw_known_patterns)):
-                    # NOTE: sites are never auto-removed/demoted anymore, for
-                    # any error. Only /rgood removes a site. We just skip this
-                    # site for the rest of THIS card's attempts (stays in
-                    # tried_sites) and retry with a different one.
-                    print(f"🔄 [UNKNOWN GW / 0 PRICE] {current_site} — skipping this attempt, trying another site (not removed)")
+                    # NOTE: sites are never auto-removed/demoted for this.
+                    # Only /rgood removes a site. We just skip this site for
+                    # the rest of THIS card's attempts (stays in tried_sites)
+                    # and retry with a different one — up to the shared
+                    # 3x cap with NO_PRODUCT_ERROR above.
+                    no_product_or_unknown_retries += 1
+                    if no_product_or_unknown_retries >= NO_PRODUCT_OR_UNKNOWN_RETRY_LIMIT:
+                        print(f"🔄 [UNKNOWN GW / 0 PRICE] {current_site} — hit {NO_PRODUCT_OR_UNKNOWN_RETRY_LIMIT}x retry limit, giving up")
+                        result["api_used"] = api_name
+                        result["api_attempt"] = attempt
+                        result["site_used"] = current_site
+                        result["proxy_used"] = current_proxy
+                        return result
+                    print(f"🔄 [UNKNOWN GW / 0 PRICE] {current_site} — retry {no_product_or_unknown_retries}/{NO_PRODUCT_OR_UNKNOWN_RETRY_LIMIT}, trying another site")
                     continue
 
                 response_text = result.get("message", "")
@@ -14079,27 +14098,26 @@ class ShopifyAPIPool:
 
             response_upper = response_text.upper()
 
-            # -------- FAKE GATEWAY ----------
-            is_fake = False
-            fake_detected = ""
-            for pattern in fake_gateway_patterns:
-                if pattern in response_text or pattern.upper() in response_upper:
-                    is_fake = True
-                    fake_detected = pattern
-                    break
-            if "Gateway" in data:
-                gv = data.get("Gateway", "")
-                for pattern in fake_gateway_patterns:
-                    if pattern in gv or pattern.upper() in gv.upper():
-                        is_fake = True
-                        fake_detected = pattern
-                        break
+            # -------- FAKE GATEWAY (the one case that DOES remove the site) --------
+            # Only "Shopify Payments" is a valid gateway for this flow. If the
+            # site reports a different NAMED gateway (Authorize.net, Stripe,
+            # Braintree, Square, PayPal, etc.) it isn't really running native
+            # Shopify Payments checkout, so it's permanently removed from
+            # rotation — same removal /rgood performs. "UNKNOWN"/empty does
+            # NOT count as fake here (that's incomplete API metadata, not a
+            # real gateway name — handled separately, never removes).
+            gateway_clean = (gateway or "").strip()
+            gateway_upper_clean = gateway_clean.upper()
+            is_fake = bool(gateway_clean) and gateway_upper_clean not in (
+                "SHOPIFY PAYMENTS", "UNKNOWN", "GATEWAY UNKNOWN", "UNKNOWN GATEWAY"
+            )
+            fake_detected = gateway_clean if is_fake else ""
 
             if is_fake:
-                # Not auto-removed anymore — just skip this site for the
-                # rest of this card's attempts and retry with another one.
-                # Only /rgood actually removes a site from rotation now.
-                print(f"⚠️ [FAKE GATEWAY] {fake_detected} on {site_clean} — skipping, not removing (use /rgood to remove)")
+                print(f"🗑️ [FAKE GATEWAY] '{fake_detected}' (not Shopify Payments) on {site_clean} — removing from rotation + GOOD list")
+                full_remove_site_from_rotation(site_clean, OWNER_ID)
+                self.site_performance.pop(site_clean, None)
+                self.good_sites_cache_time = 0
                 return {
                     "status": "error", "result": "FAKE_GATEWAY",
                     "message": f"Fake gateway: {fake_detected}",
@@ -47021,7 +47039,7 @@ async def run_shopify_multi_check(update: Update, context: ContextTypes.DEFAULT_
                     await _safe_edit()
                     continue
 
-                result = await shopify_api_pool.check_card_with_pool(card, site, None, u_id)
+                result = await shopify_api_pool.check_card_with_pool(card, site, None, u_id, use_global_proxy=True)
 
                 status_category = result.get("status_category", "declined")
                 response_msg = result.get("message", result.get("status_display", "Unknown"))
@@ -49081,8 +49099,8 @@ async def single_check_shopify_pool(update: Update, context: ContextTypes.DEFAUL
                 add_user_credits(u_id, 1)  # refund credit
             return
 
-        # ── Run the API-pool check (no proxy — direct connection) ─────
-        result = await shopify_api_pool.check_card_with_pool(card, site, None, u_id)
+        # ── Run the API-pool check (global proxy pool, rotated) ─────
+        result = await shopify_api_pool.check_card_with_pool(card, site, None, u_id, use_global_proxy=True)
 
         elapsed         = result.get("elapsed", 0)
         status_display  = result.get("status_display", "❌ DECLINED")
