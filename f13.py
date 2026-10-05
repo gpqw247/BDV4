@@ -19854,9 +19854,25 @@ def tn_gateway_list_text() -> str:
     return "\n".join(lines)
 
 
+def _tn_parse_duration(token: str):
+    """
+    Parse an optional trailing duration token for /tn auto-repeat mode.
+        '30s' -> 30, '10m' -> 600, '1h' -> 3600
+    Returns None when the token is not a duration (e.g. a plain count).
+    """
+    if not token:
+        return None
+    m = re.fullmatch(r"(\d+)\s*([smh])", token.strip().lower())
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n * {"s": 1, "m": 60, "h": 3600}[m.group(2)]
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  /tn — Test Hit Notification (exact same format as real hits)
-#  Usage: /tn <gateway> <count>   ·   /tn list
+#  Usage: /tn <gateway> [username] [emoji] <count> [duration]
+#     e.g. /tn Shopify Payments 🎁 1 10m   (auto-repeat for 10 minutes)
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -19890,32 +19906,45 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await message.reply_text(
             "🧪 <b>Test Hit Notification</b>\n\n"
-            "Usage: <code>/tn &lt;gateway&gt; [username] &lt;count&gt;</code>\n"
+            "Usage: <code>/tn &lt;gateway&gt; [username] [emoji] &lt;count&gt; [duration]</code>\n"
             "Examples:\n"
             "   <code>/tn paypal 2</code>\n"
             "   <code>/tn Stripe SK Charge 3</code>\n"
-            "   <code>/tn Shopify Payments VIPER_SNKE 1</code>\n\n"
+            "   <code>/tn Shopify Payments VIPER_SNKE 1</code>\n"
+            "   <code>/tn Shopify Payments 🎁 1 10m</code>  (auto-repeat 10 min)\n\n"
+            "Duration suffix (optional): <code>30s</code> · <code>10m</code> · <code>1h</code>\n"
             "Type <code>/tn list</code> to see all gateways.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    if len(context.args) == 1 and context.args[0].strip().lower() in ("list", "gateways", "all"):
+    args = list(context.args)
+
+    # Optional trailing duration → auto-repeat mode. Must be the LAST token
+    # (e.g. /tn Shopify Payments 🎁 1 10m), so strip it before reading count.
+    duration_seconds = None
+    if len(args) >= 2:
+        _dur = _tn_parse_duration(args[-1])
+        if _dur is not None:
+            duration_seconds = _dur
+            args = args[:-1]
+
+    if len(args) == 1 and args[0].strip().lower() in ("list", "gateways", "all"):
         await message.reply_text(tn_gateway_list_text(), parse_mode=ParseMode.HTML)
         return
 
-    if len(context.args) < 2:
+    if len(args) < 2:
         await message.reply_text(
             "❌ Missing count.\n"
-            "Usage: <code>/tn &lt;gateway&gt; [username] &lt;count&gt;</code>\n"
+            "Usage: <code>/tn &lt;gateway&gt; [username] [emoji] &lt;count&gt; [duration]</code>\n"
             "Example: <code>/tn paypal 2</code>",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    # Count is the LAST token.
+    # Count is the LAST remaining token.
     try:
-        count = int(context.args[-1])
+        count = int(args[-1])
     except ValueError:
         await message.reply_text(
             "❌ The last value must be a number (the count).\n"
@@ -19924,7 +19953,7 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    middle = context.args[:-1]  # everything between /tn and the count
+    middle = args[:-1]  # everything between /tn and the count
 
     # ── Premium emoji handling ─────────────────────────────────────────
     # Pull custom-emoji tokens out of the args before resolving the gateway.
@@ -20051,11 +20080,16 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
        
 
     # ── Confirmation to admin ──────────────────────────────────────────
+    _mode_line = (
+        f"🔁 Mode: <b>Auto</b> · {count} hit(s) every 1–30s for <b>{duration_seconds}s</b>"
+        if duration_seconds
+        else f"🎯 Tier: <b>ULTIMATE</b>"
+    )
     status_msg = await message.reply_text(
         f"🧪 <b>Sending {count} test hit(s)…</b>\n\n"
         f"🌐 Gateway: <b>{gateway_display}</b>\n"
         f"👤 User: <b>{target_username}</b>\n"
-        f"🎯 Tier: <b>ULTIMATE</b>",
+        f"{_mode_line}",
         parse_mode=ParseMode.HTML,
     )
 
@@ -20067,79 +20101,134 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent_ok = 0
     sent_fail = 0
 
-    try:
-        for i in range(1, count + 1):
-            price_val = round(random.uniform(1.00, 5.00), 2)
-            price_display = f"${price_val:.2f}"
-            response_text = random.choice(RESPONSES)
+    async def send_one(label: str):
+        """Send a single test hit; flood-safe (retries once on 429)."""
+        nonlocal sent_ok, sent_fail
+        price_val = round(random.uniform(1.00, 5.00), 2)
+        price_display = f"${price_val:.2f}"
+        response_text = random.choice(RESPONSES)
 
-            hit_message = build_hit_message(
-                target_username, price_display, response_text
-            )
-
-            try:
-                await context.bot.send_message(
-                    chat_id=HIT_NOTIFICATION_GROUP_ID,
-                    text=hit_message,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=reply_markup, 
-                    disable_web_page_preview=True,
-                )
-                sent_ok += 1
-                print(f"✅ [TN] Sent {i}/{count} — {price_display} — {response_text}")
-
-            except Exception as e:
-                sent_fail += 1
-                err_s = str(e).lower()
-                print(f"❌ [TN] Send {i}/{count} failed: {e}")
-
-                # Flood control — wait and retry once
-                if "retry after" in err_s or "flood" in err_s:
-                    m = re.search(r"retry after (\d+)", err_s)
-                    wait_s = int(m.group(1)) if m else 5
-                    print(f"⏸️ [TN] Flood control — waiting {wait_s}s")
-                    await asyncio.sleep(wait_s + 1)
-                    try:
-                        await context.bot.send_message(
-                            chat_id=HIT_NOTIFICATION_GROUP_ID,
-                            text=hit_message,
-                            parse_mode=ParseMode.HTML,
-                            reply_markup=reply_markup,
-                        )
-                        sent_ok += 1
-                        sent_fail -= 1
-                    except Exception:
-                        pass
-
-            # 0–1 second delay
-            if i < count:
-                await asyncio.sleep(random.uniform(0.0, 1.0))
-
-            # Progress update every 10 or at end
-            if i % 10 == 0 or i == count:
-                try:
-                    await status_msg.edit_text(
-                        f"🧪 <b>Sending test hits…</b>\n\n"
-                        f"👤 User: <b>{target_username}</b>\n"
-                        f"📊 Progress: <b>{i}/{count}</b>\n"
-                        f"✅ Sent: <b>{sent_ok}</b>\n"
-                        f"❌ Failed: <b>{sent_fail}</b>",
-                        parse_mode=ParseMode.HTML,
-                    )
-                except Exception:
-                    pass
+        hit_message = build_hit_message(
+            target_username, price_display, response_text
+        )
 
         try:
+            await context.bot.send_message(
+                chat_id=HIT_NOTIFICATION_GROUP_ID,
+                text=hit_message,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+            sent_ok += 1
+            print(f"✅ [TN] Sent {label} — {price_display} — {response_text}")
+            return True
+
+        except Exception as e:
+            sent_fail += 1
+            err_s = str(e).lower()
+            print(f"❌ [TN] Send {label} failed: {e}")
+
+            # Flood control — wait and retry once
+            if "retry after" in err_s or "flood" in err_s:
+                m = re.search(r"retry after (\d+)", err_s)
+                wait_s = int(m.group(1)) if m else 5
+                print(f"⏸️ [TN] Flood control — waiting {wait_s}s")
+                await asyncio.sleep(wait_s + 1)
+                try:
+                    await context.bot.send_message(
+                        chat_id=HIT_NOTIFICATION_GROUP_ID,
+                        text=hit_message,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=reply_markup,
+                    )
+                    sent_ok += 1
+                    sent_fail -= 1
+                    return True
+                except Exception:
+                    pass
+            return False
+
+    async def update_status(header: str, extra: str = ""):
+        """Edit the admin status message (best-effort, never raises)."""
+        try:
             await status_msg.edit_text(
-                f"✅ <b>Test Hit Batch Complete</b>\n\n"
+                f"{header}\n\n"
+                f"🌐 Gateway: <b>{gateway_display}</b>\n"
                 f"👤 User: <b>{target_username}</b>\n"
-                f"📤 Requested: <b>{count}</b>\n"
+                f"{extra}"
                 f"✅ Sent: <b>{sent_ok}</b>\n"
                 f"❌ Failed: <b>{sent_fail}</b>",
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
             pass
+
+    try:
+        if duration_seconds:
+            # ── AUTO-REPEAT MODE ───────────────────────────────────────
+            # /tn <gateway> [emoji] <count> <duration>  e.g. ... 1 10m
+            # Sends <count> hit(s), waits a random 1–30s, and repeats until
+            # <duration> has elapsed.
+            start_ts = time.monotonic()
+            end_ts = start_ts + duration_seconds
+            rounds = 0
+            await update_status(
+                "🧪 <b>Auto Test Hits — running…</b>",
+                f"⏱️ Duration: <b>{duration_seconds}s</b>\n",
+            )
+            while time.monotonic() < end_ts:
+                rounds += 1
+                for j in range(1, count + 1):
+                    if time.monotonic() >= end_ts:
+                        break
+                    await send_one(f"r{rounds}.{j}")
+                    if j < count:
+                        await asyncio.sleep(random.uniform(0.0, 1.0))
+                elapsed = int(time.monotonic() - start_ts)
+                await update_status(
+                    "🧪 <b>Auto Test Hits — running…</b>",
+                    f"⏱️ Elapsed: <b>{elapsed}s</b> / {duration_seconds}s\n"
+                    f"🔁 Rounds: <b>{rounds}</b>\n",
+                )
+                # Random 1–30s delay between rounds
+                if time.monotonic() < end_ts:
+                    await asyncio.sleep(random.uniform(1.0, 30.0))
+            await update_status(
+                "✅ <b>Auto Test Hits Complete</b>",
+                f"⏱️ Duration: <b>{duration_seconds}s</b>\n"
+                f"🔁 Rounds: <b>{rounds}</b>\n",
+            )
+        else:
+            # ── SINGLE BATCH MODE (unchanged behaviour) ────────────────
+            for i in range(1, count + 1):
+                await send_one(f"{i}/{count}")
+                if i < count:
+                    await asyncio.sleep(random.uniform(0.0, 1.0))
+                if i % 10 == 0 or i == count:
+                    try:
+                        await status_msg.edit_text(
+                            f"🧪 <b>Sending test hits…</b>\n\n"
+                            f"👤 User: <b>{target_username}</b>\n"
+                            f"📊 Progress: <b>{i}/{count}</b>\n"
+                            f"✅ Sent: <b>{sent_ok}</b>\n"
+                            f"❌ Failed: <b>{sent_fail}</b>",
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception:
+                        pass
+
+            try:
+                await status_msg.edit_text(
+                    f"✅ <b>Test Hit Batch Complete</b>\n\n"
+                    f"👤 User: <b>{target_username}</b>\n"
+                    f"📤 Requested: <b>{count}</b>\n"
+                    f"✅ Sent: <b>{sent_ok}</b>\n"
+                    f"❌ Failed: <b>{sent_fail}</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
 
     except Exception as e:
         print(f"❌ [TN] Error: {e}")
