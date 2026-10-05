@@ -13672,12 +13672,26 @@ class ShopifyAPIPool:
         tried_proxies = []
         attempt = 0
         max_attempts = 5000
-        # Dedicated retry cap — ONLY for "Gateway: UNKNOWN, Price: 0.0" and
-        # "No Products" responses. Nothing else is capped by this counter;
-        # every other retryable condition still runs through the full
-        # max_attempts site rotation as before.
-        no_product_or_unknown_retries = 0
-        NO_PRODUCT_OR_UNKNOWN_RETRY_LIMIT = 3
+        # Dedicated retry cap for "soft" site errors where the site itself
+        # simply can't process this card and trying a fresh site is worth it:
+        #   • No products in range ("No products under $X")
+        #   • Unknown gateway / 0.00 price
+        #   • PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED
+        #   • Site not supported
+        #   • Site requires login
+        # Each soft error consumes one of the 3 retries; after 3 retries the
+        # card is given up on. Every other retryable condition still runs
+        # through the full max_attempts site rotation as before.
+        soft_site_retries = 0
+        SOFT_SITE_RETRY_LIMIT = 3
+        SOFT_SITE_ERRORS = (
+            "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED",
+            "SITE NOT SUPPORTED",
+            "SITE REQUIRES LOGIN",
+            "REQUIRES LOGIN",
+            "LOGIN REQUIRED",
+            "CART FAILED WITH STATUS 422",
+        )
 
         # Per-user personal proxies stay disabled here (unchanged, as before).
         # Every check now falls back to the built-in rotating proxy pool
@@ -13761,12 +13775,22 @@ class ShopifyAPIPool:
                     self.mark_api_result(api_name, False, elapsed, True)
                     continue
 
-                # Site removed by API request
-                if result.get("site_removed", False):
-                    reason = result.get("result", "Unknown")
-                    print(f"🗑️ [API POOL] Site {current_site} removed ({reason})")
+                # NO_PRODUCT_ERROR must be handled BEFORE the generic
+                # site_removed branch below: the API flags no-product results
+                # with site_removed=True too, so checking site_removed first
+                # would skip the 3x retry cap and loop the whole site pool.
+                if result.get("result") == "NO_PRODUCT_ERROR":
+                    soft_site_retries += 1
                     if current_site in tried_sites:
                         tried_sites.remove(current_site)
+                    if soft_site_retries > SOFT_SITE_RETRY_LIMIT:
+                        print(f"🔄 [NO PRODUCT] {current_site} — hit {SOFT_SITE_RETRY_LIMIT}x retry limit, giving up")
+                        result["api_used"] = api_name
+                        result["api_attempt"] = attempt
+                        result["site_used"] = current_site
+                        result["proxy_used"] = current_proxy
+                        return result
+                    print(f"🔄 [NO PRODUCT] {current_site} — retry {soft_site_retries}/{SOFT_SITE_RETRY_LIMIT}, trying next site")
                     continue
 
                 if result.get("result") == "FAKE_GATEWAY":
@@ -13775,18 +13799,12 @@ class ShopifyAPIPool:
                         tried_sites.remove(current_site)
                     continue
 
-                if result.get("result") == "NO_PRODUCT_ERROR":
-                    no_product_or_unknown_retries += 1
+                # Site removed by API request (any other removal reason)
+                if result.get("site_removed", False):
+                    reason = result.get("result", "Unknown")
+                    print(f"🗑️ [API POOL] Site {current_site} removed ({reason})")
                     if current_site in tried_sites:
                         tried_sites.remove(current_site)
-                    if no_product_or_unknown_retries >= NO_PRODUCT_OR_UNKNOWN_RETRY_LIMIT:
-                        print(f"🔄 [NO PRODUCT] {current_site} — hit {NO_PRODUCT_OR_UNKNOWN_RETRY_LIMIT}x retry limit, giving up")
-                        result["api_used"] = api_name
-                        result["api_attempt"] = attempt
-                        result["site_used"] = current_site
-                        result["proxy_used"] = current_proxy
-                        return result
-                    print(f"🔄 [NO PRODUCT] {current_site} — retry {no_product_or_unknown_retries}/{NO_PRODUCT_OR_UNKNOWN_RETRY_LIMIT}, trying next site")
                     continue
 
                 # 429 → retry with different site & proxy. This MUST run before
@@ -13824,21 +13842,42 @@ class ShopifyAPIPool:
                     # Only /rgood removes a site. We just skip this site for
                     # the rest of THIS card's attempts (stays in tried_sites)
                     # and retry with a different one — up to the shared
-                    # 3x cap with NO_PRODUCT_ERROR above.
-                    no_product_or_unknown_retries += 1
-                    if no_product_or_unknown_retries >= NO_PRODUCT_OR_UNKNOWN_RETRY_LIMIT:
-                        print(f"🔄 [UNKNOWN GW / 0 PRICE] {current_site} — hit {NO_PRODUCT_OR_UNKNOWN_RETRY_LIMIT}x retry limit, giving up")
+                    # 3-retry cap with NO_PRODUCT_ERROR above.
+                    soft_site_retries += 1
+                    if soft_site_retries > SOFT_SITE_RETRY_LIMIT:
+                        print(f"🔄 [UNKNOWN GW / 0 PRICE] {current_site} — hit {SOFT_SITE_RETRY_LIMIT}x retry limit, giving up")
                         result["api_used"] = api_name
                         result["api_attempt"] = attempt
                         result["site_used"] = current_site
                         result["proxy_used"] = current_proxy
                         return result
-                    print(f"🔄 [UNKNOWN GW / 0 PRICE] {current_site} — retry {no_product_or_unknown_retries}/{NO_PRODUCT_OR_UNKNOWN_RETRY_LIMIT}, trying another site")
+                    print(f"🔄 [UNKNOWN GW / 0 PRICE] {current_site} — retry {soft_site_retries}/{SOFT_SITE_RETRY_LIMIT}, trying another site")
                     continue
 
                 response_text = result.get("message", "")
                 response_upper = response_text.upper()
                 status_category = result.get("status_category", "")
+
+                # ---- Soft "site can't be used" errors: cap at 3 retries ----
+                # PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED / "Site not supported"
+                # / "Site requires login!" are not the card's fault, so we try
+                # up to 3 fresh sites then give up (instead of looping the whole
+                # site pool). This also catches "Site requires login!", which
+                # the API returns as a plain (non-retryable) response.
+                if any(p in response_upper for p in SOFT_SITE_ERRORS):
+                    soft_site_retries += 1
+                    self.mark_api_result(api_name, False, elapsed, True)
+                    if current_site in tried_sites:
+                        tried_sites.remove(current_site)
+                    if soft_site_retries > SOFT_SITE_RETRY_LIMIT:
+                        print(f"🔄 [SITE UNSUPPORTED] {current_site} — hit {SOFT_SITE_RETRY_LIMIT}x retry limit, giving up")
+                        result["api_used"] = api_name
+                        result["api_attempt"] = attempt
+                        result["site_used"] = current_site
+                        result["proxy_used"] = current_proxy
+                        return result
+                    print(f"🔄 [SITE UNSUPPORTED] {current_site} — retry {soft_site_retries}/{SOFT_SITE_RETRY_LIMIT}, trying another site")
+                    continue
 
                 # Retryable errors
                 if status_category == "retryable":
@@ -19739,6 +19778,82 @@ def resolve_tn_gateway(query: str) -> Optional[str]:
     return None
 
 
+# ── Premium (custom) emoji support for /tn ──────────────────────────────
+# Type a NORMAL emoji in the /tn command and the bot sends it as the
+# Telegram Premium version of that emoji, using the custom-emoji ID below:
+#     /tn Shopify Payments 🎁 1
+# Add more pairs here as needed. If you send a REAL premium emoji instead,
+# its ID is read automatically from the message (custom_emoji entities), so
+# the map below is only required for plain/normal emojis.
+TN_PREMIUM_EMOJI_MAP = {
+    "🎁": "6269135402855044481",
+    "💎": "5427168083074628963",
+    "🔥": "5039670412733055750",
+    "💰": "5197434882321567830",
+    "✨": "5893321843149902412",
+    "⭐": "6282793227057632654",
+    "💀": "5042167377869932162",
+    "👾": "5298822932577937495",
+    "😈": "6268012745776588577",
+    "🌸": "6230927657257668107",
+    "🌐": "5426850247242418700",
+    "🔐": "5197288647275071607",
+    "🏆": "5188344996356448758",
+    "👤": "5307905813451397794",
+    "🧾": "5226929552319594190",
+    "⏳": "5206351870765300656",
+    "✅": "6266787022111773140",
+    "❌": "6267039884016358504",
+    "🎯": "5377336227533969892",
+    "📍": "6269135402855044481",
+    "💳": "5472250091332993630",
+    "🚀": "5196576190192096359",
+}
+
+
+def _tn_utf16_slice(text: str, offset: int, length: int) -> str:
+    """Slice text using Telegram's UTF-16 code-unit offsets."""
+    if not text:
+        return ""
+    try:
+        raw = text.encode("utf-16-le")
+        return raw[offset * 2:(offset + length) * 2].decode("utf-16-le", errors="ignore")
+    except Exception:
+        return ""
+
+
+def tn_extract_custom_emojis(message) -> dict:
+    """
+    Read every real Telegram premium emoji typed in the command and return
+    {emoji_char: custom_emoji_id}. Plain (non-premium) emojis are not here —
+    those are resolved from TN_PREMIUM_EMOJI_MAP instead.
+    """
+    found = {}
+    try:
+        entities = getattr(message, "entities", None) or []
+        text = getattr(message, "text", None) or ""
+        for ent in entities:
+            etype = getattr(ent, "type", None)
+            etype_name = getattr(etype, "value", None) or str(etype)
+            if str(etype_name).lower().endswith("custom_emoji"):
+                cid = getattr(ent, "custom_emoji_id", None)
+                if not cid:
+                    continue
+                emo = _tn_utf16_slice(
+                    text, getattr(ent, "offset", 0), getattr(ent, "length", 0)
+                )
+                if emo:
+                    found[emo] = str(cid)
+    except Exception as e:
+        print(f"⚠️ [TN] custom emoji extract failed: {e}")
+    return found
+
+
+def tn_premium_emoji_tag(emoji_char: str, emoji_id: str) -> str:
+    """Render an emoji as a Telegram premium emoji HTML tag."""
+    return f'<tg-emoji emoji-id="{emoji_id}">{emoji_char}</tg-emoji>'
+
+
 def tn_gateway_list_text() -> str:
     """A tidy, grouped list of every gateway you can pass to /tn."""
     lines = ["🌐 <b>Available Gateways for /tn</b>\n"]
@@ -19824,6 +19939,28 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     middle = context.args[:-1]  # everything between /tn and the count
+
+    # ── Premium emoji handling ─────────────────────────────────────────
+    # Pull custom-emoji tokens out of the args before resolving the gateway.
+    # A token counts as a custom emoji when it is:
+    #   • a real premium emoji typed in the message (custom_emoji entity), or
+    #   • a plain emoji listed in TN_PREMIUM_EMOJI_MAP (e.g. 🎁), or
+    #   • a bare numeric custom-emoji ID (15+ digits).
+    emoji_lookup = dict(TN_PREMIUM_EMOJI_MAP)
+    emoji_lookup.update(tn_extract_custom_emojis(message))
+
+    custom_emoji_tags = []   # premium <tg-emoji> tags, in the order typed
+    gateway_tokens = []      # middle tokens with emoji / ID tokens removed
+    for tok in middle:
+        if tok in emoji_lookup:
+            custom_emoji_tags.append(tn_premium_emoji_tag(tok, emoji_lookup[tok]))
+            continue
+        if tok.isdigit() and len(tok) >= 15:
+            custom_emoji_tags.append(tn_premium_emoji_tag("🎁", tok))
+            continue
+        gateway_tokens.append(tok)
+
+    middle = gateway_tokens
 
     # Try 1: the whole middle is the gateway (no username given).
     gateway_display = resolve_tn_gateway(" ".join(middle))
@@ -19912,12 +20049,17 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ═══════════════════════════════════════════════════════════════════
     sparkle_emoji = premium_emoji("5893321843149902412", "✨")
 
+    # Custom premium emoji (if one was typed) is shown on the USER line,
+    # replacing the username — exactly like the hidden-user gift emoji in
+    # real hit notifications. The header always keeps the default 💎.
+    user_emoji_display = " ".join(custom_emoji_tags) if custom_emoji_tags else None
+
     def build_hit_message(username: str, price_display: str, response_text: str) -> str:
         return (
             f'<b>{gateway_display}</b> {pe("diamond", "💎")}\n'
             f'{sparkle_emoji} <b>Price</b> ➛ {price_display}\n'
             f'{sparkle_emoji} <b>Response</b> ➛ {response_text}\n'
-            f'{sparkle_emoji} <b>User</b> ➛ {username}\n'
+            f'{sparkle_emoji} <b>User</b> ➛ {user_emoji_display or username}\n'
         )
         
        
@@ -23168,8 +23310,14 @@ async def send_hit_notification(context: ContextTypes.DEFAULT_TYPE,
         except Exception:
             hide_username = False
 
+    # Premium "gift" emoji shown in place of the username when hidden.
+    GIFT_EMOJI_ID = "6269135402855044481"
+    gift_emoji = f'<tg-emoji emoji-id="{GIFT_EMOJI_ID}">🎁</tg-emoji>'
+
     if hide_username:
-        user_display = "User"
+        # Hidden → fully anonymous: only the premium gift emoji, no name
+        # and no user id anywhere in the notification.
+        user_display = gift_emoji
     elif username and username != 'Unknown':
         user_display = username
     else:
@@ -23195,7 +23343,8 @@ async def send_hit_notification(context: ContextTypes.DEFAULT_TYPE,
     
     try:
         price_float = float(price.replace('$', '').replace('₹', ''))
-        price_display = f"${price_float:.2f}" if '$' not in price else price
+        # Dollar sign at the END, e.g. 0.99$
+        price_display = f"{price_float:.2f}$"
     except:
         price_display = price
     
@@ -41920,7 +42069,7 @@ async def check_card_shopify_mass(card: str, site: str, proxy: str = None, user_
                     print(f"✅ Site removed: {site_clean}")
                     
                     # Retry with a different site (max 3 retries)
-                    max_retries = 100
+                    max_retries = 3
                     if retry_count < max_retries:
                         print(f"🔄 Retrying with a different site (attempt {retry_count + 1}/{max_retries})...")
                         
@@ -41946,7 +42095,40 @@ async def check_card_shopify_mass(card: str, site: str, proxy: str = None, user_
                     "gateway": gateway,
                     "site_removed": True
                 }
-            
+
+            # ============ RETRY (UP TO 3x) FOR UNSUPPORTED-SITE ERRORS ============
+            # Brand not supported / site not supported / login required are not
+            # the card's fault — try up to 3 fresh sites, then give up. Placed
+            # BEFORE the site-removal loop so these responses do NOT remove the
+            # site from rotation.
+            site_unsupported_errors = [
+                "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED",
+                "SITE NOT SUPPORTED",
+                "SITE REQUIRES LOGIN",
+                "REQUIRES LOGIN",
+                "LOGIN REQUIRED",
+                "CART FAILED WITH STATUS 422",
+            ]
+            if any(err in response_upper for err in site_unsupported_errors):
+                if retry_count < 3:
+                    new_site = autosopi_site_manager.get_next_site_weighted()
+                    if new_site and new_site != site_clean:
+                        print(f"🔄 [MSH] {str(response_text)[:60]} — retry {retry_count + 1}/3 with {new_site}")
+                        await asyncio.sleep(1)
+                        return await check_card_shopify_mass(card, new_site, proxy, user_id, retry_count + 1)
+                    print(f"⚠️ [MSH] No alternative site available")
+                print(f"🔄 [MSH] {str(response_text)[:60]} — hit 3x retry limit, giving up")
+                return {
+                    "status": "error",
+                    "result": response_text,
+                    "message": response_text,
+                    "status_display": "⚠️ SITE NOT SUPPORTED",
+                    "status_category": "error",
+                    "elapsed": elapsed,
+                    "price": "0.00",
+                    "gateway": gateway,
+                }
+
             # ============ CHECK FOR SITE REMOVAL ERRORS (strike-based) ============
             for removal_error in SITE_REMOVAL_ERRORS:
                 if removal_error.upper() in response_upper:
@@ -74176,6 +74358,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton("🎁 Refer & Earn", callback_data='show_refer', style='success'),
         ],
+        [
+            InlineKeyboardButton("⚙️ Settings", callback_data='settings_menu', style='primary'),
+        ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -74415,15 +74600,17 @@ def build_settings_view(user_id: int):
     """Return (text, keyboard) for the Settings screen with Hide/Unhide."""
     hidden = bool(user_manager.get_user(user_id).get('hide_username'))
     status = "🙈 Hidden" if hidden else "👁️ Visible"
+    gift = '<tg-emoji emoji-id="6269135402855044481">🎁</tg-emoji>'
+    sparkle = '<tg-emoji emoji-id="5893321843149902412">✨</tg-emoji>'
     text = (
         "⚙️ <b>Settings</b>\n\n"
         f"<b>Name in hit notifications</b> ➛ {status}\n\n"
-        "• <b>Hide</b> — your name shows as <code>User</code> in hit notifications\n"
+        "• <b>Hide</b> — a premium emoji is shown instead of your name\n"
         "• <b>Unhide</b> — your username is shown\n\n"
         "<b>Hidden looks like:</b>\n"
-        "📍 <b>User</b> ➛ User\n\n"
+        f"{sparkle} <b>User</b> ➛ {gift}\n\n"
         "<b>Shown looks like:</b>\n"
-        "📍 <b>User</b> ➛ your_username"
+        f"{sparkle} <b>User</b> ➛ your_username"
     )
     keyboard = [
         [
@@ -74747,6 +74934,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ],
             [
                 InlineKeyboardButton("🎁 Refer & Earn", callback_data='show_refer', style='success'),
+            ],
+            [
+                InlineKeyboardButton("⚙️ Settings", callback_data='settings_menu', style='primary'),
             ],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
