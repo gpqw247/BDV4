@@ -13347,13 +13347,26 @@ class ShopifyAPIPool:
         self.retried_cards = set()
 
         # ── Global concurrency cap ────────────────────────────────────
-        # Limits TOTAL simultaneous Railway API calls across ALL users.
-        # 60 Railway APIs × 3 safe concurrent calls each = 180.
-        # We set 300 so speed is uncapped but each API stays ~sane.
-        self._global_semaphore = asyncio.Semaphore(300)
+        # Limits TOTAL simultaneous API calls across ALL users and ALL
+        # APIs combined. Sized well above PER_API_CONCURRENCY × a generous
+        # number of APIs, so this is never the first thing to bottleneck —
+        # the per-API cap below is the one that actually matters day to day.
+        self._global_semaphore = asyncio.Semaphore(1000)
 
-        # ── Per-API semaphores (max 5 concurrent calls per Railway URL) ─
-        # Prevents any single Railway instance from getting slammed.
+        # ── Per-API concurrency ─────────────────────────────────────────
+        # Each API gets its own high ceiling (not shared/divided with other
+        # APIs) — api_test.py's own httpx client already supports up to 200
+        # concurrent outbound connections (max_connections=200), so 50
+        # concurrent calls from the bot's side is comfortably inside what
+        # a single instance can actually handle.
+        #
+        # This means: with only 1 API added, it alone can run up to this
+        # many checks at once — no artificial "share the 5 slots" ceiling.
+        # Add a 2nd API and total system capacity roughly doubles (each API
+        # still gets its own full 50), not splits — so adding more APIs
+        # only ever adds speed, never takes it away.
+        PER_API_CONCURRENCY = 50
+        self._per_api_concurrency = PER_API_CONCURRENCY
         self._api_semaphores: dict = {}   # populated lazily in get_next_api
 
         # Site performance tracking
@@ -13588,10 +13601,12 @@ class ShopifyAPIPool:
         self._api_index += 1
         selected = weighted[idx]
 
-        # Ensure per-API semaphore exists (max 5 concurrent per Railway URL)
+        # Ensure per-API semaphore exists (each API gets its own full
+        # concurrency ceiling — see __init__ for why this isn't divided
+        # across however many APIs happen to be in the pool)
         name = selected["name"]
         if name not in self._api_semaphores:
-            self._api_semaphores[name] = asyncio.Semaphore(5)
+            self._api_semaphores[name] = asyncio.Semaphore(self._per_api_concurrency)
 
         self.last_used[name] = time.time()
         stats = self.api_stats.get(name, {})
@@ -13735,7 +13750,7 @@ class ShopifyAPIPool:
 
             try:
                 # Global cap: 300 simultaneous Railway calls across all users.
-                # Each Railway API also has its own semaphore of 5 inside
+                # Each Railway API also has its own semaphore (50, not shared across APIs) inside
                 # _make_api_request, so no single Railway instance gets slammed.
                 async with self._global_semaphore:
                     result = await self._make_api_request(api, card, current_site, current_proxy, user_id)
@@ -65383,7 +65398,7 @@ async def autosopi_mass_check_logic(update: Update, context: ContextTypes.DEFAUL
             "admin": 100,
         }.get(tier, 100)
         # Sliding window keeps all CONCURRENCY slots busy at all times.
-        # Global pool semaphore (300) + per-API semaphore (5) prevent flooding.
+        # Global pool semaphore (1000) + per-API semaphore (50 each) prevent flooding.
 
         # Proxy support removed — checks run on direct connections only.
         user_proxies = []
@@ -65711,7 +65726,7 @@ async def autosopi_mass_check_logic(update: Update, context: ContextTypes.DEFAUL
         #  — keeps exactly CONCURRENCY tasks running at all times
         #  — no batch boundary idle time
         #  — no pre-card sleep (rate limiting is done by the pool's
-        #    per-API semaphore of 5 + the global semaphore of 300)
+        #    per-API semaphore of 50 each + the global semaphore of 1000)
         # ══════════════════════════════════════════════════════════════
         pending: set = set()
         card_iter = enumerate(cards)
