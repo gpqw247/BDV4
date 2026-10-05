@@ -18584,7 +18584,7 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
 
 # ============ FIXED FORMAT_JIO_RESPONSE - DETECTS 3DS ============
 
-def format_jio_response(result: Dict, card: str) -> Tuple[str, str]:
+def format_jio_response(result: Dict, card: str, compact: bool = False) -> Tuple[str, str]:
     """
     Format Jio response with premium emojis - detects 3DS redirects properly
     """
@@ -18717,6 +18717,13 @@ def format_jio_response(result: Dict, card: str) -> Tuple[str, str]:
     time_emoji = safe_premium_emoji("time", "⏱️")
     skull_emoji = safe_premium_emoji("skull", "💀")
     
+    # Compact mode: just the card + its result line, used by the /jhit
+    # multi-check progress message, e.g.
+    #     5178058031282786|04|27|276
+    #       ⤷ 🔐 3D REQUIRED
+    if compact:
+        return f"{full_card}\n  ⤷ {status_emoji} {status_text}", status_category
+
     # Build the output with proper formatting
     ui = (
         f"┏━━━━━━━⍟\n"
@@ -18753,14 +18760,7 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text(
             "💎 <b>Jio Auto-Hitter</b>\n\n"
             "Usage:\n"
-            "<code>/jhit &lt;phone&gt; &lt;amount&gt; &lt;card1&gt; &lt;card2&gt; ...</code>\n\n"
-            "Example:\n"
-            "<code>/jhit 093450 19 2231137515675|09|26|593</code>\n\n"
-            "📱 <b>phone</b> - Jio mobile number\n"
-            "💰 <b>amount</b> - Recharge amount (₹)\n"
-            "💳 <b>card(s)</b> - One or more cards in cc|mm|yy|cvv format\n\n"
-            "💡 <b>Multiple cards:</b> Add multiple cards to try them one by one\n"
-            "<code>/jhit 6398093450 19 card1 card2 card3</code>",
+            "<code>/jhit &lt;phone&gt; &lt;amount&gt; &lt;card1&gt; &lt;card2&gt;</code>",
             parse_mode=ParseMode.HTML
         )
         return
@@ -18892,14 +18892,21 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     diamond_emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("diamond", "5427168083074628963"), "💎")
     skull_emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("skull", "5042167377869932162"), "💀")
     
+    progress_blocks = []  # per-card result blocks, appended as they finish
+
+    def build_progress_text(current_idx):
+        text = (
+            f"{diamond_emoji} <b>Jio Multi-Check</b>\n\n"
+            f"<b>Phone:</b> <code>{phone}</code>\n"
+            f"<b>Amount:</b> ₹{amount}\n"
+            f"<b>Progress:</b> {current_idx}/{total_cards}"
+        )
+        if progress_blocks:
+            text += "\n\n" + "\n\n".join(progress_blocks)
+        return text
+
     progress_msg = await message.reply_text(
-        f"{diamond_emoji} <b>Jio Multi-Check Started</b>\n\n"
-        f"📱 <b>Phone:</b> <code>{phone}</code>\n"
-        f"💰 <b>Amount:</b> ₹{amount}\n"
-        f"📊 <b>Cards:</b> {total_cards}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🔄 <b>Processing card 1/{total_cards}</b>\n"
-        f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot",
+        build_progress_text(1),
         parse_mode=ParseMode.HTML
     )
 
@@ -18921,18 +18928,7 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"{'='*60}")
         
         try:
-            await progress_msg.edit_text(
-                f"{diamond_emoji} <b>Jio Multi-Check</b>\n\n"
-                f"📱 <b>Phone:</b> <code>{phone}</code>\n"
-                f"💰 <b>Amount:</b> ₹{amount}\n"
-                f"📊 <b>Progress:</b> {idx}/{total_cards}\n"
-                f"━━━━━━━━━━━━━━━━━━━\n"
-                f"🔄 <b>Checking card {idx}/{total_cards}</b>\n"
-                f"💳 <code>{cc[:4]}****{cc[-4:]}</code>\n"
-                f"⏳ Please wait...\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot",
-                parse_mode=ParseMode.HTML
-            )
+            await progress_msg.edit_text(build_progress_text(idx), parse_mode=ParseMode.HTML)
         except:
             pass
 
@@ -18954,9 +18950,13 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_approved = status.upper() in ["APPROVED", "LIVE", "CVV_LIVE", "INSUFFICIENT_FUNDS"]
             
             result['card'] = card_display
-            ui, status_category = format_jio_response(result, card_display)
-            
-            await message.reply_text(ui, parse_mode=ParseMode.HTML)
+            block, status_category = format_jio_response(result, card_display, compact=True)
+            progress_blocks.append(block)
+
+            try:
+                await progress_msg.edit_text(build_progress_text(idx), parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
             
             results.append({
                 'card': card_display,
@@ -19024,35 +19024,21 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if success_card:
         summary = (
-            f"✅ <b>Jio Multi-Check Complete - SUCCESS!</b>\n\n"
-            f"📱 Phone: <code>{phone}</code>\n"
-            f"💰 Amount: ₹{amount}\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 <b>Successful Card:</b>\n"
-            f"   <code>{success_card}</code>\n"
-            f"   {charged_emoji} CHARGED!\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 <b>Results:</b>\n"
-            f"   ✅ Checked: {len(results)}/{total_cards}\n"
-            f"   🔥 Charged: {charged_count}\n"
-            f"   ❌ Failed: {len(failed_cards)}\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+            f"{diamond_emoji} <b>Jio</b>\n\n"
+            f"<b>Phone:</b> <code>{phone}</code>\n"
+            f"<b>Amount:</b> ₹{amount}\n"
+            f"<b>Complete - Success</b>"
         )
     else:
         summary = (
-            f"❌ <b>Jio Multi-Check Complete - No Success</b>\n\n"
-            f"📱 Phone: <code>{phone}</code>\n"
-            f"💰 Amount: ₹{amount}\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 <b>Results:</b>\n"
-            f"   ✅ Checked: {len(results)}/{total_cards}\n"
-            f"   ❌ All cards declined\n"
-            f"   💡 Try different cards or proxy\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+            f"{diamond_emoji} <b>Jio</b>\n\n"
+            f"<b>Phone:</b> <code>{phone}</code>\n"
+            f"<b>Amount:</b> ₹{amount}\n"
+            f"<b>Complete - No Success</b>"
         )
     
+    if progress_blocks:
+        summary = summary + "\n\n" + "\n\n".join(progress_blocks)
     await progress_msg.edit_text(summary, parse_mode=ParseMode.HTML)
     
     user_manager.increment_checks(user_id, len(results))
