@@ -15042,7 +15042,7 @@ def payglocal_hit(card: str, proxy: str = None) -> dict:
         "steps": {},
         "elapsed": 0,
         "status": None,
-        "message": None,
+        "message": "",
         "card": card,
         "amount": PAYGLOCAL_AMOUNT,
         "currency": PAYGLOCAL_CURRENCY
@@ -15627,7 +15627,7 @@ async def single_check_payglocal_lite(update: Update, context: ContextTypes.DEFA
         if status_category in ["charged", "approved"]:
             await save_hit_to_file(
                 card=card, gateway="PayGlocal",
-                response=result.get("message", "Approved"),
+                response=result.get("message") or "Approved",
                 price="₹10",
                 bin_info=bin_info, user_id=user_id, user_tier=tier
             )
@@ -15635,7 +15635,7 @@ async def single_check_payglocal_lite(update: Update, context: ContextTypes.DEFA
             user_data = user_manager.get_user(user_id)
             await send_hit_notification(
                 context=context, gateway="PayGlocal", card=card,
-                response=result.get("message", "Approved"),
+                response=result.get("message") or "Approved",
                 price="₹10",
                 user=user_data, bin_info=bin_info, status_category=status_category
             )
@@ -15856,7 +15856,7 @@ async def _mass_check_payglocal_logic(update, context, cards, progress_msg):
                     
                     await save_hit_to_file(
                         card=card, gateway="PayGlocal",
-                        response=result.get("message", "Approved"),
+                        response=result.get("message") or "Approved",
                         price="₹10",
                         bin_info=bin_info, user_id=u_id, user_tier=tier
                     )
@@ -15865,7 +15865,7 @@ async def _mass_check_payglocal_logic(update, context, cards, progress_msg):
                         user_data = user_manager.get_user(u_id)
                         await send_hit_notification(
                             context=context, gateway="PayGlocal", card=card,
-                            response=result.get("message", "Charged"),
+                            response=result.get("message") or "Charged",
                             price="₹10",
                             user=user_data, bin_info=bin_info, status_category="charged"
                         )
@@ -16041,7 +16041,7 @@ async def mass_check_payglocal_logic(update: Update, context: ContextTypes.DEFAU
                     
                     await save_hit_to_file(
                         card=card, gateway="PayGlocal",
-                        response=result.get("message", "Approved"),
+                        response=result.get("message") or "Approved",
                         price="$0.10",
                         bin_info=bin_info, user_id=u_id, user_tier=tier
                     )
@@ -16050,7 +16050,7 @@ async def mass_check_payglocal_logic(update: Update, context: ContextTypes.DEFAU
                         user_data = user_manager.get_user(u_id)
                         await send_hit_notification(
                             context=context, gateway="PayGlocal", card=card,
-                            response=result.get("message", "Charged"),
+                            response=result.get("message") or "Charged",
                             price="$0.10",
                             user=user_data, bin_info=bin_info, status_category="charged"
                         )
@@ -17993,7 +17993,7 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
         "steps": {},
         "elapsed": 0,
         "status": None,
-        "message": None,
+        "message": "",
         "card": f"{cc}|{mm}|{yy}|{cvv}"
     }
 
@@ -18639,8 +18639,8 @@ def format_jio_response(result: Dict, card: str, compact: bool = False) -> Tuple
     Format Jio response with premium emojis - detects 3DS redirects properly
     """
     
-    status = result.get("status", "UNKNOWN")
-    message = result.get("message", "Unknown")
+    status = result.get("status") or "UNKNOWN"
+    message = result.get("message") or result.get("error") or ""
     elapsed = result.get("elapsed", 0)
     amount = result.get("amount", "19")
     
@@ -18986,8 +18986,11 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Process the card
             result = jio_hit(phone, amount, cc, mm, yy, cvv, proxy_str)
             
-            status = result.get("status", "UNKNOWN")
-            message_text = result.get("message", "Unknown")
+            status = result.get("status") or "UNKNOWN"
+            # `message` is initialised to "" and is never populated on error
+            # paths, so fall back to the actual error (e.g. proxy timeout)
+            # instead of letting None reach message_text[:50] and crash.
+            message_text = result.get("message") or result.get("error") or "Unknown"
             elapsed = result.get("elapsed", 0)
             
             print(f"📊 Result for card {idx}: {status} - {message_text[:50]}")
@@ -26774,7 +26777,7 @@ async def addproxy_stripe_command(update: Update, context: ContextTypes.DEFAULT_
     if not args:
         await message.reply_text(
             "🔒 <b>Stripe Proxy Manager</b>\n\n"
-            "Usage: /addproxy <proxy>\n"
+            "Usage: /addproxy &lt;proxy&gt;\n"
             "Format: user:pass@host:port\n"
             "Example: /addproxy user:pass@192.168.1.1:8080",
             parse_mode=ParseMode.HTML
@@ -26827,7 +26830,7 @@ async def proxy_stripe_check_command(update: Update, context: ContextTypes.DEFAU
     
     if not user_proxies:
         await message.reply_text(
-            "❌ <b>No proxies to check</b>\n\nAdd proxies with: /addproxy <proxy>",
+            "❌ <b>No proxies to check</b>\n\nAdd proxies with: /addproxy &lt;proxy&gt;",
             parse_mode=ParseMode.HTML
         )
         return
@@ -28548,7 +28551,7 @@ async def autosopi_proxy_test_command(update: Update, context: ContextTypes.DEFA
     if not proxies:
         await update.message.reply_text(
             "📋 You don't have any proxies to test.\n"
-            "Use /addmyproxy <proxy> to add proxies first.\n\n"
+            "Use /addmyproxy &lt;proxy&gt; to add proxies first.\n\n"
             "Supported formats:\n"
             "• ip:port\n"
             "• user:pass@ip:port\n"
@@ -30747,9 +30750,9 @@ async def globalproxy_stats_command(update: Update, context: ContextTypes.DEFAUL
     detailed_stats = stats + "\n\n"
     detailed_stats += "━━━━━━━━━━━━━━━━━━━\n"
     detailed_stats += "<b>Commands:</b>\n"
-    detailed_stats += "   /addglobalproxy <proxy> - Add proxy\n"
-    detailed_stats += "   /massglobalproxy <proxies> - Add multiple\n"
-    detailed_stats += "   /removeglobalproxy <proxy> - Remove proxy\n"
+    detailed_stats += "   /addglobalproxy &lt;proxy&gt; - Add proxy\n"
+    detailed_stats += "   /massglobalproxy &lt;proxies&gt; - Add multiple\n"
+    detailed_stats += "   /removeglobalproxy &lt;proxy&gt; - Remove proxy\n"
     detailed_stats += "   /globalproxy_on - Enable pool\n"
     detailed_stats += "   /globalproxy_off - Disable pool\n"
     detailed_stats += "   /globalproxy_rotate - Force rotate\n"
@@ -79176,7 +79179,7 @@ async def test_my_proxies_autosopi(update: Update, context: ContextTypes.DEFAULT
     if user_id not in proxy_manager.user_proxies or not proxy_manager.user_proxies[user_id]:
         await update.message.reply_text(
             "📋 You don't have any proxies to test.\n"
-            "Use /addmyproxy <proxy> to add proxies first.",
+            "Use /addmyproxy &lt;proxy&gt; to add proxies first.",
             parse_mode=ParseMode.HTML
         )
         return
