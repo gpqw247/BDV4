@@ -18892,21 +18892,17 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"💎 User {user_id} used {len(cards)} credits for Jio multi-check. Remaining: {get_user_credits(user_id)}")
 
     # ============ GET PROXY ============
+    # Only ever use the caller's OWN proxies. The old code fell back to
+    # load_stripe_proxies() and random.choice() over EVERY user's proxies,
+    # which is why /proxy said "no proxies" and /removeproxy said
+    # "not found" while /jhit was still routing through someone else's
+    # proxy. If the caller has no proxy, connect directly (proxy = None).
     proxy = None
     try:
         proxy = get_stripe_user_proxy(user_id)
-        if not proxy:
-            proxies = load_stripe_proxies()
-            all_proxies = []
-            for user_proxies in proxies.values():
-                if isinstance(user_proxies, list):
-                    all_proxies.extend(user_proxies)
-                else:
-                    all_proxies.append(user_proxies)
-            if all_proxies:
-                proxy = random.choice(all_proxies)
-    except:
-        pass
+    except Exception as e:
+        print(f"⚠️ [jhit] proxy lookup failed: {e}")
+        proxy = None
 
     # ============ FIX: Format proxy correctly ============
     if proxy:
