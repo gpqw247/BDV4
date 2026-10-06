@@ -33653,6 +33653,11 @@ SQ_AMOUNT_LABEL = "$1.00"
 SQ_FREQ         = "ONE_TIME"
 SQ_LABEL        = "Square 1$"
 
+# Some successful charges come back from the charge endpoint as HTTP 402
+# with this exact body length. When that happens the payment actually went
+# through, so it is reported as "Payment successful" and fires a hit.
+SQ_402_SUCCESS_LEN = 265
+
 SQ_TIMEOUT       = 25
 SQ_COOKIE_DOMAIN = ".investinginchildren.on.ca"
 
@@ -33899,6 +33904,18 @@ def _sq_step_charge(s, cart_id, pm_id, _attempt=1):
                    "x-crumb":        crumb,
                }, json=payload)
     _sq_log(f"[5] POST /api/2/commerce/orders  HTTP {r.status_code}  len={len(r.text)}")
+
+    # Special case: a 402 with this exact body length means the charge
+    # actually succeeded. Flag it so the verdict layer reports
+    # "Payment successful" and the hit notification fires.
+    if r.status_code == 402 and len(r.text) == SQ_402_SUCCESS_LEN:
+        _sq_log(f"    ✅ 402 len={SQ_402_SUCCESS_LEN} → treated as SUCCESS")
+        return {
+            "_sq_402_success": True,
+            "_status": r.status_code,
+            "_raw": r.text[:400],
+        }
+
     try:
         j = r.json()
     except Exception:
@@ -33985,6 +34002,10 @@ def _sq_detail(j) -> str:
 def _sq_verdict(j):
     if not isinstance(j, dict):
         return "UNKNOWN", str(j)[:120]
+
+    # HTTP 402 + len 265 from the charge step = successful payment.
+    if j.get("_sq_402_success"):
+        return "CHARGED", "Payment successful"
 
     if j.get("id") and j.get("paymentState"):
         state = (j.get("paymentState") or "").upper()
@@ -34123,6 +34144,11 @@ def sq_format_result(status_category: str, response_text: str,
 
     clean_resp = response_text[:80]
     country_name = (country or "Unknown").replace("🌐", "").strip()
+
+    # 402/len-265 success path → show the green check instead of the
+    # charged fire so the UI matches the "Payment successful" wording.
+    if clean_resp.strip().lower().startswith("payment successful"):
+        emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("approved", "6266787022111773140"), "✅")
 
     return (
         f"<b>Square 1$</b> {premium_emoji('5895770017458294953', '💫')}\n\n"
