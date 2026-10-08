@@ -67840,9 +67840,9 @@ async def autosopi_mass_check_logic(update: Update, context: ContextTypes.DEFAUL
         CONCURRENCY = {
             "free": 1,
             "premium": 15,
-            "ultimate": 100,
-            "admin": 100,
-        }.get(tier, 100)
+            "ultimate": 50,
+            "admin": 50,
+        }.get(tier, 50)
         # Sliding window keeps all CONCURRENCY slots busy at all times.
         # Global pool semaphore (1000) + per-API semaphore (50 each) prevent flooding.
 
@@ -71863,7 +71863,7 @@ class ChkaddAPIPoolManager:
             self.mark_api_result(api["name"], False, time.time() - start_time)
             return False, 0, str(e)[:50], {}
     
-    async def check_sites_parallel(self, sites: list, max_concurrent: int = 13, proxy: str = None) -> dict:
+    async def check_sites_parallel(self, sites: list, max_concurrent: int = 13, proxy: str = None, proxies: list = None) -> dict:
         """
         Check multiple sites in parallel using the API pool.
         Each site gets a different API.
@@ -71897,10 +71897,19 @@ class ChkaddAPIPoolManager:
         CONCURRENCY = 40
         semaphore = asyncio.Semaphore(CONCURRENCY)
         _rr = {"i": 0}
+        _rrp = {"i": 0}
+
+        # Build the proxy rotation pool. A `proxies` list wins, then a single
+        # `proxy`, else fall back to the global proxy pool. Each site gets the
+        # NEXT proxy in rotation instead of pinning the first one for the whole
+        # batch, so one dead/slow proxy can no longer sink every site.
+        _proxy_pool = [p for p in proxies if p] if proxies else ([proxy] if proxy else [])
 
         def _pick_proxy():
-            if proxy:
-                return proxy
+            if _proxy_pool:
+                p = _proxy_pool[_rrp["i"] % len(_proxy_pool)]
+                _rrp["i"] += 1
+                return p
             try:
                 if global_proxy_pool.enabled and global_proxy_pool.proxies:
                     return global_proxy_pool.get_next_proxy()
@@ -72176,13 +72185,16 @@ async def process_chkadd_sites_api(update: Update, context: ContextTypes.DEFAULT
     
     start_time = time.time()
     
-    # Get proxy if allowed
-    proxy_str = None
+    # Get proxies if allowed — rotate across ALL of the user's working
+    # proxies (the global pool is the fallback inside check_sites_parallel)
+    # instead of pinning proxy_list[0] for the whole batch.
+    proxy_list = []
     if user_manager.can_use_proxy(user_id):
-        if user_id in autosopi_proxy_tracker.working_proxies and autosopi_proxy_tracker.working_proxies[user_id]:
-            proxy_list = autosopi_proxy_tracker.working_proxies[user_id]
-            if proxy_list:
-                proxy_str = proxy_list[0]
+        try:
+            proxy_list = [p for p in autosopi_proxy_tracker.working_proxies.get(user_id, []) if p]
+        except Exception:
+            proxy_list = []
+    proxy_str = proxy_list[0] if proxy_list else None
     
     # Statistics
     all_good_sites = []
@@ -72221,7 +72233,7 @@ async def process_chkadd_sites_api(update: Update, context: ContextTypes.DEFAULT
         
         try:
             # Run the parallel check for this batch
-            results = await chkadd_api_pool.check_sites_parallel(batch_sites, proxy=proxy_str)
+            results = await chkadd_api_pool.check_sites_parallel(batch_sites, proxy=proxy_str, proxies=proxy_list)
             
             # Store results
             good_sites = results.get("good", [])
@@ -72403,16 +72415,19 @@ async def process_chkadd_enhanced(update: Update, context: ContextTypes.DEFAULT_
     
     start_time = time.time()
     
-    # Get proxy if allowed
-    proxy_str = None
+    # Get proxies if allowed — rotate across ALL of the user's working
+    # proxies (the global pool is the fallback inside check_sites_parallel)
+    # instead of pinning proxy_list[0].
+    proxy_list = []
     if user_manager.can_use_proxy(user_id):
-        if user_id in autosopi_proxy_tracker.working_proxies and autosopi_proxy_tracker.working_proxies[user_id]:
-            proxy_list = autosopi_proxy_tracker.working_proxies[user_id]
-            if proxy_list:
-                proxy_str = proxy_list[0]
+        try:
+            proxy_list = [p for p in autosopi_proxy_tracker.working_proxies.get(user_id, []) if p]
+        except Exception:
+            proxy_list = []
+    proxy_str = proxy_list[0] if proxy_list else None
     
     # Run the parallel check
-    results = await chkadd_api_pool.check_sites_parallel(sites, proxy=proxy_str)
+    results = await chkadd_api_pool.check_sites_parallel(sites, proxy=proxy_str, proxies=proxy_list)
     
     elapsed = time.time() - start_time
     minutes = int(elapsed // 60)
