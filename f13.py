@@ -13461,6 +13461,11 @@ SHOPIFY_API_POOL = [
 # in well under a second — anything faster than this is treated as throttling.
 API_THROTTLE_FAST_SECONDS = 2.5
 
+# The new API's exact "no products" wording. ONLY this exact Response value
+# triggers an automatic site purge (same as /rgood); every other no-product
+# wording keeps the old skip-and-retry behaviour.
+NO_PRODUCTS_EXACT = "<b>no products!</b>"
+
 
 class ShopifyAPIPool:
     """
@@ -14404,6 +14409,27 @@ class ShopifyAPIPool:
 
             # -------- NO PRODUCT ----------
             if any(err.upper() in response_upper for err in no_product_errors):
+                # EXCEPTION (Shopify): the API's exact "<b>No Products!</b>"
+                # response means this site genuinely has no usable products, so
+                # purge it from the rotation + GOOD list -- exactly what /rgood
+                # does -- instead of only skipping it. This fires ONLY for that
+                # exact Response string; every other no-product wording keeps
+                # the skip-and-retry behaviour below.
+                if response_text.strip().lower() == NO_PRODUCTS_EXACT:
+                    print(f"🗑️ [NO PRODUCTS!] {site_clean} — exact '<b>No Products!</b>' response, removing from rotation + GOOD list")
+                    full_remove_site_from_rotation(site_clean, OWNER_ID)
+                    self.site_performance.pop(site_clean, None)
+                    self.good_sites_cache_time = 0
+                    return {
+                        "status": "error", "result": "NO_PRODUCT_ERROR",
+                        "message": response_text,
+                        "status_display": "🗑️ NO PRODUCTS (REMOVED)",
+                        "status_category": "retryable",
+                        "elapsed": elapsed, "price": str(price),
+                        "gateway": gateway, "site": site_clean,
+                        "proxy_used": proxy, "api_name": api.get('name', 'Unknown'),
+                        "site_removed": True, "site_purged": True
+                    }
                 # A FAST "<b>No Products!</b>" is the API being throttled, not a
                 # bad site: a real Shopify check takes 6-9s while a throttled API
                 # short-circuits in well under a second. Cool the API down and let
@@ -45808,6 +45834,92 @@ def full_remove_site_from_rotation(site_clean: str, user_id: int = None) -> tupl
     return removed_from_good, removed_from_rotation
 
 
+def remove_all_rotation_sites(user_id: int = None) -> dict:
+    """
+    FULL Shopify rotation wipe -- used by /rgood all.
+
+    Clears EVERY site, not just the GOOD ones:
+      1. every entry in autosopi_site_manager.sites
+      2. the GOOD / NORMAL / BAD lists + per-site quality + price cache
+      3. rotation stats, failures/strikes and pending removals
+      4. the GOOD/NORMAL backup pool (shopify_quality_backup.json)
+
+    (4) matters: shopify_backup_reload_job runs every 10 minutes and pulls
+    sites straight back out of that pool whenever the rotation is below
+    SHOPIFY_ROTATION_MIN_SITES -- without clearing it, /rgood all would
+    silently undo itself within minutes.
+
+    Returns a summary dict.
+    """
+    uid = user_id or OWNER_ID
+
+    rotation_before = list(autosopi_site_manager.sites)
+    good_before = len(site_quality_tracker.good_sites)
+    normal_before = len(site_quality_tracker.normal_sites)
+
+    # remove_site() refuses to drop a site that is still marked GOOD, so the
+    # GOOD list has to go first.
+    site_quality_tracker.good_sites.clear()
+
+    removed = 0
+    for site_clean in rotation_before:
+        try:
+            ok, _msg = autosopi_site_manager.remove_site(site_clean, uid)
+            if ok:
+                removed += 1
+        except Exception as e:
+            print(f"⚠️ [RGOOD ALL] remove_site({site_clean}) failed: {e}")
+
+    # Belt and braces -- drop anything remove_site() refused so the rotation
+    # really is empty afterwards.
+    autosopi_site_manager.sites.clear()
+    autosopi_site_manager.site_stats.clear()
+    autosopi_site_manager.site_failures.clear()
+    try:
+        autosopi_site_manager.sites_to_remove.clear()
+    except Exception:
+        pass
+    autosopi_site_manager.current_index = 0
+
+    site_quality_tracker.good_sites.clear()
+    site_quality_tracker.normal_sites.clear()
+    site_quality_tracker.bad_sites.clear()
+    site_quality_tracker.site_quality.clear()
+    site_quality_tracker.price_cache.clear()
+    site_quality_tracker.save_stats()
+
+    # Empty the GOOD/NORMAL backup pool so the reload job cannot refill.
+    backup_cleared = False
+    try:
+        with open(SHOPIFY_QUALITY_BACKUP_FILE, 'w', encoding='utf-8') as f:
+            json.dump({"good": {}, "normal": {}}, f, indent=2)
+        backup_cleared = True
+        print("🧹 [RGOOD ALL] Cleared GOOD/NORMAL backup pool")
+    except Exception as e:
+        print(f"⚠️ [RGOOD ALL] Could not clear backup pool: {e}")
+
+    autosopi_site_manager.save_sites()
+    try:
+        autosopi_site_manager.reset_rotation()
+    except Exception as e:
+        print(f"⚠️ [RGOOD ALL] reset_rotation error: {e}")
+
+    site_rotation_manager.cache_time = 0
+    site_rotation_manager.good_sites_cache = []
+    site_rotation_manager.good_sites_cache_time = 0
+
+    print(f"🗑️ [RGOOD ALL] Wiped rotation: {len(rotation_before)} sites, "
+          f"{good_before} GOOD, {normal_before} NORMAL removed")
+
+    return {
+        "rotation_before": len(rotation_before),
+        "rotation_removed": removed,
+        "good_cleared": good_before,
+        "normal_cleared": normal_before,
+        "backup_cleared": backup_cleared,
+    }
+
+
 async def rgood_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Remove a site from the GOOD list AND rotation - /rgood <site>
@@ -45847,7 +45959,7 @@ async def rgood_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Remove the site from rotation entirely\n"
             "• Reset GOOD status for the site\n\n"
             "💡 Use <code>/rgood list</code> to see all GOOD sites.\n"
-            "💡 Use <code>/rgood all</code> to fully remove every GOOD site at once.",
+            "💡 Use <code>/rgood all</code> to remove EVERY site from rotation at once.",
             parse_mode=ParseMode.HTML,
             reply_markup=back_menu()
         )
@@ -46070,13 +46182,12 @@ async def list_good_sites_for_removal(update: Update, context: ContextTypes.DEFA
 
 async def rgood_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Fully remove ALL GOOD sites from both the GOOD list AND rotation -
-    /rgood all. Admin only.
+    Remove EVERY site from the Shopify rotation - /rgood all. Admin only.
 
-    Unlike /rgood_clear (which only strips the GOOD label and leaves the
-    sites in rotation), this does the full /rgood removal — GOOD list +
-    rotation + quality reset — for every currently-GOOD site at once.
-    USE WITH CAUTION! Requires confirmation.
+    Full wipe: every site in the rotation (GOOD, NORMAL and everything
+    else), the GOOD/NORMAL/BAD lists, quality data, cached prices, strikes
+    and the GOOD/NORMAL backup pool are all cleared. USE WITH CAUTION!
+    Requires confirmation.
     """
     if not await verify_group_access(update, context):
         return
@@ -46086,16 +46197,18 @@ async def rgood_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id != OWNER_ID:
         await update.message.reply_text(
             "❌ <b>Admin Only Command</b>\n\n"
-            "Only the bot owner can remove all GOOD sites.",
+            "Only the bot owner can remove all sites from rotation.",
             parse_mode=ParseMode.HTML,
             reply_markup=back_menu()
         )
         return
 
+    rotation_count = len(autosopi_site_manager.sites)
     good_count = len(site_quality_tracker.good_sites)
+    normal_count = len(site_quality_tracker.normal_sites)
 
-    if good_count == 0:
-        await update.message.reply_text("📋 No GOOD sites to remove.")
+    if rotation_count == 0 and good_count == 0 and normal_count == 0:
+        await update.message.reply_text("📋 No sites to remove — the rotation is already empty.")
         return
 
     keyboard = [
@@ -46107,10 +46220,13 @@ async def rgood_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        f"⚠️ <b>WARNING: Remove ALL GOOD Sites</b>\n\n"
-        f"This will fully remove ALL {good_count} GOOD sites from:\n"
-        f"• The GOOD sites list\n"
-        f"• Rotation entirely\n\n"
+        f"⚠️ <b>WARNING: Remove ALL Sites From Rotation</b>\n\n"
+        f"This will fully remove <b>every</b> site from the Shopify rotation:\n"
+        f"• 🌐 Sites in rotation: <b>{rotation_count}</b>\n"
+        f"• 🌟 GOOD sites: <b>{good_count}</b>\n"
+        f"• 🔵 NORMAL sites: <b>{normal_count}</b>\n"
+        f"• 🗄️ GOOD/NORMAL backup pool\n"
+        f"• Prices, quality data & strikes\n\n"
         f"<b>This action cannot be undone!</b>\n\n"
         f"Are you sure?",
         parse_mode=ParseMode.HTML,
@@ -46131,18 +46247,21 @@ async def rgood_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text("❌ Cancelled — no sites were removed.", reply_markup=back_menu())
         return
 
-    await query.answer("Removing all GOOD sites...")
+    await query.answer("Removing all sites from rotation...")
 
-    sites_to_remove = list(site_quality_tracker.good_sites)
-    removed_count = 0
+    summary = remove_all_rotation_sites(OWNER_ID)
 
-    for site_clean in sites_to_remove:
-        full_remove_site_from_rotation(site_clean, OWNER_ID)
-        removed_count += 1
+    backup_line = "✅ Backup pool cleared" if summary["backup_cleared"] else "⚠️ Backup pool could not be cleared"
 
     await query.edit_message_text(
-        f"🗑️ <b>All GOOD Sites Removed!</b>\n\n"
-        f"✅ Fully removed {removed_count} sites (GOOD list + rotation)\n\n"
+        f"🗑️ <b>ALL Sites Removed From Rotation!</b>\n\n"
+        f"✅ Sites removed from rotation: <b>{summary['rotation_removed']}</b>\n"
+        f"✅ GOOD list cleared: <b>{summary['good_cleared']}</b>\n"
+        f"✅ NORMAL list cleared: <b>{summary['normal_cleared']}</b>\n"
+        f"{backup_line}\n"
+        f"✅ Prices, quality data & strikes cleared\n\n"
+        f"🌐 Sites now in rotation: <b>{len(autosopi_site_manager.sites)}</b>\n"
+        f"🌟 Sites now GOOD: <b>{len(site_quality_tracker.good_sites)}</b>\n\n"
         f"Use <code>/chkadd</code> to find new GOOD sites.",
         parse_mode=ParseMode.HTML,
         reply_markup=back_menu()
