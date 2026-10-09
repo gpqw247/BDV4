@@ -13461,11 +13461,6 @@ SHOPIFY_API_POOL = [
 # in well under a second — anything faster than this is treated as throttling.
 API_THROTTLE_FAST_SECONDS = 2.5
 
-# The new API's exact "no products" wording. ONLY this exact Response value
-# triggers an automatic site purge (same as /rgood); every other no-product
-# wording keeps the old skip-and-retry behaviour.
-NO_PRODUCTS_EXACT = "<b>no products!</b>"
-
 
 class ShopifyAPIPool:
     """
@@ -14011,9 +14006,12 @@ class ShopifyAPIPool:
                     continue
 
                 if result.get("result") == "NO_PRODUCT_ERROR":
+                    # No products on this site -- DO NOTHING to the site: it
+                    # stays in the live rotation (never removed/demoted). We
+                    # just move on to the NEXT site (kept in tried_sites so the
+                    # next attempt picks a DIFFERENT one) with the next API
+                    # (get_next_api() runs on every attempt).
                     soft_site_retries += 1
-                    if current_site in tried_sites:
-                        tried_sites.remove(current_site)
                     if soft_site_retries > SOFT_SITE_RETRY_LIMIT:
                         print(f"🔄 [NO PRODUCT] {current_site} — hit {SOFT_SITE_RETRY_LIMIT}x retry limit, giving up")
                         result["api_used"] = api_name
@@ -14409,27 +14407,6 @@ class ShopifyAPIPool:
 
             # -------- NO PRODUCT ----------
             if any(err.upper() in response_upper for err in no_product_errors):
-                # EXCEPTION (Shopify): the API's exact "<b>No Products!</b>"
-                # response means this site genuinely has no usable products, so
-                # purge it from the rotation + GOOD list -- exactly what /rgood
-                # does -- instead of only skipping it. This fires ONLY for that
-                # exact Response string; every other no-product wording keeps
-                # the skip-and-retry behaviour below.
-                if response_text.strip().lower() == NO_PRODUCTS_EXACT:
-                    print(f"🗑️ [NO PRODUCTS!] {site_clean} — exact '<b>No Products!</b>' response, removing from rotation + GOOD list")
-                    full_remove_site_from_rotation(site_clean, OWNER_ID)
-                    self.site_performance.pop(site_clean, None)
-                    self.good_sites_cache_time = 0
-                    return {
-                        "status": "error", "result": "NO_PRODUCT_ERROR",
-                        "message": response_text,
-                        "status_display": "🗑️ NO PRODUCTS (REMOVED)",
-                        "status_category": "retryable",
-                        "elapsed": elapsed, "price": str(price),
-                        "gateway": gateway, "site": site_clean,
-                        "proxy_used": proxy, "api_name": api.get('name', 'Unknown'),
-                        "site_removed": True, "site_purged": True
-                    }
                 # A FAST "<b>No Products!</b>" is the API being throttled, not a
                 # bad site: a real Shopify check takes 6-9s while a throttled API
                 # short-circuits in well under a second. Cool the API down and let
