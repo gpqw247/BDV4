@@ -85753,10 +85753,6 @@ def _vbv_usage_text(db: dict) -> str:
     return (
         f"<b>𝑽𝑩𝑽 / 𝟑𝑫𝑺 𝑳𝑶𝑶𝑲𝑼𝑷</b> {pe('5895770017458294953', '💫')}\n\n"
         "Usage: <code>/vbv 4111111111111111|12|29|123</code>\n"
-        "Or reply to a card with <code>/vbv</code>\n\n"
-        f"📚 <b>Database</b> ➛ <code>{db['valid']}</code> BINs\n"
-        f"🗂️ <b>Source</b> ➛ <code>{Path(db['path']).name}</code>\n"
-        f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
     )
 
 
