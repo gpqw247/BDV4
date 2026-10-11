@@ -2639,7 +2639,7 @@ class AutosopiProxyTracker:
         self.working_proxies = {}        # user_id -> list of working proxies
         self.proxy_performance = {}      # proxy -> stats
         self.proxy_rotation_index = {}   # user_id -> current index
-        pass
+        self.proxy_cooldown = {}         # proxy -> cooldown_until (unused; cooldowns disabled)
         self.proxy_errors = {}           # proxy -> {'407': 0, '429': 0, 'throttled': 0, 'total': 0, 'last_error': '', 'last_time': 0}
 
         self.MAX_407_ERRORS = 3
@@ -13497,7 +13497,7 @@ class ShopifyAPIPool:
         self.good_sites_cache_ttl = 60
 
         # ============ 429 SITE COOLDOWN ============
-        pass
+        self.site_cooldown = {}         # site -> cooldown_until (unused; cooldowns disabled)
         self.SITE_429_COOLDOWN = 0      # 30-second cooldown
 
         # ============ API THROTTLE COOLDOWN ============
@@ -13505,7 +13505,7 @@ class ShopifyAPIPool:
         # instead of doing a real 6-9s Shopify check. When that happens we put
         # the API (NOT the site) on a short cooldown so rotation skips it and
         # the same site gets retried on a healthy API.
-        pass
+        self.api_cooldown = {}          # api_name -> cooldown_until (unused; cooldowns disabled)
         self.API_THROTTLE_COOLDOWN = 0  # seconds
         # NOTE: 429 errors NEVER remove a site, no matter the count.
         # SITE_429_REMOVAL_THRESHOLD intentionally removed — do not re-add
@@ -31089,7 +31089,7 @@ class SiteRotationManager:
         msg += f"📊 Pattern: 3 GOOD → 2 NORMAL\n"
         msg += f"⏸️ 429 cooldown: {self.RATE_LIMIT_COOLDOWN}s\n\n"
 
-        pass
+        cooldowns = []
         for site, data in self.rate_limited_sites.items():
             if time.time() < data.get('cooldown_until', 0):
                 remaining = int(data['cooldown_until'] - time.time())
