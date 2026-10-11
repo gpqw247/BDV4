@@ -24592,6 +24592,7 @@ class UserManager:
         "stripe_charge",    # /st  (Strip £5)   — free users: 1 credit per check
         "stco",             # /stco (Stripe Checkout) — free users: 1 credit per check
         "st1_charge",        # /st1 (ST1 $1 Charge) — free users: 1 credit per check
+        "stripe_chk",        # /chk (Stripe Auth) — free users: 1 credit per check
     ]
 
     # ─────────────────────────────────────────────────────────────
@@ -85821,12 +85822,7 @@ def _vbv_save_db(lines: List[str]) -> bool:
 def _vbv_usage_text(db: dict) -> str:
     return (
         f"<b>𝑽𝑩𝑽 / 𝟑𝑫𝑺 𝑳𝑶𝑶𝑲𝑼𝑷</b> {pe('5895770017458294953', '💫')}\n\n"
-        "Usage: <code>/vbv 4111111111111111|12|29|123</code>\n"
-        "Or reply to a card with <code>/vbv</code>\n\n"
-        f"📚 <b>Database</b> ➛ <code>{db['valid']}</code> BINs\n"
-        f"🗂️ <b>Source</b> ➛ <code>{html.escape(str(db.get('path', '—')))}</code>\n"
-        f"📄 <b>Files</b> ➛ <code>{len(db.get('paths', []))}</code>\n"
-        f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+        "Usage: <code>/vbv 4111111111111111|12|29|123</code>"
     )
 
 
@@ -85871,19 +85867,16 @@ async def vbv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cc = card["cc"]
     bin_num = cc[:6]
 
-    # ── credit gate (free tier only) ───────────────────────────────────
+    # ── credit gate: 1 credit per check for free users ────────────────
+    # Uses the shared credit system (owner / ultimate-group / paid tiers
+    # bypass; free tier is charged 1 credit per lookup).
     tier = user_manager.get_tier(user_id)
-    if tier == "free" and user_id != OWNER_ID:
-        balance = get_user_credits(user_id)
-        if balance < VBV_CREDIT_COST:
-            await message.reply_text(
-                f"💎 <b>Not enough credits</b>\n\n"
-                f"This check costs <b>{VBV_CREDIT_COST}</b> credit.\n"
-                f"Your balance: <b>{balance}</b>\n\n"
-                f"Use /redeemcredits or /buy for more.",
-                parse_mode=ParseMode.HTML)
-            return
-        deduct_user_credits(user_id, VBV_CREDIT_COST)
+    can_proceed, credit_err = await check_and_deduct_credits(
+        user_id, update, context, is_mass_check=False, card_count=1
+    )
+    if not can_proceed:
+        await message.reply_text(credit_err, parse_mode=ParseMode.HTML)
+        return
 
     proc = await message.reply_text("🔐 <b>Running VBV lookup…</b>",
                                     parse_mode=ParseMode.HTML)
