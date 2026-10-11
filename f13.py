@@ -2639,11 +2639,11 @@ class AutosopiProxyTracker:
         self.working_proxies = {}        # user_id -> list of working proxies
         self.proxy_performance = {}      # proxy -> stats
         self.proxy_rotation_index = {}   # user_id -> current index
-        self.proxy_cooldown = {}         # proxy -> cooldown_until timestamp
+        pass
         self.proxy_errors = {}           # proxy -> {'407': 0, '429': 0, 'throttled': 0, 'total': 0, 'last_error': '', 'last_time': 0}
 
         self.MAX_407_ERRORS = 3
-        self.RATE_LIMIT_COOLDOWN = 30    # 30-second cooldown for 429 / throttled
+        self.RATE_LIMIT_COOLDOWN = 0    # 30-second cooldown for 429 / throttled
 
     # ---------------------------------------------------------------
     #  RESPONSE VALIDATION
@@ -2683,28 +2683,11 @@ class AutosopiProxyTracker:
     # ---------------------------------------------------------------
     def is_proxy_on_cooldown(self, proxy: str) -> bool:
         """Check if a proxy is currently on 429 cooldown."""
-        if not proxy:
-            return False
-        if proxy in self.proxy_cooldown:
-            if time.time() < self.proxy_cooldown[proxy]:
-                remaining = int(self.proxy_cooldown[proxy] - time.time())
-                print(f"⏸️ [Proxy Cooldown] {mask_proxy(proxy)} — {remaining}s remaining")
-                return True
-            else:
-                del self.proxy_cooldown[proxy]
         return False
 
     def mark_rate_limited(self, user_id: int, proxy: str, seconds: int = 30):
         """Put a proxy on cooldown for 429 / throttled (DO NOT REMOVE)."""
-        if not proxy:
-            return
-        self.proxy_cooldown[proxy] = time.time() + seconds
-        # Ensure it stays in the working pool so it can be reused after cooldown
-        if user_id not in self.working_proxies:
-            self.working_proxies[user_id] = []
-        if proxy not in self.working_proxies[user_id]:
-            self.working_proxies[user_id].append(proxy)
-        print(f"⏸️ [429 Cooldown] {mask_proxy(proxy)} on cooldown for {seconds}s (NOT removed)")
+        return
 
     # ---------------------------------------------------------------
     #  PROXY RESULT RECORDING
@@ -13514,16 +13497,16 @@ class ShopifyAPIPool:
         self.good_sites_cache_ttl = 60
 
         # ============ 429 SITE COOLDOWN ============
-        self.site_cooldown = {}          # site -> cooldown_until timestamp
-        self.SITE_429_COOLDOWN = 30      # 30-second cooldown
+        pass
+        self.SITE_429_COOLDOWN = 0      # 30-second cooldown
 
         # ============ API THROTTLE COOLDOWN ============
         # A throttled API answers "<b>No Products!</b>" in well under a second
         # instead of doing a real 6-9s Shopify check. When that happens we put
         # the API (NOT the site) on a short cooldown so rotation skips it and
         # the same site gets retried on a healthy API.
-        self.api_cooldown = {}           # api name -> cooldown_until timestamp
-        self.API_THROTTLE_COOLDOWN = 45  # seconds
+        pass
+        self.API_THROTTLE_COOLDOWN = 0  # seconds
         # NOTE: 429 errors NEVER remove a site, no matter the count.
         # SITE_429_REMOVAL_THRESHOLD intentionally removed — do not re-add
         # removal-on-429 logic here.
@@ -13600,46 +13583,22 @@ class ShopifyAPIPool:
     # ---------------------------------------------------------------
     def is_api_on_cooldown(self, api_name: str) -> bool:
         """True if this API is currently on throttle cooldown."""
-        if not api_name:
-            return False
-        until = self.api_cooldown.get(api_name)
-        if not until:
-            return False
-        if time.time() < until:
-            return True
-        self.api_cooldown.pop(api_name, None)
         return False
 
     def mark_api_throttled(self, api_name: str, seconds: int = None):
         """Put a THROTTLED API on cooldown (never removed from the pool)."""
-        if not api_name:
-            return
-        secs = self.API_THROTTLE_COOLDOWN if seconds is None else seconds
-        self.api_cooldown[api_name] = time.time() + secs
-        print(f"⏳ [API THROTTLE] {api_name} on {secs}s cooldown (fast No-Products = throttled)")
+        return
 
     # ---------------------------------------------------------------
     #  SITE COOLDOWN HELPERS
     # ---------------------------------------------------------------
     def is_site_on_cooldown(self, site: str) -> bool:
         """Check if a site is on 429 cooldown."""
-        if not site:
-            return False
-        if site in self.site_cooldown:
-            if time.time() < self.site_cooldown[site]:
-                remaining = int(self.site_cooldown[site] - time.time())
-                print(f"⏸️ [Site Cooldown] {site} — {remaining}s remaining")
-                return True
-            else:
-                del self.site_cooldown[site]
         return False
 
     def mark_site_rate_limited(self, site: str, seconds: int = 30):
         """Put a site on cooldown for 429 (DO NOT REMOVE)."""
-        if not site:
-            return
-        self.site_cooldown[site] = time.time() + seconds
-        print(f"⏸️ [429 Cooldown] Site {site} on cooldown for {seconds}s (NOT removed)")
+        return
 
     # ---------------------------------------------------------------
     #  SITE PERFORMANCE TRACKING
@@ -13892,7 +13851,6 @@ class ShopifyAPIPool:
         MAX_API_THROTTLE_RETRIES = 6
         force_site = None
         SOFT_SITE_ERRORS = (
-            "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED",
             "SITE NOT SUPPORTED",
             "SITE REQUIRES LOGIN",
             "REQUIRES LOGIN",
@@ -14048,6 +14006,22 @@ class ShopifyAPIPool:
                     self.mark_api_result(api_name, False, elapsed, True, is_rate_limit=True)
                     continue
 
+                # ── EXCEPTION: PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED ──
+                # Treat this as CARD_DECLINED with NO retry. This short-circuits
+                # BEFORE every retry path below (unknown-gateway/0-price, soft
+                # site errors, retryable, etc.) so the card is never retried.
+                if "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED" in (result.get("message", "") or "").upper():
+                    result["status"] = "declined"
+                    result["status_category"] = "declined"
+                    result["status_display"] = "❌ DECLINED"
+                    result["message"] = "CARD_DECLINED"
+                    result["api_used"] = api_name
+                    result["api_attempt"] = attempt
+                    result["site_used"] = current_site
+                    result["proxy_used"] = current_proxy
+                    print(f"❌ [API POOL] PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED → CARD_DECLINED (no retry)")
+                    return result
+
                 # A response only counts as a REAL result when the API filled in
                 # BOTH a gateway and a price. Any response with an UNKNOWN
                 # gateway OR a 0.00 price — even a CARD_DECLINED / ORDER_PLACED —
@@ -14132,7 +14106,7 @@ class ShopifyAPIPool:
                     return result
 
                 # Declined (real)
-                decline_patterns = ["CARD_DECLINED", "DECLINED", "DO NOT HONOR", "EXPIRED", "GENERIC_ERROR"]
+                decline_patterns = ["PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED", "CARD_DECLINED", "DECLINED", "DO NOT HONOR", "EXPIRED", "GENERIC_ERROR"]
                 if any(p in response_upper for p in decline_patterns):
                     self._update_site_performance(current_site, response_text, is_good=False)
                     self.mark_api_result(api_name, True, elapsed, False)
@@ -14143,6 +14117,8 @@ class ShopifyAPIPool:
                     result["status"] = "declined"
                     result["status_category"] = "declined"
                     result["status_display"] = "❌ DECLINED"
+                    if "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED" in response_upper:
+                        result["message"] = "CARD_DECLINED"
                     print(f"❌ [API POOL] DECLINED — attempt {attempt}, site {current_site}")
                     return result
 
@@ -14499,7 +14475,7 @@ class ShopifyAPIPool:
                     }
 
             # -------- Real decline ----------
-            real_decline = [
+            real_decline = ["PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED", 
                 "CARD_DECLINED", "DECLINED", "INSUFFICIENT FUNDS",
                 "EXPIRED CARD", "DO NOT HONOR", "LOST CARD",
                 "STOLEN CARD", "RESTRICTED CARD",
@@ -14621,7 +14597,6 @@ class ShopifyAPIPool:
                 "FLEXIBILITY_TERMS", "PAYMENT_FLEXIBILITY",
                 "CART_FAILED", "Cart failed", "CART_FAILED_WITH_STATUS",
                 "PAYMENTS_PROPOSED_GATEWAY_UNAVAILABLE",
-                "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED",
                 "BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH",
                 "DELIVERY_DELIVERY_LINE_DETAIL_CHANGED",
                 "INVALID_PAYMENT_METHOD", "Site not supported",
@@ -23537,7 +23512,6 @@ class AutosopiRetryManager:
     "PAYMENTS_INVALID_GATEWAY_FOR_DEVELOPMENT_STORE",
     "BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH",
     "PAYMENTS_PROPOSED_GATEWAY_UNAVAILABLE",
-    "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED",
     "BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH",
     "SITE_ERROR",
     "Site requires login!",
@@ -23588,7 +23562,6 @@ class AutosopiRetryManager:
     "PAYMENTS_INVALID_GATEWAY_FOR_DEVELOPMENT_STORE",
     "BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH",
     "PAYMENTS_PROPOSED_GATEWAY_UNAVAILABLE",
-    "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED",
     "BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH",
     "SITE_ERROR",
     "Site requires login!",
@@ -23608,7 +23581,7 @@ class AutosopiRetryManager:
         ]
         
         # ============ NEVER RETRY THESE (card is dead) ============
-        no_retry_errors = [
+        no_retry_errors = ["PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED", 
             "CARD_DECLINED",
             "ORDER_PLACED",
             "Order completed",
@@ -25092,19 +25065,6 @@ class UserManager:
     # ═════════════════════════════════════════════════════════════
     def check_rate_limit(self, user_id: int,
                           from_ultimate_group: bool = False):
-        user = self.get_user(user_id)
-        tier = self.get_tier(user_id, from_ultimate_group)
-        rate_limit = self.TIERS[tier]["rate_limit"]
-
-        if rate_limit == 0:
-            return True, 0
-
-        last_check = user.get("last_check", 0)
-        time_diff = time.time() - last_check
-
-        if time_diff < rate_limit:
-            return False, rate_limit - time_diff
-
         return True, 0
 
     def check_daily_limit(self, user_id: int,
@@ -30958,7 +30918,7 @@ class SiteRotationManager:
         # local 429 tracking
         self.rate_limited_sites = {}   # site -> {'count': 0, 'cooldown_until': 0}
         self.RATE_LIMIT_THRESHOLD = 3
-        self.RATE_LIMIT_COOLDOWN = 30
+        self.RATE_LIMIT_COOLDOWN = 0
 
         self.last_used_type = "good"
 
@@ -31011,18 +30971,6 @@ class SiteRotationManager:
     def _is_site_on_cooldown(self, site: str) -> bool:
         """Check both local and pool cooldowns."""
         # Pool-level cooldown
-        if hasattr(shopify_api_pool, 'is_site_on_cooldown'):
-            if shopify_api_pool.is_site_on_cooldown(site):
-                return True
-        # Local cooldown
-        if site in self.rate_limited_sites:
-            cd = self.rate_limited_sites[site].get('cooldown_until', 0)
-            if time.time() < cd:
-                remaining = int(cd - time.time())
-                print(f"⏸️ [Cooldown] {site} — {remaining}s remaining")
-                return True
-            else:
-                self.rate_limited_sites[site]['count'] = 0
         return False
 
     # ---------------------------------------------------------------
@@ -31121,16 +31069,7 @@ class SiteRotationManager:
 
     # ---------------------------------------------------------------
     def record_rate_limit(self, site: str):
-        if site not in self.rate_limited_sites:
-            self.rate_limited_sites[site] = {'count': 0, 'cooldown_until': 0}
-        self.rate_limited_sites[site]['count'] += 1
-        count = self.rate_limited_sites[site]['count']
-        print(f"🚫 [429] {site} — #{count}/{self.RATE_LIMIT_THRESHOLD}")
-        if count >= self.RATE_LIMIT_THRESHOLD:
-            cd = time.time() + self.RATE_LIMIT_COOLDOWN
-            self.rate_limited_sites[site]['cooldown_until'] = cd
-            self.rate_limited_sites[site]['count'] = 0
-            print(f"⏸️ [Cooldown] {site} on cooldown for {self.RATE_LIMIT_COOLDOWN}s")
+        return
 
     def record_site_result(self, site: str, success: bool, response_text: str = ""):
         if success:
@@ -31150,7 +31089,7 @@ class SiteRotationManager:
         msg += f"📊 Pattern: 3 GOOD → 2 NORMAL\n"
         msg += f"⏸️ 429 cooldown: {self.RATE_LIMIT_COOLDOWN}s\n\n"
 
-        cooldowns = []
+        pass
         for site, data in self.rate_limited_sites.items():
             if time.time() < data.get('cooldown_until', 0):
                 remaining = int(data['cooldown_until'] - time.time())
@@ -44308,7 +44247,6 @@ async def check_card_shopify_mass(card: str, site: str, proxy: str = None, user_
             # BEFORE the site-removal loop so these responses do NOT remove the
             # site from rotation.
             site_unsupported_errors = [
-                "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED",
                 "SITE NOT SUPPORTED",
                 "SITE REQUIRES LOGIN",
                 "REQUIRES LOGIN",
@@ -44360,7 +44298,7 @@ async def check_card_shopify_mass(card: str, site: str, proxy: str = None, user_
                        
             
             # ============ DECLINE PATTERNS - MARK AS DECLINED ============
-            decline_patterns = [
+            decline_patterns = ["PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED", 
                 "PAYMENTS_METHOD",
                 "PAYMENTS_CREDIT_CARD_BASE_EXPIRED",
                 "CARD_DECLINED",
@@ -51226,7 +51164,7 @@ async def check_card_shopify_single(card: str, proxy: str = None, site_list: lis
                 is_insufficient = any(pattern in response_upper for pattern in insufficient_patterns)
                 
                 # Decline patterns
-                decline_patterns = ["DECLINED", "CARD DECLINED", "REJECTED", "DO NOT HONOR", "GENERIC_ERROR",]
+                decline_patterns = ["PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED", "DECLINED", "CARD DECLINED", "REJECTED", "DO NOT HONOR", "GENERIC_ERROR",]
                 is_declined = any(pattern in response_upper for pattern in decline_patterns)
                 
                 if is_charged:
@@ -51457,7 +51395,7 @@ async def check_card_backup_shopify(card: str, site: str, proxy: str = None, use
             ]
             
             # Decline patterns (card is dead/invalid)
-            decline_patterns = [
+            decline_patterns = ["PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED", 
                 "CARD_DECLINED", "DECLINED", "REJECTED", 
                 "DO NOT HONOR", "GENERIC_ERROR", "INVALID CARD",
                 "EXPIRED CARD", "LOST_CARD", "STOLEN_CARD",
@@ -62921,16 +62859,7 @@ class BraintreeSession:
     
     async def wait_for_rate_limit(self):
         """Ensure we don't request too quickly"""
-        async with self._lock:
-            now = time.time()
-            time_since_last = now - self.last_request_time
-            
-            if time_since_last < self.min_request_interval:
-                wait_time = self.min_request_interval - time_since_last
-                await asyncio.sleep(wait_time)
-            
-            self.last_request_time = time.time()
-            self.request_count += 1
+        return
     
     async def wake_up_once(self):
         """Wake up the service only once per session"""
@@ -66660,7 +66589,7 @@ async def check_card_new_autosopi(card: str, site: str, proxy: str = None, user_
                 "REDIRECT", "CHALLENGE"
             ]
             
-            decline_patterns = [
+            decline_patterns = ["PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED", 
                 "CARD_DECLINED", "DECLINED", "REJECTED",
                 "DO NOT HONOR", "GENERIC_ERROR", "INVALID CARD",
                 "EXPIRED CARD", "LOST CARD", "STOLEN CARD",
@@ -67249,7 +67178,6 @@ RETRY_ERRORS = [
     "PAYMENTS_INVALID_GATEWAY_FOR_DEVELOPMENT_STORE",
     "BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH",
     "PAYMENTS_PROPOSED_GATEWAY_UNAVAILABLE",
-    "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED",
     "BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH",
     "SITE_ERROR",
     "Site requires login!",
@@ -67296,7 +67224,6 @@ RETRY_ERRORS = [
     "PAYMENTS_INVALID_GATEWAY_FOR_DEVELOPMENT_STORE",
     "BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH",
     "PAYMENTS_PROPOSED_GATEWAY_UNAVAILABLE",
-    "PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED",
     "BUYER_IDENTITY_PRESENTMENT_CURRENCY_DOES_NOT_MATCH",
     "SITE_ERROR",
     "Site requires login!",
@@ -67346,7 +67273,7 @@ SITE_REMOVAL_ERRORS = [
 ]
 
 # Errors that should NOT retry (card is dead)
-NO_RETRY_ERRORS = [
+NO_RETRY_ERRORS = ["PAYMENTS_CREDIT_CARD_BRAND_NOT_SUPPORTED", 
     "CHARGED",
     "ORDER COMPLETED",
     "ORDER_PLACED",
