@@ -31610,25 +31610,54 @@ async def addglobalproxy_command(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def massglobalproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add multiple proxies to the global pool (admin only)"""
+    """Add multiple proxies to the global pool (admin only).
+
+    Sources (in priority order): command args, a replied .txt file
+    (one proxy per line), or a replied text/caption message.
+    """
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("❌ Admin only command.")
         return
-    
-    if not context.args:
-        await update.message.reply_text(
+
+    message = update.effective_message
+    proxy_strings = list(context.args) if context.args else []
+
+    # ── Reply support: pull proxies from a replied .txt file or message ──
+    if not proxy_strings and message.reply_to_message:
+        rt = message.reply_to_message
+        if rt.document:
+            try:
+                tg_file = await rt.document.get_file()
+                raw = await tg_file.download_as_bytearray()
+                content = raw.decode("utf-8", errors="ignore")
+                for line in content.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        proxy_strings.extend(line.split())
+            except Exception as e:
+                await message.reply_text(
+                    f"❌ <b>Could not read the replied file</b>\n\n<code>{str(e)[:120]}</code>",
+                    parse_mode=ParseMode.HTML
+                )
+                return
+        if not proxy_strings:
+            replied_text = (rt.text or rt.caption or "").strip()
+            for line in replied_text.splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    proxy_strings.extend(line.split())
+
+    if not proxy_strings:
+        await message.reply_text(
             "📦 <b>Mass Add Global Proxies</b>\n\n"
             "Usage: <code>/massglobalproxy proxy1 proxy2 proxy3 ...</code>\n"
             "Example: <code>/massglobalproxy user:pass@ip:port user2:pass2@ip2:port2</code>\n\n"
-            "Or reply to a .txt file with /massglobalproxy",
+            "Or reply to a .txt file (one proxy per line) with /massglobalproxy",
             parse_mode=ParseMode.HTML
         )
         return
-    
-    # Get all proxies from args
-    proxy_strings = list(context.args)
-    
-    status_msg = await update.message.reply_text(
+
+    status_msg = await message.reply_text(
         f"📥 Adding {len(proxy_strings)} proxies to global pool..."
     )
     
@@ -77378,6 +77407,18 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
         return True
 
     # ══════════════════════════════════════════════════════════════════════
+    # ── SPECIAL: /massglobalproxy in reply — bulk-add proxies from the
+    #  replied .txt file or text message (owner-only; the command enforces
+    #  that itself). Handled here because the group-0 CommandHandler does
+    #  not run for reply commands.
+    # ══════════════════════════════════════════════════════════════════════
+    if command == '/massglobalproxy':
+        user_args = command_text.split()
+        context.args = user_args[1:]          # drop "/massglobalproxy", keep inline
+        await massglobalproxy_command(update, context)
+        return True
+
+    # ══════════════════════════════════════════════════════════════════════
     # ── SPECIAL: /gift in reply — gift the replied-to user ───────────────
     #  Reply to a user's message with /gift 1h | /gift 1d | /gift test etc.
     #  gift_command reads reply_to_message.from_user as the target.
@@ -85657,20 +85698,115 @@ _vbv_cache = {"path": None, "mtime": None, "map": {},
               "valid": 0, "malformed": 0, "dupes": 0}
 
 
+def _vbv_search_dirs() -> List[Path]:
+    """Directories that may hold a vbvbin.txt copy (ordered, de-duplicated)."""
+    dirs: List[Path] = []
+    for d in (
+        DATA_DIR,
+        DATA_DIR / "FILES",
+        DATA_DIR / "vbv",
+        DATA_DIR / "data",
+        DATA_DIR / "files",
+    ):
+        dirs.append(d)
+    try:
+        cwd = Path.cwd()
+        dirs += [cwd, cwd / "FILES", cwd / "data", cwd / "files"]
+    except Exception:
+        pass
+    try:
+        here = Path(__file__).resolve().parent
+        dirs += [here, here / "FILES", here / "data", here / "files"]
+    except Exception:
+        pass
+    # Common absolute deployment paths (e.g. when DATA_DIR fell back to
+    # ./bot_data but the DB was placed on the mounted volume).
+    for base in ("/data", "/app", "/app/data", "/app/FILES"):
+        dirs.append(Path(base))
+        dirs.append(Path(base) / "FILES")
+
+    seen, out = set(), []
+    for d in dirs:
+        key = str(d)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(d)
+    return out
+
+
+def _vbv_find_paths() -> List[Path]:
+    """Every existing vbvbin.txt / vbvbin*.txt across the search dirs.
+
+    All copies are merged (first copy wins per BIN) so a stale or partial
+    file can never hide a BIN that lives in another copy.
+    """
+    found: List[Path] = []
+    seen = set()
+
+    def _add(p: Path):
+        try:
+            if not p.is_file():
+                return
+            rp = str(p.resolve())
+        except Exception:
+            return
+        if rp in seen:
+            return
+        seen.add(rp)
+        found.append(p)
+
+    for d in _vbv_search_dirs():
+        try:
+            if not d.is_dir():
+                continue
+            # exact filename first, then any vbvbin*.txt upload variant
+            _add(d / VBV_DB_FILENAME)
+            for p in sorted(d.glob("vbvbin*.txt")):
+                _add(p)
+        except Exception:
+            continue
+
+    # Last resort: bounded recursive search under DATA_DIR.
+    if not found:
+        try:
+            for p in DATA_DIR.rglob(VBV_DB_FILENAME):
+                _add(p)
+        except Exception:
+            pass
+    return found
+
+
 def _vbv_db_path() -> Path:
-    """Locate the VBV BIN database (DATA_DIR, then DATA_DIR/FILES)."""
-    candidates = [
+    """Primary DB path (used for /addvbv and /rmvbv writes)."""
+    explicit = [
         data_path(VBV_DB_FILENAME),
         data_path("FILES") / VBV_DB_FILENAME,
         data_path("vbv") / VBV_DB_FILENAME,
     ]
-    for c in candidates:
+    for c in explicit:
         try:
             if c.exists():
                 return c
         except Exception:
             continue
-    return candidates[0]
+    found = _vbv_find_paths()
+    if found:
+        return found[0]
+    return explicit[0]
+
+
+def _vbv_db_signature(paths: List[Path]):
+    """Cache key: per-file (path, mtime_ns, size, inode) so a replaced file
+    is always re-read even if mtime granularity is coarse."""
+    sig = []
+    for p in paths:
+        try:
+            st = p.stat()
+            sig.append((str(p), st.st_mtime_ns, st.st_size, st.st_ino))
+        except Exception:
+            sig.append((str(p), None, None, None))
+    return tuple(sig)
 
 
 def _vbv_classify(status: str) -> str:
@@ -85688,23 +85824,23 @@ def _vbv_classify(status: str) -> str:
 
 
 def _vbv_load_db(force: bool = False) -> dict:
-    """Load + cache the DB. First matching line wins per BIN (as before)."""
-    path = _vbv_db_path()
-    try:
-        mtime = path.stat().st_mtime if path.exists() else None
-    except Exception:
-        mtime = None
+    """Load + merge every DB copy found. First matching line wins per BIN."""
+    paths = _vbv_find_paths()
+    primary = str(paths[0]) if paths else str(data_path(VBV_DB_FILENAME))
+    sig = _vbv_db_signature(paths)
 
-    if (not force and _vbv_cache["path"] == str(path)
-            and _vbv_cache["mtime"] == mtime):
+    if not force and _vbv_cache.get("sig") == sig:
         return _vbv_cache
 
     mapping, valid, malformed, dupes = {}, 0, 0, 0
-    if mtime is not None:
+    sources = []
+    for path in paths:
+        file_valid = 0
         try:
             if path.stat().st_size > VBV_MAX_DB_BYTES:
-                raise ValueError("vbv database exceeds size cap")
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                print(f"⚠️ [VBV] skipping oversized file: {path}")
+                continue
+            with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
                 for raw in fh:
                     line = raw.strip()
                     if not line or line.startswith("#"):
@@ -85719,16 +85855,22 @@ def _vbv_load_db(force: bool = False) -> dict:
                         continue
                     key = key[:6]
                     valid += 1
+                    file_valid += 1
                     if key in mapping:
                         dupes += 1
                         continue              # first match wins
                     mapping[key] = (parts[1].strip(), parts[2].strip())
         except Exception as e:
             print(f"⚠️ [VBV] failed to read {path}: {e}")
+            continue
+        sources.append(f"{path} ({file_valid})")
 
-    _vbv_cache.update({"path": str(path), "mtime": mtime, "map": mapping,
-                       "valid": valid, "malformed": malformed, "dupes": dupes})
-    print(f"📚 [VBV] loaded {valid} BINs from {path} "
+    _vbv_cache.update({"sig": sig, "path": primary,
+                       "paths": [str(p) for p in paths],
+                       "map": mapping, "valid": valid,
+                       "malformed": malformed, "dupes": dupes})
+    print(f"📚 [VBV] loaded {valid} BINs from {len(sources)} file(s): "
+          f"{', '.join(sources) if sources else 'NONE FOUND'} "
           f"(malformed={malformed}, duplicates={dupes})")
     return _vbv_cache
 
@@ -85753,6 +85895,11 @@ def _vbv_usage_text(db: dict) -> str:
     return (
         f"<b>𝑽𝑩𝑽 / 𝟑𝑫𝑺 𝑳𝑶𝑶𝑲𝑼𝑷</b> {pe('5895770017458294953', '💫')}\n\n"
         "Usage: <code>/vbv 4111111111111111|12|29|123</code>\n"
+        "Or reply to a card with <code>/vbv</code>\n\n"
+        f"📚 <b>Database</b> ➛ <code>{db['valid']}</code> BINs\n"
+        f"🗂️ <b>Source</b> ➛ <code>{html.escape(str(db.get('path', '—')))}</code>\n"
+        f"📄 <b>Files</b> ➛ <code>{len(db.get('paths', []))}</code>\n"
+        f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
     )
 
 
