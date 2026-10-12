@@ -67651,20 +67651,21 @@ async def autosopi_mass_check_logic(update: Update, context: ContextTypes.DEFAUL
         errors_emoji   = premium_emoji(PREMIUM_EMOJI_IDS.get("error",    "6282641460093260838"), "⚠️")
         clock_emoji    = premium_emoji(PREMIUM_EMOJI_IDS.get("clock",    "5262540380301191210"), "⏱️")
         id_emoji       = premium_emoji(PREMIUM_EMOJI_IDS.get("id",       "5307905813451397794"), "🔋")
+        checked_emoji  = premium_emoji("6210757863770426951", "🍏")
+        diamond_emoji  = premium_emoji(PREMIUM_EMOJI_IDS.get("diamond", "5427168083074628963"), "💎")
+        sparkle_emoji  = premium_emoji("5895770017458294953", "💫")
 
         # ══════════════════════════════════════════════════════════════
         #  PROGRESS MESSAGE
         # ══════════════════════════════════════════════════════════════
         if progress_msg is None:
             initial_text = (
-                f"{approved_emoji} <b>AUTOSOPI MASS CHECK</b>\n"
-                f"<b>Gateway</b> ➛ Shopify\n"
-                f"<b>Status</b> ➛ STARTING...\n"
-                f"<b>Checked</b> ➛ 0/{total}\n"
-                f"<b>Charged</b> ➛ 0 {charged_emoji}\n"
-                f"<b>Approved</b> ➛ 0 {approved_emoji}\n"
-                f"<b>Dead</b> ➛ 0 {dead_emoji}\n"
-                f"<b>Errors</b> ➛ 0 {errors_emoji}\n"
+                f"<b>Shopify Payments</b>  {sparkle_emoji}\n\n"
+                f"{checked_emoji} <b>Checked</b> ➛ 0/{total}\n"
+                f"{diamond_emoji} <b>Charged</b> ➛ 0\n"
+                f"{approved_emoji} <b>Approved</b> ➛ 0\n"
+                f"{dead_emoji} <b>Dead</b> ➛ 0\n"
+                f"{errors_emoji} <b>Errors</b> ➛ 0\n\n"
                 f"{id_emoji} <b>Session ID</b> ➛ <code>{session_id}</code>\n"
                 f"{clock_emoji} <b>Time</b> ➛ 0s"
             )
@@ -67707,14 +67708,12 @@ async def autosopi_mass_check_logic(update: Update, context: ContextTypes.DEFAUL
                 status_text = f"PROCESSING {current}/{total}"
 
             progress_text = (
-                f"{approved_emoji} <b>AUTOSOPI MASS CHECK</b>\n"
-                f"<b>Gateway</b> ➛ Shopify\n"
-                f"<b>Status</b> ➛ {status_text}\n"
-                f"<b>Checked</b> ➛ {current}/{total}\n"
-                f"<b>Charged</b> ➛ {stats['charged']} {charged_emoji}\n"
-                f"<b>Approved</b> ➛ {stats['approved']} {approved_emoji}\n"
-                f"<b>Dead</b> ➛ {stats['declined']} {dead_emoji}\n"
-                f"<b>Errors</b> ➛ 0 {errors_emoji}\n"
+                f"<b>Shopify Payments</b>  {sparkle_emoji}\n\n"
+                f"{checked_emoji} <b>Checked</b> ➛ {current}/{total}\n"
+                f"{diamond_emoji} <b>Charged</b> ➛ {stats['charged']}\n"
+                f"{approved_emoji} <b>Approved</b> ➛ {stats['approved']}\n"
+                f"{dead_emoji} <b>Dead</b> ➛ {stats['declined']}\n"
+                f"{errors_emoji} <b>Errors</b> ➛ {stats['errors']}\n\n"
                 f"{id_emoji} <b>Session ID</b> ➛ <code>{session_id}</code>\n"
                 f"{clock_emoji} <b>Time</b> ➛ {time_str}"
             )
@@ -68075,13 +68074,18 @@ async def autosopi_mass_check_logic(update: Update, context: ContextTypes.DEFAUL
             skull_emoji_sum    = premium_emoji(PREMIUM_EMOJI_IDS.get("skull",    "5042167377869932162"), "💀")
             id_emoji_sum       = premium_emoji(PREMIUM_EMOJI_IDS.get("id",       "5307905813451397794"), "🔋")
             clock_emoji_sum    = premium_emoji(PREMIUM_EMOJI_IDS.get("clock",    "5262540380301191210"), "⏱️")
+            checked_emoji_sum  = premium_emoji("6210757863770426951", "🍏")
+            diamond_emoji_sum  = premium_emoji(PREMIUM_EMOJI_IDS.get("diamond", "5427168083074628963"), "💎")
+            sparkle_emoji_sum  = premium_emoji("5895770017458294953", "💫")
+            errors_emoji_sum   = premium_emoji(PREMIUM_EMOJI_IDS.get("error", "6282641460093260838"), "⚠️")
 
             summary = (
-                f"{skull_emoji_sum} <b>AUTOSOPI SESSION COMPLETE</b>\n\n"
-                f"{charged_emoji_sum} <b>Charged</b> ➛ {stats['charged']}\n"
-                f"{approved_emoji_sum} <b>Insufficient</b> ➛ {stats['approved']}\n"
+                f"<b>Shopify Payments</b>  {sparkle_emoji_sum}\n\n"
+                f"{checked_emoji_sum} <b>Checked</b> ➛ {total}/{total}\n"
+                f"{diamond_emoji_sum} <b>Charged</b> ➛ {stats['charged']}\n"
+                f"{approved_emoji_sum} <b>Approved</b> ➛ {stats['approved']}\n"
                 f"{declined_emoji_sum} <b>Dead</b> ➛ {stats['declined']}\n"
-                f"📝 <b>Total</b> ➛ {total}\n"
+                f"{errors_emoji_sum} <b>Errors</b> ➛ {stats['errors']}\n\n"
                 f"{id_emoji_sum} <b>Session ID</b> ➛ <code>{session_id}</code>\n"
                 f"{clock_emoji_sum} <b>Time</b> ➛ {minutes}m {seconds}s\n"
                 f"{skull_emoji_sum} <b>Bot</b> ➛ @BLADESARKS_V3bot"
@@ -77901,6 +77905,14 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
         'square_1usd':       'Square 1$',
     }.get(gateway, gateway.replace('_', ' ').title())
 
+    # ── Autosopi owns its own live-progress message so the new UI (with the
+    #    Session ID) is shown from the very first frame. Do NOT pre-create a
+    #    generic progress card here for it. ──
+    if gateway == 'autosopi':
+        print(f"📦 [REPLY] Mass check → {len(cards)} cards → gateway={gateway}")
+        asyncio.create_task(autosopi_mass_check_logic(update, context, cards, None))
+        return True
+
     progress_text = (
         f"<b>Gateway</b> ➛ {gateway_display}\n"
         f"<b>Status</b> ➛ STARTING...\n"
@@ -77916,9 +77928,7 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
 
     print(f"📦 [REPLY] Mass check → {len(cards)} cards → gateway={gateway}")
 
-    if gateway == 'autosopi':
-        asyncio.create_task(autosopi_mass_check_logic(update, context, cards, progress_msg))
-    elif gateway == 'shopify':
+    if gateway == 'shopify':
         asyncio.create_task(sc_mass_check_logic(update, context, cards, progress_msg))
     elif gateway == 'strip5':
         asyncio.create_task(strip5_mass_logic(update, context, cards, progress_msg))
