@@ -128,6 +128,54 @@ def data_path(filename: str) -> Path:
     """Return the full path to a file inside the persistent data directory."""
     return DATA_DIR / filename
 
+
+async def download_document_bytes(document, attempts: int = 5, base_delay: float = 2.0):
+    """Download a Telegram document's raw bytes as reliably as possible.
+
+    Works for a replied file no matter how old the replied message is: the
+    ``file_id`` is resolved to a fresh ``file_path`` on every attempt, so a
+    stale or expired path from an earlier call is never reused.  Transient
+    Telegram timeouts are retried with backoff, and if the SDK download keeps
+    failing the bytes are fetched directly over HTTPS with a dedicated client
+    (bypassing the bot's shared connection pool).
+    """
+    last_err = None
+    for attempt in range(1, max(1, attempts) + 1):
+        tg_file = None
+        # 1) Resolve a fresh download path for this file_id.
+        try:
+            tg_file = await document.get_file()
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            print(f"⚠️ [DOWNLOAD] get_file attempt {attempt}/{attempts} failed: {e}")
+
+        if tg_file is not None:
+            # 2) Normal python-telegram-bot download.
+            try:
+                return await tg_file.download_as_bytearray()
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                print(f"⚠️ [DOWNLOAD] bytearray attempt {attempt}/{attempts} failed: {e}")
+
+            # 3) Direct HTTPS fallback with a dedicated client / long timeout.
+            try:
+                url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_file.file_path}"
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(300.0, connect=60.0)
+                ) as client:
+                    resp = await client.get(url)
+                    resp.raise_for_status()
+                    return bytearray(resp.content)
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                print(f"⚠️ [DOWNLOAD] direct attempt {attempt}/{attempts} failed: {e}")
+
+        if attempt < attempts:
+            await asyncio.sleep(min(base_delay * attempt, 10))
+
+    raise last_err
+
+
 SESSION_STATE_FILE        = str(data_path("session_state.json"))
 PENDING_BATCHES_FILE      = str(data_path("pending_batches.json"))
 LEADERBOARD_FILE          = str(data_path("leaderboard.json"))
@@ -31567,8 +31615,7 @@ async def massglobalproxy_command(update: Update, context: ContextTypes.DEFAULT_
         rt = message.reply_to_message
         if rt.document:
             try:
-                tg_file = await rt.document.get_file()
-                raw = await tg_file.download_as_bytearray()
+                raw = await download_document_bytes(rt.document)
                 content = raw.decode("utf-8", errors="ignore")
                 for line in content.splitlines():
                     line = line.strip()
@@ -77389,8 +77436,7 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
         if not sites and replied_msg.document:
             try:
                 print(f"📦 [REPLY] /chkadd — downloading replied file: {replied_msg.document.file_name}")
-                tg_file = await replied_msg.document.get_file()
-                raw = await tg_file.download_as_bytearray()
+                raw = await download_document_bytes(replied_msg.document)
                 content = raw.decode('utf-8', errors='ignore')
 
                 for line in content.splitlines():
@@ -77476,8 +77522,7 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
         # 3) replied message is a file → download + parse
         if not sh_cards and replied_msg.document:
             try:
-                tg_file = await replied_msg.document.get_file()
-                raw = await tg_file.download_as_bytearray()
+                raw = await download_document_bytes(replied_msg.document)
                 content = raw.decode('utf-8', errors='ignore')
                 sh_cards = card_formatter.extract_cards(content)
                 if not sh_cards:
@@ -77660,8 +77705,7 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
     if not cards and replied_msg.document:
         try:
             print(f"📦 [REPLY] Downloading replied file: {replied_msg.document.file_name}")
-            tg_file = await replied_msg.document.get_file()
-            raw = await tg_file.download_as_bytearray()
+            raw = await download_document_bytes(replied_msg.document)
             content = raw.decode('utf-8', errors='ignore')
             print(f"📦 [REPLY] File size: {len(content)} bytes")
 
@@ -86018,8 +86062,7 @@ async def addvbv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Bulk via a replied .txt file.
     if replied and replied.document:
         try:
-            tg_file = await replied.document.get_file()
-            blob = await tg_file.download_as_bytearray()
+            blob = await download_document_bytes(replied.document)
             file_text = blob.decode("utf-8", errors="ignore")
             raw = f"{raw}\n{file_text}" if raw else file_text
         except Exception as e:
@@ -86188,10 +86231,10 @@ def main():
     app = Application.builder() \
         .token(BOT_TOKEN) \
         .concurrent_updates(True) \
-        .connect_timeout(30.0) \
-        .read_timeout(30.0) \
-        .write_timeout(30.0) \
-        .pool_timeout(30.0) \
+        .connect_timeout(60.0) \
+        .read_timeout(300.0) \
+        .write_timeout(300.0) \
+        .pool_timeout(60.0) \
         .build()
     
     # ============ CRITICAL: Create and store flood control in bot_data ============
