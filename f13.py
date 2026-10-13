@@ -45100,8 +45100,8 @@ async def shopify_mass_check_logic(update: Update, context: ContextTypes.DEFAULT
         CONCURRENCY = {
             "free": 1,
             "premium": 1,
-            "ultimate": 50,
-            "admin": 50,
+            "ultimate": 100,
+            "admin": 100,
         }.get(tier, 1)
         
         stats = {
@@ -46982,7 +46982,7 @@ stripe_sk_active_tasks: dict = {}
 SK_FILE_PATH = Path("FILES/live_sk.json")
 
 # ── DEFAULT SK ─────────────────────────────────────────────────────────────
-DEFAULT_SK = "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"
+DEFAULT_SK = "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"
 
 
 # ── Fake billing generator ─────────────────────────────────────────────────
