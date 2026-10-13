@@ -202,6 +202,8 @@ SITE_QUALITY_FILE         = str(data_path("site_quality.json"))
 SITE_PERFORMANCE_FILE     = str(data_path("site_performance.json"))
 SITE_PROXY_STATS_FILE     = str(data_path("site_proxy_stats.json"))
 SHOPIFY_QUALITY_BACKUP_FILE = str(data_path("shopify_quality_backup.json"))
+MSH_CONCURRENCY_FILE      = str(data_path("msh_concurrency.json"))
+CMD_LIST_FILE             = str(data_path("cmd_list.json"))
 
 # Live rotation is topped back up from the backup pool whenever it falls
 # below this many sites.
@@ -1582,6 +1584,45 @@ TIER_CONCURRENCY = {
     "ultimate": 30,
     "admin": 30,
 }
+
+# ============ /msh (SHOPIFY MASS CHECK) TIER CONCURRENCY ============
+# Controls how many cards /msh processes in parallel per tier. Editable at
+# runtime by the owner with /setcr <tier> <value> and persisted to disk.
+MSH_TIER_CONCURRENCY = {
+    "free": 1,
+    "premium": 1,
+    "ultimate": 100,
+    "admin": 100,
+}
+
+
+def _load_msh_concurrency():
+    """Load saved /msh concurrency overrides from disk (best-effort)."""
+    try:
+        if Path(MSH_CONCURRENCY_FILE).exists():
+            with open(MSH_CONCURRENCY_FILE, 'r') as f:
+                data = json.load(f)
+            for tier, val in (data or {}).items():
+                if tier in MSH_TIER_CONCURRENCY:
+                    try:
+                        MSH_TIER_CONCURRENCY[tier] = max(1, int(val))
+                    except (TypeError, ValueError):
+                        pass
+            print(f"🔄 Loaded /msh concurrency: {MSH_TIER_CONCURRENCY}")
+    except Exception as e:
+        print(f"⚠️ Error loading /msh concurrency: {e}")
+
+
+def _save_msh_concurrency():
+    """Persist the current /msh concurrency values to disk."""
+    try:
+        with open(MSH_CONCURRENCY_FILE, 'w') as f:
+            json.dump(MSH_TIER_CONCURRENCY, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Error saving /msh concurrency: {e}")
+
+
+_load_msh_concurrency()
 
 # ============ MULTI-USER TASK SCHEDULER ============
 
@@ -13099,6 +13140,80 @@ def check_gateway(gateway_name: str):
 # ============ ADD API COMMAND - FIXED ============
 # Add this to your f13.py after the ShopifyAPIPool class definition and before main()
 
+def _add_shopify_api_from_input(raw_input: str):
+    """
+    Parse ONE domain/URL string and add it to the Shopify API pool.
+
+    Returns (status, name, url):
+      "added"   -> newly added
+      "exists"  -> already in the pool
+      "invalid" -> nothing usable in the string
+    """
+    clean_input = (raw_input or "").strip()
+    # Drop inline comments and common list decoration (bullets / numbering).
+    clean_input = clean_input.split('#')[0].strip()
+    clean_input = re.sub(r'^\s*[•\-*]\s*', '', clean_input)
+    clean_input = re.sub(r'^\s*\d+[\.\)]\s+', '', clean_input)
+    clean_input = clean_input.replace('http://', '').replace('https://', '')
+    clean_input = clean_input.rstrip('/').strip()
+    if not clean_input:
+        return ("invalid", "", "")
+
+    # Build the /shopify URL
+    if clean_input.endswith('/shopify'):
+        url = f"https://{clean_input}"
+    else:
+        url = f"https://{clean_input}/shopify"
+
+    # Duplicate check
+    for api in shopify_api_pool.apis:
+        if api.get("url") == url:
+            return ("exists", api.get("name", ""), url)
+
+    # Next free name (s1, s2, s3, ...)
+    existing_numbers = []
+    for api in shopify_api_pool.apis:
+        name = api.get("name", "")
+        if name.startswith(" s") and name[2:].isdigit():
+            try:
+                existing_numbers.append(int(name[2:]))
+            except ValueError:
+                pass
+    next_number = 1
+    while next_number in existing_numbers:
+        next_number += 1
+    new_name = f" s{next_number}"
+
+    new_api = {
+        "name": new_name,
+        "url": url,
+        "type": "get",
+        "params_format": "query",
+        "timeout": 45,
+        "weight": 15,
+        "enabled": True,
+        "success_count": 0,
+        "fail_count": 0,
+        "last_success": 0,
+        "avg_response_time": 0,
+        "year_format": "2digit",
+    }
+    shopify_api_pool.apis.append(new_api)
+    shopify_api_pool.api_stats[new_name] = {
+        "total_requests": 0,
+        "successful": 0,
+        "failed": 0,
+        "retryable": 0,
+        "rate_limited": 0,
+        "avg_response_time": 0,
+        "last_used": 0,
+        "enabled": True,
+        "weight": 15,
+    }
+    print(f"✅ Added new API: {new_name} -> {url}")
+    return ("added", new_name, url)
+
+
 async def addapi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Add a new Shopify API to the pool - /addapi <domain_or_url>
@@ -13118,13 +13233,69 @@ async def addapi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id != OWNER_ID:
         await update.message.reply_text("❌ Admin only command.", reply_markup=back_menu())
         return
-    
+
+    # ============ FILE / REPLY SUPPORT ============
+    # Replying to a file with /addapi imports every domain/URL found in it
+    # (one per line). Works like /bulkaddapi but reading from the file.
+    reply = update.message.reply_to_message
+    if not context.args and reply and reply.document:
+        status_msg = await update.message.reply_text(
+            "📥 <b>Reading API list from file...</b>\n\n⏱️ Processing...",
+            parse_mode=ParseMode.HTML,
+        )
+        try:
+            file_bytes = await download_document_bytes(reply.document)
+            text = bytes(file_bytes).decode("utf-8", errors="ignore")
+        except Exception as e:
+            await status_msg.edit_text(
+                f"❌ <b>Could not download the file.</b>\n\n<code>{str(e)[:200]}</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_menu(),
+            )
+            return
+
+        # Accept newline, comma, semicolon or whitespace separated entries.
+        entries = [e.strip() for e in re.split(r"[\s,;]+", text) if e.strip()]
+
+        added, already, invalid = [], [], 0
+        for entry in entries:
+            status, name, url = _add_shopify_api_from_input(entry)
+            if status == "added":
+                added.append((name, url))
+            elif status == "exists":
+                already.append(url)
+            else:
+                invalid += 1
+
+        response = "✅ <b>API File Import Complete</b>\n\n"
+        response += "📊 <b>Results:</b>\n"
+        response += f"   ✅ Added: {len(added)}\n"
+        response += f"   🔁 Already exists: {len(already)}\n"
+        response += f"   ⚠️ Skipped/Invalid: {invalid}\n"
+        response += "━━━━━━━━━━━━━━━━━━━\n"
+        response += f"📊 <b>Total APIs in pool:</b> {len(shopify_api_pool.apis)}\n\n"
+
+        if added:
+            response += "<b>✅ Added APIs:</b>\n"
+            for name, url in added[:15]:
+                response += f"   • <b>{name.strip()}</b> → <code>{url}</code>\n"
+            if len(added) > 15:
+                response += f"   ... and {len(added) - 15} more\n"
+
+        response += "\n💡 Use <code>/getapi</code> to export the working APIs."
+
+        await status_msg.edit_text(response, parse_mode=ParseMode.HTML, reply_markup=back_menu())
+        print(f"✅ Admin {user_id} imported {len(added)} Shopify APIs from file")
+        return
+
     if not context.args:
         await update.message.reply_text(
             "🔧 <b>Add Shopify API Command</b>\n\n"
             "Usage: <code>/addapi &lt;domain_or_url&gt;</code>\n"
             "Example: <code>/addapi s1-production-9b72.up.railway.app</code>\n\n"
             "This will add: <code>https://s1-production-9b72.up.railway.app/shopify</code>\n\n"
+            "📎 <b>File import:</b> reply to a .txt file containing domains/URLs\n"
+            "(one per line) with <code>/addapi</code> to add them all at once.\n\n"
             "⚠️ The bot will auto-assign the next available name (s1, s2, s3, etc.)",
             parse_mode=ParseMode.HTML,
             reply_markup=back_menu()
@@ -13469,7 +13640,287 @@ async def listapis_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=back_menu())
 
 
+# ============ EXPORT WORKING SHOPIFY APIS - /getapi ============
+async def getapi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Export every WORKING Shopify API from the pool to a .txt file - /getapi
+    Admin only command.
 
+    A "working" API is any API still present in the live pool (dead APIs are
+    removed from the pool by /apitest) that is also enabled. The .txt lists
+    each API's name, full URL and success stats, plus a plain URL list at the
+    bottom for easy copy/paste.
+    """
+    if not await verify_group_access(update, context):
+        return
+
+    user_id = update.effective_user.id
+
+    # Only owner can export the pool
+    if user_id != OWNER_ID:
+        await update.message.reply_text("❌ Admin only command.", reply_markup=back_menu())
+        return
+
+    apis = shopify_api_pool.apis
+
+    # Working = present in the live pool AND currently enabled
+    working_apis = [api for api in apis if api.get("enabled", True)]
+
+    if not working_apis:
+        await update.message.reply_text(
+            "📋 No working APIs found in the pool.\n\n"
+            "Use <code>/addapi &lt;domain&gt;</code> to add one.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu(),
+        )
+        return
+
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # URLs only — one per line, no header/banner
+    lines = [str(api.get("url", "")) for api in working_apis]
+
+    file_content = "\n".join(lines)
+    file_bytes = io.BytesIO(file_content.encode("utf-8"))
+    filename = f"shopify_working_apis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    file_bytes.name = filename
+
+    await update.message.reply_document(
+        document=file_bytes,
+        filename=filename,
+        caption=(
+            f"📄 <b>Shopify Working APIs</b>\n\n"
+            f"✅ Working: {len(working_apis)}/{len(apis)}\n"
+            f"🕒 {now_str}"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=back_menu(),
+    )
+
+    print(f"✅ Admin {user_id} exported {len(working_apis)} working Shopify APIs via /getapi")
+
+
+# ============ SET /msh TIER CONCURRENCY - /setcr ============
+async def setcr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Set the per-tier concurrency used by /msh (Shopify mass check).
+
+    Usage:
+      /setcr                                -> show current values
+      /setcr <tier> <value>                 -> set one tier
+      /setcr <tier1> <v1> <tier2> <v2> ...  -> set several at once
+
+    Example:
+      /setcr ultimate 80
+      /setcr admin 75
+      /setcr ultimate 80 admin 75
+
+    Admin (owner) only.
+    """
+    if not await verify_group_access(update, context):
+        return
+
+    user_id = update.effective_user.id
+    if user_id != OWNER_ID:
+        await update.message.reply_text("❌ Admin only command.", reply_markup=back_menu())
+        return
+
+    valid_tiers = ("free", "premium", "ultimate", "admin")
+    args = context.args or []
+
+    # No args -> show current settings
+    if not args:
+        msg = "⚙️ <b>/msh Tier Concurrency</b>\n\n"
+        for tier in valid_tiers:
+            msg += f"   • <b>{tier.capitalize()}</b> ➛ {MSH_TIER_CONCURRENCY.get(tier, 1)}\n"
+        msg += (
+            "\n<b>Usage:</b>\n"
+            "<code>/setcr ultimate 80</code>\n"
+            "<code>/setcr admin 75</code>\n"
+            "<code>/setcr ultimate 80 admin 75</code>"
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=back_menu())
+        return
+
+    if len(args) % 2 != 0:
+        await update.message.reply_text(
+            "⚠️ Provide <b>tier value</b> pairs.\n\n"
+            "Example: <code>/setcr ultimate 80</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu(),
+        )
+        return
+
+    changed = []
+    errors = []
+    for i in range(0, len(args), 2):
+        tier = args[i].strip().lower()
+        raw_val = args[i + 1].strip()
+
+        if tier not in valid_tiers:
+            errors.append(f"❌ Unknown tier: <code>{tier}</code> (use: {', '.join(valid_tiers)})")
+            continue
+        try:
+            val = int(raw_val)
+        except ValueError:
+            errors.append(f"❌ Invalid number for <b>{tier}</b>: <code>{raw_val}</code>")
+            continue
+        if val < 1 or val > 5000:
+            errors.append(f"❌ Value for <b>{tier}</b> must be between 1 and 5000.")
+            continue
+
+        MSH_TIER_CONCURRENCY[tier] = val
+        changed.append((tier, val))
+
+    if changed:
+        _save_msh_concurrency()
+
+    msg = ""
+    if changed:
+        msg += "✅ <b>/msh Concurrency Updated</b>\n\n"
+        for tier, val in changed:
+            msg += f"   • <b>{tier.capitalize()}</b> ➛ {val}\n"
+        msg += "\n<b>Current values:</b>\n"
+        for tier in valid_tiers:
+            msg += f"   • {tier.capitalize()}: {MSH_TIER_CONCURRENCY.get(tier, 1)}\n"
+    if errors:
+        msg += ("\n" if msg else "") + "\n".join(errors) + "\n"
+    if not msg:
+        msg = "⚠️ Nothing changed."
+
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=back_menu())
+    print(f"✅ Admin {user_id} set /msh concurrency: {MSH_TIER_CONCURRENCY}")
+
+
+# ============ COMMAND LIST - /cmd & /addcmd ============
+# Editable, persisted list of gateway commands shown by /cmd.
+# Categories: single, mass, more. Managed by the owner with /addcmd.
+CMD_LIST_DEFAULT = {
+    "single": ["/pp", "/sh", "/st", "/st1"],
+    "mass": ["/msh", "/mst1", "/mpp"],
+    "more": ["/buy", "/fb"],
+}
+
+CMD_LIST = {k: list(v) for k, v in CMD_LIST_DEFAULT.items()}
+
+
+def _load_cmd_list():
+    """Load the saved /cmd list from disk (best-effort)."""
+    try:
+        if Path(CMD_LIST_FILE).exists():
+            with open(CMD_LIST_FILE, 'r') as f:
+                data = json.load(f)
+            for cat in ("single", "mass", "more"):
+                if isinstance(data.get(cat), list):
+                    CMD_LIST[cat] = [str(c).strip() for c in data[cat] if str(c).strip()]
+            print(f"🔄 Loaded /cmd list: {CMD_LIST}")
+    except Exception as e:
+        print(f"⚠️ Error loading /cmd list: {e}")
+
+
+def _save_cmd_list():
+    """Persist the current /cmd list to disk."""
+    try:
+        with open(CMD_LIST_FILE, 'w') as f:
+            json.dump(CMD_LIST, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Error saving /cmd list: {e}")
+
+
+_load_cmd_list()
+
+
+def _format_cmd_list() -> str:
+    """Render the /cmd list in the styled layout."""
+    sep = "──────────────"
+    lines = ["𝗖𝗠𝗗𝗦", sep]
+    lines.append("𝗦𝗶𝗻𝗴𝗹𝗲 : " + " ".join(CMD_LIST.get("single", [])))
+    lines.append("𝗠𝗮𝘀𝘀 : " + " ".join(CMD_LIST.get("mass", [])))
+    lines.append("𝗠𝗼𝗿𝗲 : " + " ".join(CMD_LIST.get("more", [])))
+    return "\n".join(lines)
+
+
+async def cmd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the gateway command list - /cmd (available to all users)."""
+    if not await verify_group_access(update, context):
+        return
+
+    await update.message.reply_text(_format_cmd_list(), reply_markup=back_menu())
+
+
+async def addcmd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Add a command to the /cmd list - /addcmd <single|mass|more> <command>
+    Admin only command.
+
+    Examples:
+      /addcmd single /rz
+      /addcmd mass /mrz
+    """
+    if not await verify_group_access(update, context):
+        return
+
+    user_id = update.effective_user.id
+    if user_id != OWNER_ID:
+        await update.message.reply_text("❌ Admin only command.", reply_markup=back_menu())
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "🔧 <b>Add Command to /cmd</b>\n\n"
+            "Usage: <code>/addcmd &lt;single|mass|more&gt; &lt;command&gt;</code>\n\n"
+            "Examples:\n"
+            "<code>/addcmd single /rz</code>\n"
+            "<code>/addcmd mass /mrz</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu(),
+        )
+        return
+
+    # Category (tolerate common typos / shorthands)
+    category = context.args[0].strip().lower()
+    category = {
+        "sinlge": "single", "singel": "single", "s": "single",
+        "m": "mass", "mo": "more",
+    }.get(category, category)
+
+    if category not in CMD_LIST:
+        await update.message.reply_text(
+            "❌ Unknown category. Use <b>single</b>, <b>mass</b> or <b>more</b>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu(),
+        )
+        return
+
+    # Normalise the command to a leading slash, first token only
+    raw_cmd = " ".join(context.args[1:]).strip()
+    cmd = raw_cmd.split()[0] if raw_cmd else ""
+    if cmd and not cmd.startswith('/'):
+        cmd = '/' + cmd
+
+    if not cmd:
+        await update.message.reply_text("❌ No command provided.", reply_markup=back_menu())
+        return
+
+    if cmd in CMD_LIST[category]:
+        await update.message.reply_text(
+            f"ℹ️ <code>{cmd}</code> is already in <b>{category}</b>.\n\n"
+            f"{_format_cmd_list()}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu(),
+        )
+        return
+
+    CMD_LIST[category].append(cmd)
+    _save_cmd_list()
+
+    await update.message.reply_text(
+        f"✅ Added <code>{cmd}</code> to <b>{category}</b>\n\n"
+        f"{_format_cmd_list()}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=back_menu(),
+    )
+    print(f"✅ Admin {user_id} added {cmd} to /cmd {category}")
 
 
 # List of working Shopify APIs (only bladesarksapi endpoints)
@@ -24362,6 +24813,13 @@ async def auto_detect_reply_with_command(update: Update, context: ContextTypes.D
     # which uses the dedicated Shopify progress-card UI for both single and
     # multi-card replies. Bail here so it isn't ALSO single-checked old-style.
     if command == '/sh':
+        return
+
+    # /addapi & /bulkaddapi manage the API pool and are routed through
+    # handle_reply_with_command (group 1) so that replying to a .txt file
+    # works. Bail here so the card auto-detector never misreads an API
+    # list as a card and starts a check.
+    if command.split('@')[0] in ('/addapi', '/bulkaddapi'):
         return
 
     # Check if the user has a pending file
@@ -45096,13 +45554,8 @@ async def shopify_mass_check_logic(update: Update, context: ContextTypes.DEFAULT
         amount = context.user_data.get('payment_amount', DEFAULT_AMOUNT)
         currency = context.user_data.get('payment_currency', DEFAULT_CURRENCY)
         
-        # Concurrency based on tier
-        CONCURRENCY = {
-            "free": 1,
-            "premium": 1,
-            "ultimate": 100,
-            "admin": 100,
-        }.get(tier, 1)
+        # Concurrency based on tier (adjustable by the owner via /setcr)
+        CONCURRENCY = MSH_TIER_CONCURRENCY.get(tier, 1)
         
         stats = {
             "charged": 0,
@@ -77398,6 +77851,24 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
         return True
 
     # ══════════════════════════════════════════════════════════════════════
+    # ── SPECIAL: /addapi & /bulkaddapi in reply — import APIs from the
+    #  replied .txt file (owner-only; addapi_command enforces that itself).
+    #  Handled here because the group-0 CommandHandler does not run for
+    #  reply commands, so a replied file would otherwise be ignored.
+    # ══════════════════════════════════════════════════════════════════════
+    if command == '/addapi' or command.startswith('/addapi@'):
+        user_args = command_text.split()
+        context.args = user_args[1:]          # drop "/addapi", keep any inline
+        await addapi_command(update, context)
+        return True
+
+    if command == '/bulkaddapi' or command.startswith('/bulkaddapi@'):
+        user_args = command_text.split()
+        context.args = user_args[1:]          # drop "/bulkaddapi", keep inline
+        await bulkaddapi_command(update, context)
+        return True
+
+    # ══════════════════════════════════════════════════════════════════════
     # ── SPECIAL: /gift in reply — gift the replied-to user ───────────────
     #  Reply to a user's message with /gift 1h | /gift 1d | /gift test etc.
     #  gift_command reads reply_to_message.from_user as the target.
@@ -78126,7 +78597,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         sites.append(site)
             
             if not sites:
-                await message.reply_text("")
                 return
             
             # ============ STORE IN PENDING_FILES ============
@@ -78143,29 +78613,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             print(f"📦 [DOCUMENT] Stored {len(sites)} sites in pending_files for user {user_id}")
             print(f"📦 [DOCUMENT] Message ID: {message.message_id}")
-            
-            # Show preview
-            preview = "\n".join(sites[:5])
-            if len(sites) > 5:
-                preview += f"\n... and {len(sites) - 5} more sites"
-            
-            await message.reply_text(
-                f"📁 <b>Site File Received</b>\n\n"
-                f"📊 Found <b>{len(sites)}</b> sites\n\n"
-                f"<b>Preview:</b>\n"
-                f"<code>{preview}</code>\n\n"
-                f"💡 <b>Reply to this file with:</b>\n"
-                f"• <code>/chkadd</code> - Check sites for products under $5\n"
-                f"• <code>/submitsite</code> - Submit sites to rotation\n\n"
-                f"📌 Or use <code>/cancel</code> to cancel processing.",
-                parse_mode=ParseMode.HTML,
-                reply_to_message_id=message.message_id
-            )
+            # No confirmation message — the user replies with a command to act on the file.
             return
             
         except Exception as e:
             print(f"❌ [DOCUMENT] Error processing site file: {e}")
-            await message.reply_text(f"❌ Error reading file: {str(e)[:100]}")
             return
     
     # ============ HANDLE CHKADD SITE FILES ============
@@ -78176,15 +78628,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # ============ CHECK FILE EXTENSION ============
     if not file_name.endswith('.txt'):
-        await message.reply_text(
-            "❌ <b>Unsupported File Type</b>\n\n"
-            "Please send a <code>.txt</code> file.\n\n"
-            "Supported files:\n"
-            "• Cards: one per line (card|mm|yy|cvv)\n"
-            "• Proxies: one per line (ip:port or user:pass@ip:port)\n"
-            "• Sites: one per line (example.com)",
-            parse_mode=ParseMode.HTML
-        )
+        # Silently ignore non-.txt files (no confirmation message).
         return
     
     # ============ PROCESS FILE ============
@@ -78195,9 +78639,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         print(f"📄 [DOCUMENT] File content length: {len(content)} bytes")
         
-        # Skip empty files
+        # Skip empty files (silently)
         if not content.strip():
-            await message.reply_text("❌ File is empty.")
             return
         
         # ============ TRY TO PARSE AS CARDS ============
@@ -78217,38 +78660,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'type': 'cards'
             }
             
-            # Show preview
-            preview = "\n".join(cards[:5])
-            if len(cards) > 5:
-                preview += f"\n... and {len(cards) - 5} more cards"
-            
-            # Check batch limit
-            tier = user_manager.get_tier(user_id)
+            # Truncate to the user's tier batch limit (silently)
             max_batch = user_manager.get_max_batch_size(user_id)
-            
             if len(cards) > max_batch:
-                warning = f"⚠️ Your tier allows max {max_batch} cards. Only first {max_batch} will be processed.\n\n"
                 cards = cards[:max_batch]
-            else:
-                warning = ""
-            
-            # Build response
-            response = (
-                f"📁 <b>Card File Received</b>\n\n"
-                f"{warning}"
-                f"💡 <b>Reply to this file with a mass check command:</b>\n"
-                f"• <code>/msh</code> - Shopify Mass\n"
-                f"• <code>/mst</code> - STRIP_5$\n"
-                f"• <code>/msk</code> - Stripe SK Charge\n"
-                f"• <code>/msq</code> - Square 1$ Mass\n"
-                f"📌 Or use <code>/cancel</code> to cancel processing."
-            )
-            
-            await message.reply_text(
-                response,
-                parse_mode=ParseMode.HTML,
-                reply_to_message_id=message.message_id
-            )
+                pending_files[user_id]['cards'] = cards
+
+            # No confirmation message — the user replies with a command to act on the file.
             return
         
         # ============ TRY TO PARSE AS SITES ============
@@ -78273,24 +78691,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'timestamp': time.time(),
                 'type': 'sites'
             }
-            
-            # Show preview
-            preview = "\n".join(sites[:5])
-            if len(sites) > 5:
-                preview += f"\n... and {len(sites) - 5} more sites"
-            
-            await message.reply_text(
-                f"📁 <b>Site File Received</b>\n\n"
-                f"📊 Found <b>{len(sites)}</b> sites\n\n"
-                f"<b>Preview:</b>\n"
-                f"<code>{preview}</code>\n\n"
-                f"💡 <b>Reply to this file with:</b>\n"
-                f"• <code>/chkadd</code> - Check sites for products under $5\n"
-                f"• <code>/submitsite</code> - Submit sites to rotation\n\n"
-                f"📌 Or use <code>/cancel</code> to cancel processing.",
-                parse_mode=ParseMode.HTML,
-                reply_to_message_id=message.message_id
-            )
+            # No confirmation message — the user replies with a command to act on the file.
             return
         
         # ============ TRY TO PARSE AS PROXIES ============
@@ -78311,21 +78712,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         # ============ NO VALID DATA FOUND ============
-        await message.reply_text(
-            "❌ <b>No Valid Data Found</b>\n\n"
-            "The file doesn't contain recognizable data.\n\n"
-            "<b>Supported formats:</b>\n"
-            "• <b>Cards:</b> <code>card_number|month|year|cvv</code>\n"
-            "• <b>Proxies:</b> <code>ip:port</code> or <code>user:pass@ip:port</code>\n"
-            "• <b>Sites:</b> <code>example.com</code> or <code>example.myshopify.com</code>\n\n"
-            "💡 Make sure each entry is on a new line.",
-            parse_mode=ParseMode.HTML
-        )
+        # Silently ignore files with no recognizable data (no message).
         
     except Exception as e:
         print(f"❌ [DOCUMENT] Error processing file: {e}")
         print(f"📝 [DOCUMENT] Traceback: {traceback.format_exc()}")
-        await message.reply_text(f"❌ Error processing file: {str(e)[:100]}")
         
 # ============ HANDLE CHKADD SITE FILES ============
 async def handle_chkadd_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -78363,7 +78754,6 @@ async def handle_chkadd_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     sites.append(site)
         
         if not sites:
-            await update.message.reply_text("")
             return
         
         # Store in pending_files
@@ -78378,24 +78768,10 @@ async def handle_chkadd_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
             'command': 'chkadd'
         }
         
-        # Show preview
-        preview = "\n".join(sites[:5])
-        if len(sites) > 5:
-            preview += f"\n... and {len(sites) - 5} more sites"
-        
-        await update.message.reply_text(
-            f"📁 <b>CHKADD Site File Received</b>\n\n"
-            f"📊 Found <b>{len(sites)}</b> sites\n\n"
-            f"<b>Preview:</b>\n"
-            f"<code>{preview}</code>\n\n"
-            f"💡 Reply to this file with <code>/chkadd</code> to check them.\n"
-            f"📌 Or use <code>/cancel</code> to cancel.",
-            parse_mode=ParseMode.HTML,
-            reply_to_message_id=update.message.message_id
-        )
+        # No confirmation message — the user replies with a command to act on the file.
         
     except Exception as e:
-        await update.message.reply_text(f"❌ Error reading file: {str(e)[:100]}")
+        print(f"❌ [CHKADD] Error reading file: {e}")
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel pending file processing"""
@@ -86467,6 +86843,10 @@ def main():
     app.add_handler(CommandHandler("addapi", addapi_command))
     app.add_handler(CommandHandler("bulkaddapi", bulkaddapi_command))
     app.add_handler(CommandHandler("listapis", listapis_command))
+    app.add_handler(CommandHandler("getapi", getapi_command))
+    app.add_handler(CommandHandler("setcr", setcr_command))
+    app.add_handler(CommandHandler("cmd", cmd_command))
+    app.add_handler(CommandHandler("addcmd", addcmd_command))
     
     # ============ GLOBAL PROXY COMMANDS ============
     app.add_handler(CommandHandler("addglobalproxy", addglobalproxy_command))
