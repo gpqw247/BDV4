@@ -304,6 +304,16 @@ MASS_CHECK_GATEWAY_TASK_DICT_NAMES = {
     "msq": "sq_active_tasks",
 }
 
+# Premium custom-emoji IDs used as button icons (icon_custom_emoji_id) on the
+# shared mass-check progress keyboards (Live / Dead / Charged / All / Stop).
+MASS_CHECK_BUTTON_ICONS = {
+    "live":    "6266787022111773140",  # ✅ approved
+    "dead":    "6267039884016358504",  # ❌ declined
+    "charged": "5427168083074628963",  # 💎 diamond
+    "all":     "6210757863770426951",  # 🍏 checked
+    "stop":    "6282641460093260838",  # 🔴 error
+}
+
 
 def build_mass_check_keyboard(stats: dict, uid: int, session_id: str,
                                gateway_key: str, finished: bool = False) -> InlineKeyboardMarkup:
@@ -315,18 +325,18 @@ def build_mass_check_keyboard(stats: dict, uid: int, session_id: str,
 
     rows = [
         [
-            InlineKeyboardButton(f"🟢 Live ({live_count})", callback_data=f"autosopi_get_live_{session_id}", style='success'),
-            InlineKeyboardButton(f"🔴 Dead ({dead_count})", callback_data=f"autosopi_get_dead_{session_id}", style='danger'),
+            InlineKeyboardButton(f"Live ({live_count})", callback_data=f"autosopi_get_live_{session_id}", style='success', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["live"]),
+            InlineKeyboardButton(f"Dead ({dead_count})", callback_data=f"autosopi_get_dead_{session_id}", style='danger', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["dead"]),
         ],
         [
-            InlineKeyboardButton(f"💎 Charged ({charged_count})", callback_data=f"autosopi_get_charged_{session_id}", style='primary'),
-            InlineKeyboardButton(f"📋 All ({all_count})", callback_data=f"autosopi_get_all_{session_id}", style='primary'),
+            InlineKeyboardButton(f"Charged ({charged_count})", callback_data=f"autosopi_get_charged_{session_id}", style='primary', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["charged"]),
+            InlineKeyboardButton(f"All ({all_count})", callback_data=f"autosopi_get_all_{session_id}", style='primary', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["all"]),
         ],
     ]
 
     if not finished:
         rows.append([
-            InlineKeyboardButton("🛑 Stop Checking", callback_data=f"mcstop_{gateway_key}_{uid}_{session_id}", style='danger'),
+            InlineKeyboardButton("Stop Checking", callback_data=f"mcstop_{gateway_key}_{uid}_{session_id}", style='danger', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["stop"]),
         ])
 
     return InlineKeyboardMarkup(rows)
@@ -34927,17 +34937,17 @@ async def strip5_mass_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
         rows = [
             [
-                InlineKeyboardButton(f"🟢 Live ({live_count})", callback_data=f"autosopi_get_live_{session_id}", style='success'),
-                InlineKeyboardButton(f"🔴 Dead ({dead_count})", callback_data=f"autosopi_get_dead_{session_id}", style='danger'),
+                InlineKeyboardButton(f"Live ({live_count})", callback_data=f"autosopi_get_live_{session_id}", style='success', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["live"]),
+                InlineKeyboardButton(f"Dead ({dead_count})", callback_data=f"autosopi_get_dead_{session_id}", style='danger', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["dead"]),
             ],
             [
-                InlineKeyboardButton(f"💎 Charged ({charged_count})", callback_data=f"autosopi_get_charged_{session_id}", style='primary'),
-                InlineKeyboardButton(f"📋 All ({all_count})", callback_data=f"autosopi_get_all_{session_id}", style='primary'),
+                InlineKeyboardButton(f"Charged ({charged_count})", callback_data=f"autosopi_get_charged_{session_id}", style='primary', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["charged"]),
+                InlineKeyboardButton(f"All ({all_count})", callback_data=f"autosopi_get_all_{session_id}", style='primary', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["all"]),
             ],
         ]
         if not finished:
             rows.append([
-                InlineKeyboardButton("🛑 Stop Checking", callback_data=f"autosopi_stop_{uid}_{session_id}", style='danger'),
+                InlineKeyboardButton("Stop Checking", callback_data=f"autosopi_stop_{uid}_{session_id}", style='danger', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["stop"]),
             ])
         return InlineKeyboardMarkup(rows)
 
@@ -48061,17 +48071,17 @@ async def _stripe_sk_mass_logic(update, context, cards: list, sk: str, progress_
 
         rows = [
             [
-                InlineKeyboardButton(f"🟢 Live ({live_count})", callback_data=f"autosopi_get_live_{session_id}", style='success'),
-                InlineKeyboardButton(f"🔴 Dead ({dead_count})", callback_data=f"autosopi_get_dead_{session_id}", style='danger'),
+                InlineKeyboardButton(f"Live ({live_count})", callback_data=f"autosopi_get_live_{session_id}", style='success', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["live"]),
+                InlineKeyboardButton(f"Dead ({dead_count})", callback_data=f"autosopi_get_dead_{session_id}", style='danger', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["dead"]),
             ],
             [
-                InlineKeyboardButton(f"💎 Charged ({charged_count})", callback_data=f"autosopi_get_charged_{session_id}", style='primary'),
-                InlineKeyboardButton(f"📋 All ({all_count})", callback_data=f"autosopi_get_all_{session_id}", style='primary'),
+                InlineKeyboardButton(f"Charged ({charged_count})", callback_data=f"autosopi_get_charged_{session_id}", style='primary', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["charged"]),
+                InlineKeyboardButton(f"All ({all_count})", callback_data=f"autosopi_get_all_{session_id}", style='primary', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["all"]),
             ],
         ]
         if not finished:
             rows.append([
-                InlineKeyboardButton("🛑 Stop Checking", callback_data=f"autosopi_stop_{uid}_{session_id}", style='danger'),
+                InlineKeyboardButton("Stop Checking", callback_data=f"autosopi_stop_{uid}_{session_id}", style='danger', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["stop"]),
             ])
         return InlineKeyboardMarkup(rows)
 
@@ -68107,18 +68117,18 @@ async def autosopi_mass_check_logic(update: Update, context: ContextTypes.DEFAUL
 
         rows = [
             [
-                InlineKeyboardButton(f"🟢 Live ({live_count})", callback_data=f"autosopi_get_live_{session_id}", style='success'),
-                InlineKeyboardButton(f"🔴 Dead ({dead_count})", callback_data=f"autosopi_get_dead_{session_id}", style='danger'),
+                InlineKeyboardButton(f"Live ({live_count})", callback_data=f"autosopi_get_live_{session_id}", style='success', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["live"]),
+                InlineKeyboardButton(f"Dead ({dead_count})", callback_data=f"autosopi_get_dead_{session_id}", style='danger', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["dead"]),
             ],
             [
-                InlineKeyboardButton(f"💎 Charged ({charged_count})", callback_data=f"autosopi_get_charged_{session_id}", style='primary'),
-                InlineKeyboardButton(f"📋 All ({all_count})", callback_data=f"autosopi_get_all_{session_id}", style='primary'),
+                InlineKeyboardButton(f"Charged ({charged_count})", callback_data=f"autosopi_get_charged_{session_id}", style='primary', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["charged"]),
+                InlineKeyboardButton(f"All ({all_count})", callback_data=f"autosopi_get_all_{session_id}", style='primary', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["all"]),
             ],
         ]
 
         if not finished:
             rows.append([
-                InlineKeyboardButton("🛑 Stop Checking", callback_data=f"autosopi_stop_{uid}_{session_id}", style='danger'),
+                InlineKeyboardButton("Stop Checking", callback_data=f"autosopi_stop_{uid}_{session_id}", style='danger', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["stop"]),
             ])
 
         return InlineKeyboardMarkup(rows)
