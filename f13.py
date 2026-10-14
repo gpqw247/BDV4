@@ -314,6 +314,96 @@ MASS_CHECK_BUTTON_ICONS = {
     "stop":    "6282641460093260838",  # 🔴 error
 }
 
+# ══════════════════════════════════════════════════════════════════
+#  SHARED SINGLE-CHECK RESULT UI  (matches the Braintree Auth style)
+#  Premium emoji icons + labels used by every single-check formatter.
+# ══════════════════════════════════════════════════════════════════
+_UI_SPARKLE = '<tg-emoji emoji-id="5895770017458294953">💫</tg-emoji>'
+_UI_STAR    = '<tg-emoji emoji-id="5893494861612455015">⭐️</tg-emoji>'
+_UI_COIN    = '<tg-emoji emoji-id="6039802097916974085">🪙</tg-emoji>'
+_UI_GLOBE   = '<tg-emoji emoji-id="5902242339899838759">🌐</tg-emoji>'
+_UI_ROCKET  = '<tg-emoji emoji-id="6041705726206808304">🚀</tg-emoji>'
+_UI_BIN     = '<tg-emoji emoji-id="5904542823167824187">🗑</tg-emoji>'
+_UI_CLOCK   = '<tg-emoji emoji-id="6267229004311303657">⌛</tg-emoji>'
+
+
+def _ui_lead_icon(status_text, default: str = "⌛") -> str:
+    """Return the leading emoji (or premium-emoji tag) from a status string.
+
+    Falls back to a sensible status emoji when the status text carries no
+    emoji of its own (e.g. plain "CHARGED" / "DECLINED" labels).
+    """
+    s = str(status_text or "").strip()
+    m = re.match(r'(<tg-emoji emoji-id="\d+">.*?</tg-emoji>)', s)
+    if m:
+        return m.group(1)
+    m = re.match(r'([^\s<]+)', s)
+    if m and not m.group(1)[0].isascii():
+        return m.group(1)
+    up = s.upper()
+    if any(k in up for k in ("DECLIN", "DEAD", "ERROR", "FAIL", "EXPIRED",
+                             "LOST", "STOLEN", "TIMEOUT", "NOT SUPPORTED",
+                             "REJECT", "INVALID")):
+        return "\u274c"
+    if any(k in up for k in ("CHARG", "APPROV", "LIVE", "CVV", "3D",
+                             "AUTHORIZ", "SUCCESS", "INSUFFICIENT",
+                             "FUNDS", "DUPLICATE")):
+        return "\u2705"
+    return default
+
+
+def build_single_check_checking(gateway_name: str, card: str, price: str = "0$") -> str:
+    """Instant 'Checking' card for single-check flows (sparkle layout)."""
+    try:
+        bin_info = _get_fallback_bin_info(str(card)[:6])
+    except Exception:
+        bin_info = ("Unknown", "Unknown", "🌍 Unknown", "USD", "XX")
+    bin_info_text, bank, country, _, _ = bin_info
+
+    parts = str(card).split("|")
+    card_num  = parts[0] if len(parts) > 0 else card
+    exp_month = parts[1] if len(parts) > 1 else "XX"
+    exp_year  = parts[2] if len(parts) > 2 else "XX"
+    exp_year_short = exp_year[-2:] if len(exp_year) == 4 else exp_year
+    cvv       = parts[3] if len(parts) > 3 else "XXX"
+    card_display = f"{card_num}|{exp_month}|{exp_year_short}|{cvv}"
+
+    country_name = str(country).replace("🌐", "").strip() or "Unknown"
+    flag_re = "🇦🇧🇨🇩🇪🇫🇬🇭🇮🇯🇰🇱🇲🇳🇴🇵🇶🇷🇸🇹🇺🇻🇼🇽🇾🇿"
+    if any(ch in country_name for ch in flag_re):
+        country_display = country_name
+    else:
+        flag_map = {
+            "USA": "🇺🇸", "UNITED STATES": "🇺🇸", "UK": "🇬🇧",
+            "UNITED KINGDOM": "🇬🇧", "CANADA": "🇨🇦", "AUSTRALIA": "🇦🇺",
+            "INDIA": "🇮🇳", "UAE": "🇦🇪", "MALAYSIA": "🇲🇾",
+            "SINGAPORE": "🇸🇬", "THAILAND": "🇹🇭", "INDONESIA": "🇮🇩",
+            "PHILIPPINES": "🇵🇭", "VIETNAM": "🇻🇳", "JAPAN": "🇯🇵",
+            "KOREA": "🇰🇷", "GERMANY": "🇩🇪", "FRANCE": "🇫🇷",
+            "ITALY": "🇮🇹", "SPAIN": "🇪🇸", "ECUADOR": "🇪🇨",
+        }
+        flag = "🌍"
+        upper_country = country_name.upper()
+        for k, v in flag_map.items():
+            if k in upper_country:
+                flag = v
+                break
+        country_display = f"{flag} {country_name}"
+
+    bank_display = bank if isinstance(bank, str) and bank and bank != "N/A" else "Unknown"
+    if len(bank_display) > 30:
+        bank_display = bank_display[:27] + "..."
+
+    return (
+        f"<b>{gateway_name}</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗡𝗗 ↣ <code>{card_display}</code>\n\n"
+        f"{_UI_CLOCK} 𝗥𝗲𝘀𝗱𝗼𝗻𝘀𝗲 ↣   Checking ..... \n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝗾𝗻𝘁𝗿𝘂 ↣ <b>{country_display}</b>"
+    )
+
 
 def build_mass_check_keyboard(stats: dict, uid: int, session_id: str,
                                gateway_key: str, finished: bool = False) -> InlineKeyboardMarkup:
@@ -487,11 +577,11 @@ def build_results_keyboard(user_id: int) -> Optional[InlineKeyboardMarkup]:
         return None
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(f"🟢 Live ({live})", callback_data=f"resget_live_{user_id}", style='success'),
-            InlineKeyboardButton(f"💎 Charged ({charged})", callback_data=f"resget_charged_{user_id}", style='primary'),
+            InlineKeyboardButton(f"Live ({live})", callback_data=f"resget_live_{user_id}", style='success', icon_custom_emoji_id="6235252066554484059"),
+            InlineKeyboardButton(f"Charged ({charged})", callback_data=f"resget_charged_{user_id}", style='primary', icon_custom_emoji_id="5427168083074628963"),
         ],
         [
-            InlineKeyboardButton(f"📋 All ({allc})", callback_data=f"resget_all_{user_id}", style='primary'),
+            InlineKeyboardButton(f"All ({allc})", callback_data=f"resget_all_{user_id}", style='primary', icon_custom_emoji_id="5042306247047513767"),
         ],
     ])
 
@@ -2358,7 +2448,7 @@ async def check_group_membership(update: Update, context: ContextTypes.DEFAULT_T
             print(f"⚠️ [GroupCheck] Missing link for {group['name']}")
             continue
 
-        row.append(InlineKeyboardButton(label, url=link, style='primary'))
+        row.append(InlineKeyboardButton(label, url=link, style='primary', icon_custom_emoji_id="5377336227533969892"))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -2367,7 +2457,7 @@ async def check_group_membership(update: Update, context: ContextTypes.DEFAULT_T
         buttons.append(row)
 
     buttons.append([
-        InlineKeyboardButton("✅ Verify Membership", callback_data="verify_membership", style='success')
+        InlineKeyboardButton("Verify Membership", callback_data="verify_membership", style='success', icon_custom_emoji_id="5902002809573740949")
     ])
 
     reply_markup = InlineKeyboardMarkup(buttons)
@@ -2456,7 +2546,7 @@ async def verify_membership_callback(update: Update, context: ContextTypes.DEFAU
         link  = group.get("link", "").strip()
         if not link:
             continue
-        row.append(InlineKeyboardButton(label, url=link, style='primary'))
+        row.append(InlineKeyboardButton(label, url=link, style='primary', icon_custom_emoji_id="5377336227533969892"))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -2465,7 +2555,7 @@ async def verify_membership_callback(update: Update, context: ContextTypes.DEFAU
         buttons.append(row)
 
     buttons.append([
-        InlineKeyboardButton("✅ Verify Membership", callback_data="verify_membership", style='success')
+        InlineKeyboardButton("Verify Membership", callback_data="verify_membership", style='success', icon_custom_emoji_id="5902002809573740949")
     ])
     reply_markup = InlineKeyboardMarkup(buttons)
 
@@ -3605,7 +3695,7 @@ async def send_key_redeem_notification(
     
     keyboard = [
         [
-            InlineKeyboardButton(" BUY NOW", url="https://t.me/BLADESARKS_V3bot", style='success')
+            InlineKeyboardButton("BUY NOW", url="https://t.me/BLADESARKS_V3bot", style='success', icon_custom_emoji_id="5197434882321567830")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -3963,14 +4053,14 @@ def _render_keys_page(keys: list, page: int):
     # Navigation row
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"keys_page:{page - 1}"))
+        nav.append(InlineKeyboardButton("Prev", callback_data=f"keys_page:{page - 1}", icon_custom_emoji_id="5255703720078879038"))
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"keys_page:{page + 1}"))
+        nav.append(InlineKeyboardButton("Next", callback_data=f"keys_page:{page + 1}", icon_custom_emoji_id="6041705726206808304"))
 
     rows = []
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton("🔙 Back", callback_data="back_main", style="danger")])
+    rows.append([InlineKeyboardButton("Back", callback_data="back_main", style="danger", icon_custom_emoji_id="5255703720078879038")])
 
     return msg, InlineKeyboardMarkup(rows)
 
@@ -4743,16 +4833,12 @@ def format_auto_stripe_response(result: Dict, card: str, bin_info: tuple) -> Tup
     # ====================================================
     
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_display}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card_display}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ Auto Stripe\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {message}\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country}\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+        f"<b>Auto Stripe</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_display}</code>\n\n"
+        f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{message}</code>\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country}</b>"
     )
     
     return ui, status_category
@@ -4917,18 +5003,13 @@ async def worker_mass_check(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                     status_display = "💰 INSUFFICIENT FUNDS"
                 
                 output = (
-                    f"┏━━━━━━━⍟\n"
-                    f"┃ {status_display}\n"
-                    f"┗━━━━━━━━━━━⊛\n\n"
-                    f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card}</code>\n"
-                    f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway_from_response}\n"
-                    f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {response_text}\n"
-                    f"[⌬] 𝐏𝐫𝐢𝐜𝐞 ↣ {price_str}\n"
-                    f"━━━━━━━━━━━━━━━━━━━\n"
-                    f"[⌬] 𝐁𝐈𝐍 ↣ {bin_text}\n"
-                    f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank}\n"
-                    f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country}\n"
-                    f"━━━━━━━━━━━━━━━━━━━"
+                    f"<b>{gateway_from_response}</b> {_UI_SPARKLE}\n\n"
+                    f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+                    f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{response_text}</code>\n"
+                    f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price_str}</b>\n\n"
+                    f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_text}</b>\n"
+                    f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+                    f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country}</b>"
                 )
                 
                 await message.reply_text(output, parse_mode=ParseMode.HTML)
@@ -5514,7 +5595,7 @@ async def single_check_auto_stripe(update: Update, context: ContextTypes.DEFAULT
             user_speed_controllers[user_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
         
-        status_msg = await message.reply_text(f"🔄 Checking...")
+        status_msg = await message.reply_text(build_single_check_checking("Auto Stripe", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -5543,13 +5624,12 @@ async def single_check_auto_stripe(update: Update, context: ContextTypes.DEFAULT
         ui, status_category = format_auto_stripe_response(result, card, bin_info)
         
         # ============ ALWAYS SEND THE RESULT TO USER ============
-        try:
-            await status_msg.delete()
-        except:
-            pass
         
         # Send the result to user
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
         print(f"✅ [AUTO STRIPE DEBUG] Result sent to user {user_id}")
         print(f"📤 [AUTO STRIPE DEBUG] Message content: {ui[:200]}...")
         # =========================================================
@@ -5600,10 +5680,9 @@ async def single_check_auto_stripe(update: Update, context: ContextTypes.DEFAULT
         print(f"❌ [AUTO STRIPE DEBUG] Error: {e}")
         print(f"❌ [AUTO STRIPE DEBUG] Traceback: {traceback.format_exc()}")
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         # Refund credits on error
         add_user_credits(user_id, 1)
     finally:
@@ -6480,17 +6559,13 @@ def format_boutique_api_response(result: Dict, card: str, bin_info: tuple) -> Tu
         status_text = "DECLINED"
 
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_emoji} {status_text}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway}\n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price}\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_message}\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+        f"<b>{gateway}</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
+        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_message}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
 
     return ui, status_category
@@ -6551,7 +6626,7 @@ async def single_check_boutique_api(update: Update, context: ContextTypes.DEFAUL
             user_speed_controllers[user_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
 
-        status_msg = await message.reply_text("🔄 Checking card with Boutique Vacation Rentals...")
+        status_msg = await message.reply_text(build_single_check_checking("Boutique", card), parse_mode=ParseMode.HTML)
 
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -6571,13 +6646,12 @@ async def single_check_boutique_api(update: Update, context: ContextTypes.DEFAUL
 
         bin_info = await get_bin_info(card)
 
-        try:
-            await status_msg.delete()
-        except:
-            pass
 
         ui, status_category = format_boutique_api_response(result, card, bin_info)
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
 
         if status_category in ["charged", "approved"]:
             await save_hit_to_file(
@@ -6603,10 +6677,12 @@ async def single_check_boutique_api(update: Update, context: ContextTypes.DEFAUL
         print(f"❌ Error: {e}")
         traceback.print_exc()
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(
+            await status_msg.edit_text(
+            f"❌ <b>Error</b>\n\nCould not check card. Please try again later.\nError: {str(e)[:100]}",
+            parse_mode=ParseMode.HTML
+        )
+        except Exception:
+            await message.reply_text(
             f"❌ <b>Error</b>\n\nCould not check card. Please try again later.\nError: {str(e)[:100]}",
             parse_mode=ParseMode.HTML
         )
@@ -7539,16 +7615,13 @@ def format_globalgreen_response(result: Dict, card: str, bin_info: tuple) -> Tup
         status_text = "DECLINED"
 
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_emoji} {status_text}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ Strip charged \n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price}\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_message}\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
+        f"<b>Strip charged</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
+        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_message}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
 
     return ui, status_category
@@ -7608,7 +7681,7 @@ async def single_check_globalgreen(update: Update, context: ContextTypes.DEFAULT
             user_speed_controllers[user_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
 
-        status_msg = await message.reply_text("🔄 Checking ...")
+        status_msg = await message.reply_text(build_single_check_checking("GlobalGreen", card), parse_mode=ParseMode.HTML)
 
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -7628,13 +7701,12 @@ async def single_check_globalgreen(update: Update, context: ContextTypes.DEFAULT
 
         bin_info = await get_bin_info(card)
 
-        try:
-            await status_msg.delete()
-        except:
-            pass
 
         ui, status_category = format_globalgreen_response(result, card, bin_info)
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
 
         if status_category in ["charged", "approved"]:
             await save_hit_to_file(
@@ -7660,10 +7732,12 @@ async def single_check_globalgreen(update: Update, context: ContextTypes.DEFAULT
         print(f"❌ Error: {e}")
         traceback.print_exc()
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(
+            await status_msg.edit_text(
+            f"❌ <b>Error</b>\n\nCould not check card. Please try again later.\nError: {str(e)[:100]}",
+            parse_mode=ParseMode.HTML
+        )
+        except Exception:
+            await message.reply_text(
             f"❌ <b>Error</b>\n\nCould not check card. Please try again later.\nError: {str(e)[:100]}",
             parse_mode=ParseMode.HTML
         )
@@ -9460,17 +9534,13 @@ def format_paypal_response_stylish(result: Dict, card: str, bin_info: tuple, amo
     
     # Build output with Premium Emojis
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_emoji} {status_text}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ {card_num} | {exp_month} | {exp_year_short} | {cvv}\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ PayPal\n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ 0.1\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_response}\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {brand}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+        f"<b>PayPal</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num} | {exp_month} | {exp_year_short} | {cvv}</code>\n\n"
+        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_response}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>0.1</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{brand}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
     
     return ui, status_category_final
@@ -9871,17 +9941,12 @@ def format_payflow_response(result: Dict, card: str, bin_info: tuple) -> Tuple[s
     print(f"📝 [Payflow Debug] Formatted - Status: {status_display}, Category: {status_category}, Response: {response_msg}")
     
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_display}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ Payflow\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {response_msg}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country}\n"
-        f"━━━━━━━━━━━━━━━━━━━"
+        f"<b>Payflow</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+        f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{response_msg}</code>\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country}</b>"
     )
     return ui, status_category
 
@@ -10098,7 +10163,7 @@ async def payflow_single_check_logic(update: Update, context: ContextTypes.DEFAU
             user_speed_controllers[u_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[u_id]
         
-        status_msg = await message.reply_text("🔄 Checking ...")
+        status_msg = await message.reply_text(build_single_check_checking("Payflow", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -10137,7 +10202,6 @@ async def payflow_single_check_logic(update: Update, context: ContextTypes.DEFAU
             
             user_manager.increment_checks(u_id)
         
-        ui += f"\n[⌬] 𝐒𝐩𝐞𝐞𝐝 ↣ {elapsed:.2f}s"
         
         await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
         
@@ -10272,18 +10336,12 @@ def format_adyen_direct_response(result: Dict, card: str, bin_info: tuple) -> Tu
         bank_display = bank
     
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_display}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ Adyen Direct\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {message}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_code}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {api_country}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+        f"<b>Adyen Direct</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+        f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{message}</code>\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_code}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{api_country}</b>"
     )
     
     return ui, status_category
@@ -10310,7 +10368,7 @@ async def adyen_direct_single_check_logic(update: Update, context: ContextTypes.
             user_speed_controllers[u_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[u_id]
         
-        status_msg = await message.reply_text("🔄 Checking card with Adyen Direct...")
+        status_msg = await message.reply_text(build_single_check_checking("Adyen Direct", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -10760,17 +10818,12 @@ def format_stripe_charge_response(result: Dict, card: str, bin_info: tuple) -> T
         response_msg = result.get("message", "Unknown error")
     
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_display}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ Stripe Charge\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {response_msg}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country}\n"
-        f"━━━━━━━━━━━━━━━━━━━"
+        f"<b>Stripe Charge</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+        f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{response_msg}</code>\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country}</b>"
     )
     return ui, status_category
 
@@ -10932,7 +10985,7 @@ async def stripe_charge_single_check_logic(update: Update, context: ContextTypes
         speed_controller = user_speed_controllers[u_id]
         
         amount = context.user_data.get('payment_amount', DEFAULT_AMOUNT)
-        status_msg = await message.reply_text(f"🔄 Checking card with Stripe Charge (${amount})...")
+        status_msg = await message.reply_text(build_single_check_checking("Stripe Charge", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -10971,7 +11024,6 @@ async def stripe_charge_single_check_logic(update: Update, context: ContextTypes
             
             user_manager.increment_checks(u_id)
         
-        ui += f"\n[⌬] 𝐒𝐩𝐞𝐞𝐝 ↣ {elapsed:.2f}s"
         
         await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
         
@@ -11419,16 +11471,12 @@ def format_stripe_auth_response(result: Dict, card: str, bin_info: tuple) -> Tup
     response_msg = result.get("message", "Unknown")
     
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_display}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ Stripe Auth\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {response_msg}\n"
-        f"\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country}\n"
+        f"<b>Stripe Auth</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+        f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{response_msg}</code>\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country}</b>"
     )
     return ui, status_category
 
@@ -11605,7 +11653,7 @@ async def stripe_auth_single_check_logic(update: Update, context: ContextTypes.D
             user_speed_controllers[u_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[u_id]
         
-        status_msg = await message.reply_text("🔄 Checking card with Stripe Auth...")
+        status_msg = await message.reply_text(build_single_check_checking("Stripe Auth", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -11644,7 +11692,6 @@ async def stripe_auth_single_check_logic(update: Update, context: ContextTypes.D
             
             user_manager.increment_checks(u_id)
         
-        ui += f"\n[⌬] 𝐒𝐩𝐞𝐞𝐝 ↣ {elapsed:.2f}s"
         
         await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
         
@@ -11652,7 +11699,7 @@ async def stripe_auth_single_check_logic(update: Update, context: ContextTypes.D
         await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [Stripe Auth Single] Error: {traceback.format_exc()}")
 
-# --- CONFIG ---
+# --- CONFIG 
 BOT_TOKEN = "8240924682:AAEq3wiuVUrvEJO6ZuT6LEdq8X8UYIGrHSY"
 OWNER_ID = 6299808404
 PAYPAL_API_BASE = "https://web-production-9c43d.up.railway.app"
@@ -16171,17 +16218,13 @@ def format_payglocal_response(result: Dict, card: str, bin_info: tuple) -> Tuple
             break
     
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_emoji} {status_text}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{full_card}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ PayGlocal\n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ ${amount}\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_message}\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+        f"<b>PayGlocal</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{full_card}</code>\n\n"
+        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_message}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>${amount}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
     
     return ui, status_category
@@ -18555,7 +18598,7 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # ============ BLADESARKS BUTTON - LIKE SHOPIFY ============
                 keyboard = [
                     [
-                        InlineKeyboardButton("💎 BLADESARKS", url="https://t.me/BLADESARKS_V3bot", style='primary'),
+                        InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_V3bot", style='primary', icon_custom_emoji_id="5427168083074628963"),
                     ]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
@@ -20328,19 +20371,13 @@ def format_new_stripe_response(result: Dict, card: str, bin_info: tuple) -> Tupl
         status_display = "⚠️ TEST CARD (API Works)"
     
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_display}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card_display}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway}\n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price}\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {message}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+        f"<b>{gateway}</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_display}</code>\n\n"
+        f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{message}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country}</b>"
     )
     
     return ui, status_category
@@ -21118,7 +21155,7 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [
-            InlineKeyboardButton("💎 BLADESARKS", url="https://t.me/BLADESARKS_V3bot", style='primary')
+            InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_V3bot", style='primary', icon_custom_emoji_id="5427168083074628963")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -21803,16 +21840,13 @@ def format_st1_response(result: Dict, card: str, bin_info: tuple) -> Tuple[str, 
     
     # Build output with Premium Emojis
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_emoji} {status_text}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"⌬ 𝐂𝐚𝐫𝐝 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n"
-        f"⌬ 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ Strip Charged\n"
-        f"⌬ 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price}\n"
-        f"⌬ 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_response}\n"
-        f"⌬ 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"⌬ 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"⌬ 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
+        f"<b>Strip Charged</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
+        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_response}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
     
     return ui, status_category
@@ -21874,7 +21908,7 @@ async def single_check_st1(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_speed_controllers[user_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
         
-        status_msg = await message.reply_text("🔄 Checking ...")
+        status_msg = await message.reply_text(build_single_check_checking("ST1", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -21898,14 +21932,13 @@ async def single_check_st1(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bin_info = await get_bin_info(card)
         
         # Delete checking message
-        try:
-            await status_msg.delete()
-        except:
-            pass
         
         # Format and send result
         ui, status_category = format_st1_response(result, card, bin_info)
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
         
         # Save hit if approved
         if status_category == "approved":
@@ -21931,10 +21964,9 @@ async def single_check_st1(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except Exception as e:
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [ST1] Error: {traceback.format_exc()}")
         add_user_credits(user_id, 1)  # Refund credit on error
     finally:
@@ -22555,17 +22587,12 @@ def format_stripe_auth_v2_response(result: Dict, card: str, bin_info: tuple) -> 
     clean_message = message[:100]
     
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_display}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card_num}|{exp_month}|{exp_year}|{cvv}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway}\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_message}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country}\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+        f"<b>{gateway}</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year}|{cvv}</code>\n\n"
+        f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_message}</code>\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country}</b>"
     )
     
     return ui, status_category
@@ -24294,7 +24321,7 @@ async def send_hit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         keyboard = [
         [
-            InlineKeyboardButton(" BUY NOW ", url="https://t.me/BLADESARKS_V3bot", style='success')
+            InlineKeyboardButton("BUY NOW", url="https://t.me/BLADESARKS_V3bot", style='success', icon_custom_emoji_id="5197434882321567830")
         ]
 
     ]
@@ -24388,7 +24415,7 @@ async def chk_card_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Simply redirect to bot
     keyboard = [
-        [InlineKeyboardButton("🚀 Open BLADESARKS", url="https://t.me/BLADESARKS_V3bot", style='primary')]
+        [InlineKeyboardButton("Open BLADESARKS", url="https://t.me/BLADESARKS_V3bot", style='primary', icon_custom_emoji_id="6041705726206808304")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -24574,13 +24601,13 @@ async def send_hit_notification(context: ContextTypes.DEFAULT_TYPE,
     if is_charged:
         keyboard = [
             [
-                InlineKeyboardButton("💎 BLADESARKS", url="https://t.me/BLADESARKS_V3bot", style='primary'),
+                InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_V3bot", style='primary', icon_custom_emoji_id="5427168083074628963"),
             ]
         ]
     else:
         keyboard = [
             [
-                InlineKeyboardButton("💎 BLADESARKS", url="https://t.me/BLADESARKS_V3bot", style='primary')
+                InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_V3bot", style='primary', icon_custom_emoji_id="5427168083074628963")
             ]
         ]
     
@@ -25958,7 +25985,7 @@ async def single_check_new_stripe(update: Update, context: ContextTypes.DEFAULT_
     
     # Add random delay before processing (1-2 seconds)
     delay = random.uniform(1.0, 2.0)
-    checking_msg = await message.reply_text(f"🔄 Checking card (delay: {delay:.1f}s)...")
+    checking_msg = await message.reply_text(build_single_check_checking("New Stripe", card), parse_mode=ParseMode.HTML)
     await asyncio.sleep(delay)
     
     # Mark user as active
@@ -25994,13 +26021,12 @@ async def single_check_new_stripe(update: Update, context: ContextTypes.DEFAULT_
         ui, status_category = format_new_stripe_response(result, card, bin_info)
         
         # Delete checking animation
-        try:
-            await checking_msg.delete()
-        except:
-            pass
         
         # Send result
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await checking_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
         
         # Save hit if approved or charged
         if status_category in ["charged", "approved"]:
@@ -26034,10 +26060,9 @@ async def single_check_new_stripe(update: Update, context: ContextTypes.DEFAULT_
         
     except Exception as e:
         try:
-            await checking_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await checking_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [New Stripe Single] Error: {traceback.format_exc()}")
     finally:
         stripe_charge_active_tasks.pop(user_id, None)
@@ -26348,8 +26373,8 @@ async def remove_all_sites(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Ask for confirmation
     keyboard = [
         [
-            InlineKeyboardButton("✅ YES, REMOVE ALL", callback_data='confirm_remove_all', style='danger'),
-            InlineKeyboardButton("❌ CANCEL", callback_data='cancel_remove_all', style='primary')
+            InlineKeyboardButton("YES, REMOVE ALL", callback_data='confirm_remove_all', style='danger', icon_custom_emoji_id="5902002809573740949"),
+            InlineKeyboardButton("CANCEL", callback_data='cancel_remove_all', style='primary', icon_custom_emoji_id="5206121558164573238")
         ]
     ]
     markup = InlineKeyboardMarkup(keyboard)
@@ -31273,16 +31298,13 @@ def format_ezycourse_response(result: Dict, card: str, bin_info: tuple) -> Tuple
     
     # Build output
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_emoji} {status_text}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ Stripe Auth\n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price}\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_message}\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
+        f"<b>Stripe Auth</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
+        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_message}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
     
     return ui, status_category
@@ -31346,7 +31368,7 @@ async def single_check_ezycourse(update: Update, context: ContextTypes.DEFAULT_T
             user_speed_controllers[user_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
         
-        status_msg = await message.reply_text("🔄 Checking ...")
+        status_msg = await message.reply_text(build_single_check_checking("EzyCourse", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -31367,13 +31389,12 @@ async def single_check_ezycourse(update: Update, context: ContextTypes.DEFAULT_T
         
         bin_info = await get_bin_info(card)
         
-        try:
-            await status_msg.delete()
-        except:
-            pass
         
         ui, status_category = format_ezycourse_response(result, card, bin_info)
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
         
         if status_category in ["charged", "approved"]:
             await save_hit_to_file(
@@ -31399,10 +31420,9 @@ async def single_check_ezycourse(update: Update, context: ContextTypes.DEFAULT_T
         
     except Exception as e:
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [EzyCourse] Error: {traceback.format_exc()}")
         add_user_credits(user_id, 1)
     finally:
@@ -32177,8 +32197,8 @@ async def gclear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     keyboard = [[
-        InlineKeyboardButton("✅ YES, CLEAR ALL", callback_data='confirm_gclear', style='danger'),
-        InlineKeyboardButton("❌ CANCEL", callback_data='cancel_gclear', style='primary')
+        InlineKeyboardButton("YES, CLEAR ALL", callback_data='confirm_gclear', style='danger', icon_custom_emoji_id="5902002809573740949"),
+        InlineKeyboardButton("CANCEL", callback_data='cancel_gclear', style='primary', icon_custom_emoji_id="5206121558164573238")
     ]]
 
     await update.message.reply_text(
@@ -33900,17 +33920,13 @@ def format_st1_gateway_response(result: Dict, card: str, bin_info: tuple) -> Tup
 
     # Build output
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_emoji} {status_text}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway}\n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price}\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_message}\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+        f"<b>{gateway}</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
+        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_message}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
 
     return ui, status_category
@@ -33976,7 +33992,7 @@ async def single_check_st1_gateway(update: Update, context: ContextTypes.DEFAULT
             user_speed_controllers[user_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
 
-        status_msg = await message.reply_text("🔄 Checking card with ST1 Gateway...")
+        status_msg = await message.reply_text(build_single_check_checking("ST1 Gateway", card), parse_mode=ParseMode.HTML)
 
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -33997,13 +34013,12 @@ async def single_check_st1_gateway(update: Update, context: ContextTypes.DEFAULT
 
         bin_info = await get_bin_info(card)
 
-        try:
-            await status_msg.delete()
-        except:
-            pass
 
         ui, status_category = format_st1_gateway_response(result, card, bin_info)
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
 
         if status_category in ["charged", "approved"]:
             await save_hit_to_file(
@@ -34027,10 +34042,9 @@ async def single_check_st1_gateway(update: Update, context: ContextTypes.DEFAULT
 
     except Exception as e:
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [ST1 Gateway] Error: {traceback.format_exc()}")
         add_user_credits(user_id, 1)
     finally:
@@ -34758,7 +34772,7 @@ async def strip5_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tier = user_manager.get_tier(user_id)
-    status_msg = await message.reply_text("🔄 Checking card with Strip £5...")
+    status_msg = await message.reply_text(build_single_check_checking("Strip £5", card), parse_mode=ParseMode.HTML)
 
     try:
         # Proxy (optional)
@@ -34790,10 +34804,9 @@ async def strip5_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                    card, bin_info, elapsed)
 
         try:
-            await status_msg.delete()
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
         except Exception:
-            pass
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
 
         # Hit bookkeeping
         if status_category in ("CHARGED", "3DS", "LIVE"):
@@ -34815,10 +34828,9 @@ async def strip5_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         try:
-            await status_msg.delete()
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
         except Exception:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [Strip5 single] {traceback.format_exc()}")
         add_user_credits(user_id, 1)
 
@@ -35775,7 +35787,7 @@ async def sq_single_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     user_id = update.effective_user.id
     message = update.effective_message
     tier = user_manager.get_tier(user_id)
-    status_msg = await message.reply_text("🔄 Checking card with Square 1$...")
+    status_msg = await message.reply_text(build_single_check_checking("Square 1$", card), parse_mode=ParseMode.HTML)
 
     try:
         proxy_url = None
@@ -35798,10 +35810,9 @@ async def sq_single_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
         ui = sq_format_result(status_category, response_text, card, bin_info, elapsed)
 
         try:
-            await status_msg.delete()
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
         except Exception:
-            pass
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
 
         if status_category in ("CHARGED", "LIVE"):
             await save_hit_to_file(
@@ -35822,10 +35833,9 @@ async def sq_single_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     except Exception as e:
         try:
-            await status_msg.delete()
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
         except Exception:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [Square single] {traceback.format_exc()}")
         add_user_credits(user_id, 1)
 
@@ -36564,16 +36574,13 @@ def format_adyen_response(result: Dict, card: str, bin_info: tuple) -> Tuple[str
         status_text = "DECLINED"
     
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_emoji} {status_text}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"⌬ 𝐂𝐚𝐫𝐝 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n"
-        f"⌬ 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway}\n"
-        f"⌬ 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ FREE\n"
-        f"⌬ 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_message}\n"
-        f"⌬ 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"⌬ 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"⌬ 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
+        f"<b>{gateway}</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
+        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_message}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>FREE</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
     
     return ui, status_category
@@ -36635,7 +36642,7 @@ async def single_check_adyen(update: Update, context: ContextTypes.DEFAULT_TYPE)
             user_speed_controllers[user_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
         
-        status_msg = await message.reply_text("🔄 Checking card with Adyen gateway...")
+        status_msg = await message.reply_text(build_single_check_checking("Adyen", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -36656,13 +36663,12 @@ async def single_check_adyen(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
         bin_info = await get_bin_info(card)
         
-        try:
-            await status_msg.delete()
-        except:
-            pass
         
         ui, status_category = format_adyen_response(result, card, bin_info)
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
         
         if status_category in ["charged", "approved"]:
             await save_hit_to_file(
@@ -36688,10 +36694,9 @@ async def single_check_adyen(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
     except Exception as e:
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         add_user_credits(user_id, 1)
     finally:
         adyen_active_tasks.pop(user_id, None)
@@ -37653,16 +37658,13 @@ def format_stripe_pl_response(result: Dict, card: str, bin_info: tuple) -> Tuple
         status_text = "DECLINED"
     
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_emoji} {status_text}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"⌬ 𝐂𝐚𝐫𝐝 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n"
-        f"⌬ 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway}\n"
-        f"⌬ 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price}\n"
-        f"⌬ 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_message}\n"
-        f"⌬ 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"⌬ 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"⌬ 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
+        f"<b>{gateway}</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
+        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_message}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
     
     return ui, status_category
@@ -37726,7 +37728,7 @@ async def single_check_stripe_pl(update: Update, context: ContextTypes.DEFAULT_T
             user_speed_controllers[user_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
         
-        status_msg = await message.reply_text("🔄 Checking card with Stripe Payment Link...")
+        status_msg = await message.reply_text(build_single_check_checking("Stripe Payment Link", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -37747,13 +37749,12 @@ async def single_check_stripe_pl(update: Update, context: ContextTypes.DEFAULT_T
         
         bin_info = await get_bin_info(card)
         
-        try:
-            await status_msg.delete()
-        except:
-            pass
         
         ui, status_category = format_stripe_pl_response(result, card, bin_info)
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
         
         if status_category in ["charged", "approved"]:
             await save_hit_to_file(
@@ -37779,10 +37780,9 @@ async def single_check_stripe_pl(update: Update, context: ContextTypes.DEFAULT_T
         
     except Exception as e:
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         add_user_credits(user_id, 1)
     finally:
         stripe_pl_active_tasks.pop(user_id, None)
@@ -39160,7 +39160,7 @@ async def paypal_key_single_command(update: Update, context: ContextTypes.DEFAUL
         tier   = user_manager.get_tier(user_id)
         amount = context.user_data.get("payment_amount", PAYPAL_KEY_AMOUNT)
 
-        status_msg = await message.reply_text("🔄 Checking card with PayPal...")
+        status_msg = await message.reply_text(build_single_check_checking("PayPal", card), parse_mode=ParseMode.HTML)
 
         # ── 3-tier proxy lookup ──────────────────────────────────────────
         proxy_str = _ppk_pick_proxy(user_id)
@@ -39168,13 +39168,12 @@ async def paypal_key_single_command(update: Update, context: ContextTypes.DEFAUL
         result   = await check_card_paypal_key(card, str(amount), proxy_str)
         bin_info = await get_bin_info(card)
 
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
 
         ui, status_category = format_paypal_key_response(result, card, bin_info, str(amount))
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
 
         if status_category in ("charged", "approved"):
             await save_hit_to_file(
@@ -39197,10 +39196,9 @@ async def paypal_key_single_command(update: Update, context: ContextTypes.DEFAUL
 
     except Exception as e:
         try:
-            await status_msg.delete()
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
         except Exception:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [PP Single] {traceback.format_exc()}")
         add_user_credits(user_id, 1)
     finally:
@@ -39774,8 +39772,8 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Show existing pending payment with option to continue
             keyboard = [
                 [
-                    InlineKeyboardButton("✅ Continue Payment", callback_data=f'pay_continue', style='success'),
-                    InlineKeyboardButton("❌ Cancel & Start New", callback_data='pay_cancel_new', style='danger')
+                    InlineKeyboardButton("Continue Payment", callback_data=f'pay_continue', style='success', icon_custom_emoji_id="5902002809573740949"),
+                    InlineKeyboardButton("Cancel & Start New", callback_data='pay_cancel_new', style='danger', icon_custom_emoji_id="5206121558164573238")
                 ]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -39798,16 +39796,16 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Create payment buttons
     keyboard = [
         [
-            InlineKeyboardButton("🔥 Test - $2 (1 Day)", callback_data='pay_plan_test', style='primary'),
-            InlineKeyboardButton("🔥 Lite - $5 (7 Days)", callback_data='pay_plan_lite', style='primary')
+            InlineKeyboardButton("Test - $2 (1 Day)", callback_data='pay_plan_test', style='primary', icon_custom_emoji_id="5039670412733055750"),
+            InlineKeyboardButton("Lite - $5 (7 Days)", callback_data='pay_plan_lite', style='primary', icon_custom_emoji_id="5039670412733055750")
         ],
         [
-            InlineKeyboardButton("🔥 Crown - $10 (15 Days)", callback_data='pay_plan_crown', style='success'),
-            InlineKeyboardButton("🔥 Member - $20 (30 Days)", callback_data='pay_plan_member', style='success')
+            InlineKeyboardButton("Crown - $10 (15 Days)", callback_data='pay_plan_crown', style='success', icon_custom_emoji_id="5039670412733055750"),
+            InlineKeyboardButton("Member - $20 (30 Days)", callback_data='pay_plan_member', style='success', icon_custom_emoji_id="5039670412733055750")
         ],
         [
-            InlineKeyboardButton("📤 Payment Methods", callback_data='pay_wallets', style='primary'),
-            InlineKeyboardButton("❌ Cancel", callback_data='pay_cancel', style='danger')
+            InlineKeyboardButton("Payment Methods", callback_data='pay_wallets', style='primary', icon_custom_emoji_id="5472250091332993630"),
+            InlineKeyboardButton("Cancel", callback_data='pay_cancel', style='danger', icon_custom_emoji_id="5206121558164573238")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -39907,8 +39905,8 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
         keyboard = [
-            [InlineKeyboardButton("✅ I Have Sent Payment", callback_data='pay_done', style='success')],
-            [InlineKeyboardButton("❌ Cancel Payment", callback_data='pay_cancel', style='danger')]
+            [InlineKeyboardButton("I Have Sent Payment", callback_data='pay_done', style='success', icon_custom_emoji_id="5902002809573740949")],
+            [InlineKeyboardButton("Cancel Payment", callback_data='pay_cancel', style='danger', icon_custom_emoji_id="5206121558164573238")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -39936,7 +39934,7 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'💀 <b>Bot</b> ➛ @BLADESARKS_V3bot'
         )
         
-        keyboard = [[InlineKeyboardButton("🔙 Back to Plans", callback_data='pay_back', style='danger')]]
+        keyboard = [[InlineKeyboardButton("Back to Plans", callback_data='pay_back', style='danger', icon_custom_emoji_id="5255703720078879038")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(msg, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
@@ -39946,16 +39944,16 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == 'pay_back':
         keyboard = [
             [
-                InlineKeyboardButton("🔥 Test - $2 (1 Day)", callback_data='pay_plan_test', style='primary'),
-                InlineKeyboardButton("🔥 Lite - $5 (7 Days)", callback_data='pay_plan_lite', style='primary')
+                InlineKeyboardButton("Test - $2 (1 Day)", callback_data='pay_plan_test', style='primary', icon_custom_emoji_id="5039670412733055750"),
+                InlineKeyboardButton("Lite - $5 (7 Days)", callback_data='pay_plan_lite', style='primary', icon_custom_emoji_id="5039670412733055750")
             ],
             [
-                InlineKeyboardButton("🔥 Crown - $10 (15 Days)", callback_data='pay_plan_crown', style='success'),
-                InlineKeyboardButton("🔥 Member - $20 (30 Days)", callback_data='pay_plan_member', style='success')
+                InlineKeyboardButton("Crown - $10 (15 Days)", callback_data='pay_plan_crown', style='success', icon_custom_emoji_id="5039670412733055750"),
+                InlineKeyboardButton("Member - $20 (30 Days)", callback_data='pay_plan_member', style='success', icon_custom_emoji_id="5039670412733055750")
             ],
             [
-                InlineKeyboardButton("📤 Payment Methods", callback_data='pay_wallets', style='primary'),
-                InlineKeyboardButton("❌ Cancel", callback_data='pay_cancel', style='danger')
+                InlineKeyboardButton("Payment Methods", callback_data='pay_wallets', style='primary', icon_custom_emoji_id="5472250091332993630"),
+                InlineKeyboardButton("Cancel", callback_data='pay_cancel', style='danger', icon_custom_emoji_id="5206121558164573238")
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -40010,13 +40008,9 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = []
         for wallet_key, wallet in PAYMENT_WALLETS.items():
             keyboard.append([
-                InlineKeyboardButton(
-                    f"📤 {wallet['name']} ({wallet['network']})", 
-                    callback_data=f'pay_wallet_{plan_key}_{wallet_key}',
-                    style='primary'
-                )
+                InlineKeyboardButton(f"{wallet['name']} ({wallet['network']})", callback_data=f'pay_wallet_{plan_key}_{wallet_key}', style='primary', icon_custom_emoji_id="5472250091332993630")
             ])
-        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data='pay_back', style='danger')])
+        keyboard.append([InlineKeyboardButton("Back", callback_data='pay_back', style='danger', icon_custom_emoji_id="5255703720078879038")])
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         msg = (
@@ -40140,8 +40134,8 @@ async def pay_wallet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     
     keyboard = [
-        [InlineKeyboardButton("✅ I Have Sent Payment", callback_data='pay_done', style='success')],
-        [InlineKeyboardButton("❌ Cancel Payment", callback_data='pay_cancel', style='danger')]
+        [InlineKeyboardButton("I Have Sent Payment", callback_data='pay_done', style='success', icon_custom_emoji_id="5902002809573740949")],
+        [InlineKeyboardButton("Cancel Payment", callback_data='pay_cancel', style='danger', icon_custom_emoji_id="5206121558164573238")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -40236,8 +40230,8 @@ async def pay_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Send confirmation to user
     keyboard = [
-        [InlineKeyboardButton("📊 Check Status", callback_data='pay_status', style='primary')],
-        [InlineKeyboardButton("🔙 Back", callback_data='pay_back', style='danger')]
+        [InlineKeyboardButton("Check Status", callback_data='pay_status', style='primary', icon_custom_emoji_id="5028746137645876535")],
+        [InlineKeyboardButton("Back", callback_data='pay_back', style='danger', icon_custom_emoji_id="5255703720078879038")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -40309,7 +40303,7 @@ async def pay_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             msg += f'   • {plan} - ${amount:.2f} ({date}) {status_emoji}\n'
     
     keyboard = [
-        [InlineKeyboardButton("🔙 Back", callback_data='pay_back', style='danger')]
+        [InlineKeyboardButton("Back", callback_data='pay_back', style='danger', icon_custom_emoji_id="5255703720078879038")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -40341,7 +40335,7 @@ async def paywallets_button_command(update: Update, context: ContextTypes.DEFAUL
     )
     
     keyboard = [
-        [InlineKeyboardButton("🔙 Back to Plans", callback_data='pay_back', style='danger')]
+        [InlineKeyboardButton("Back to Plans", callback_data='pay_back', style='danger', icon_custom_emoji_id="5255703720078879038")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -40886,7 +40880,7 @@ async def send_plan_purchase_notification_clean(
     
     keyboard = [
         [
-            InlineKeyboardButton(" BUY NOW", url="https://t.me/BLADESARKS_V3bot", style='success')
+            InlineKeyboardButton("BUY NOW", url="https://t.me/BLADESARKS_V3bot", style='success', icon_custom_emoji_id="5197434882321567830")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -41587,17 +41581,13 @@ def format_paypal_donation_50_response(result: Dict, card: str, bin_info: tuple)
     
     # Build output
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_emoji} {status_text}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ {card_num} | {exp_month} | {exp_year_short} | {cvv}\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway}\n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price}\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {message[:80]}\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+        f"<b>{gateway}</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num} | {exp_month} | {exp_year_short} | {cvv}</code>\n\n"
+        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{message[:80]}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
     
     return ui, status_category
@@ -41658,7 +41648,7 @@ async def single_check_paypal_donation_50(update: Update, context: ContextTypes.
             user_speed_controllers[user_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
         
-        status_msg = await message.reply_text("🔄 Checking card with PayPal $0.50 Donation...")
+        status_msg = await message.reply_text(build_single_check_checking("PayPal $0.50", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -41679,13 +41669,12 @@ async def single_check_paypal_donation_50(update: Update, context: ContextTypes.
         
         bin_info = await get_bin_info(card)
         
-        try:
-            await status_msg.delete()
-        except:
-            pass
         
         ui, status_category = format_paypal_donation_50_response(result, card, bin_info)
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
         
         if status_category in ["charged", "approved"]:
             await save_hit_to_file(
@@ -41711,10 +41700,9 @@ async def single_check_paypal_donation_50(update: Update, context: ContextTypes.
         
     except Exception as e:
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         add_user_credits(user_id, 1)
     finally:
         paypal_donation_50_active_tasks.pop(user_id, None)
@@ -42630,16 +42618,13 @@ def format_paypal_donation_response(result: Dict, card: str, bin_info: tuple) ->
         status_text = "DECLINED"
     
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_emoji} {status_text}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"⌬ 𝐂𝐚𝐫𝐝 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n"
-        f"⌬ 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway}\n"
-        f"⌬ 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price}\n"
-        f"⌬ 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_message}{billing_info}\n"
-        f"⌬ 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"⌬ 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"⌬ 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣  {country_name}\n"
+        f"<b>{gateway}</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
+        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_message}{billing_info}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
     
     return ui, status_category
@@ -42700,7 +42685,7 @@ async def single_check_paypal_donation(update: Update, context: ContextTypes.DEF
             user_speed_controllers[user_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
         
-        status_msg = await message.reply_text("🔄 Checking card with PayPal $5 Donation...")
+        status_msg = await message.reply_text(build_single_check_checking("PayPal $5", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -42721,13 +42706,12 @@ async def single_check_paypal_donation(update: Update, context: ContextTypes.DEF
         
         bin_info = await get_bin_info(card)
         
-        try:
-            await status_msg.delete()
-        except:
-            pass
         
         ui, status_category = format_paypal_donation_response(result, card, bin_info)
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
         
         if status_category in ["charged", "approved"]:
             await save_hit_to_file(
@@ -42753,10 +42737,9 @@ async def single_check_paypal_donation(update: Update, context: ContextTypes.DEF
         
     except Exception as e:
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         add_user_credits(user_id, 1)
     finally:
         paypal_donation_active_tasks.pop(user_id, None)
@@ -43088,7 +43071,7 @@ async def mass_check_paypal_donation_command(update: Update, context: ContextTyp
 def stop_markup(user_id: int) -> InlineKeyboardMarkup:
     """Create stop button markup for mass checks"""
     keyboard = [
-        [InlineKeyboardButton("🛑 Stop", callback_data=f'stop_{user_id}', style='danger')]
+        [InlineKeyboardButton("Stop", callback_data=f'stop_{user_id}', style='danger', icon_custom_emoji_id="6282641460093260838")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -43854,8 +43837,8 @@ def _next_feedback_id() -> int:
 
 def _feedback_review_keyboard(fid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve", callback_data=f"fbrev_approve_{fid}", style='success'),
-        InlineKeyboardButton("❌ Decline", callback_data=f"fbrev_decline_{fid}", style='danger'),
+        InlineKeyboardButton("Approve", callback_data=f"fbrev_approve_{fid}", style='success', icon_custom_emoji_id="5902002809573740949"),
+        InlineKeyboardButton("Decline", callback_data=f"fbrev_decline_{fid}", style='danger', icon_custom_emoji_id="5206121558164573238"),
     ]])
 
 
@@ -45440,16 +45423,13 @@ async def msh_single_worker(update: Update, context: ContextTypes.DEFAULT_TYPE,
             
             # Build output
             ui = (
-                f"┏━━━━━━━⍟\n"
-                f"┃ {status_display}\n"
-                f"┗━━━━━━━━━━━⊛\n\n"
-                f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card}</code>\n"
-                f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway_from_response}\n"
-                f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price_str}\n"
-                f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {response_msg}\n"
-                f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-                f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank}\n"
-                f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
+                f"<b>{gateway_from_response}</b> {_UI_SPARKLE}\n\n"
+                f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+                f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{response_msg}</code>\n"
+                f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price_str}</b>\n\n"
+                f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+                f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+                f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
             )
             
             async with results_lock:
@@ -45715,18 +45695,13 @@ async def shopify_mass_check_logic(update: Update, context: ContextTypes.DEFAULT
                         
                         if status_category_final in ["charged", "approved"]:
                             ui = (
-                                f"┏━━━━━━━⍟\n"
-                                f"┃ {status_display}\n"
-                                f"┗━━━━━━━━━━━⊛\n\n"
-                                f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card}</code>\n"
-                                f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ Shopify Payments\n"
-                                f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {response_msg}\n"
-                                f"[⌬] 𝐏𝐫𝐢𝐜𝐞 ↣ {price_str}\n"
-                                f"━━━━━━━━━━━━━━━━━━━\n"
-                                f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-                                f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank}\n"
-                                f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country}\n"
-                                f"━━━━━━━━━━━━━━━━━━━"
+                                f"<b>Shopify Payments</b> {_UI_SPARKLE}\n\n"
+                                f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+                                f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{response_msg}</code>\n"
+                                f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price_str}</b>\n\n"
+                                f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+                                f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+                                f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country}</b>"
                             )
                             
                             try:
@@ -46030,18 +46005,13 @@ async def _msh_single_worker_background(chat_id, progress_msg_id, context, card_
             elapsed = result.get("elapsed", 0)
             
             ui = (
-                f"┏━━━━━━━⍟\n"
-                f"┃ {status_display}\n"
-                f"┗━━━━━━━━━━━⊛\n\n"
-                f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card}</code>\n"
-                f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ Shopify Payments\n"
-                f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {response_msg}\n"
-                f"[⌬] 𝐏𝐫𝐢𝐜𝐞 ↣ {price_str}\n"
-                f"━━━━━━━━━━━━━━━━━━━\n"
-                f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-                f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank}\n"
-                f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country}\n"
-                f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+                f"<b>Shopify Payments</b> {_UI_SPARKLE}\n\n"
+                f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+                f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{response_msg}</code>\n"
+                f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price_str}</b>\n\n"
+                f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+                f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+                f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country}</b>"
             )
             
             # Update stats
@@ -46671,8 +46641,8 @@ async def rgood_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [
         [
-            InlineKeyboardButton("✅ YES, REMOVE ALL", callback_data='confirm_rgood_all', style='danger'),
-            InlineKeyboardButton("❌ CANCEL", callback_data='cancel_rgood_all', style='primary')
+            InlineKeyboardButton("YES, REMOVE ALL", callback_data='confirm_rgood_all', style='danger', icon_custom_emoji_id="5902002809573740949"),
+            InlineKeyboardButton("CANCEL", callback_data='cancel_rgood_all', style='primary', icon_custom_emoji_id="5206121558164573238")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -46771,8 +46741,8 @@ async def rgood_clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     keyboard = [
         [
-            InlineKeyboardButton("✅ YES, CLEAR ALL", callback_data='confirm_rgood_clear', style='danger'),
-            InlineKeyboardButton("❌ CANCEL", callback_data='cancel_rgood_clear', style='primary')
+            InlineKeyboardButton("YES, CLEAR ALL", callback_data='confirm_rgood_clear', style='danger', icon_custom_emoji_id="5902002809573740949"),
+            InlineKeyboardButton("CANCEL", callback_data='cancel_rgood_clear', style='primary', icon_custom_emoji_id="5206121558164573238")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -48485,19 +48455,13 @@ def format_stc1_response(result: Dict, card: str, bin_info: tuple) -> Tuple[str,
     proxy_display = mask_proxy(proxy_used) if proxy_used and proxy_used != "None" else "None"
     
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_display}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card_display}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway}\n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price}\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {message}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+        f"<b>{gateway}</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_display}</code>\n\n"
+        f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{message}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country}</b>"
     )
     
     return ui, status_category
@@ -49689,7 +49653,7 @@ async def paypal_single_check_with_gif(update: Update, context: ContextTypes.DEF
         
         amount = context.user_data.get('payment_amount', DEFAULT_AMOUNT)
         
-        status_msg = await message.reply_text("🔄 Checking card with PayPal...")
+        status_msg = await message.reply_text(build_single_check_checking("PayPal", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -49702,10 +49666,6 @@ async def paypal_single_check_with_gif(update: Update, context: ContextTypes.DEF
         
         bin_info = await get_bin_info(card)
         
-        try:
-            await status_msg.delete()
-        except:
-            pass
         
         # Determine status
         status_category = result.get("status_category", "unknown")
@@ -49769,20 +49729,19 @@ async def paypal_single_check_with_gif(update: Update, context: ContextTypes.DEF
         
         # Build the output
         output = (
-            f"┏━━━━━━━⍟\n"
-            f"┃ {status_display}\n"
-            f"┗━━━━━━━━━━━⊛\n\n"
-            f"[⌬] 𝐂𝐚𝐫𝐝 ↣ {card_num} | {exp_month} | {exp_year} | {cvv}\n"
-            f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ PayPal\n"
-            f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ ${amount}\n"
-            f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_response}\n"
-            f"[⌬] 𝐁𝐈𝐍 ↣ {bin_text}\n"
-            f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-            f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
-            f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+            f"<b>PayPal</b> {_UI_SPARKLE}\n\n"
+            f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num} | {exp_month} | {exp_year} | {cvv}</code>\n\n"
+            f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_response}</code>\n"
+            f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>${amount}</b>\n\n"
+            f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_text}</b>\n"
+            f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+            f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
         )
         
-        await message.reply_text(output, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(output, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(output, parse_mode=ParseMode.HTML)
         
         # Only save as hit if ACTUALLY CHARGED
         if final_category == "charged":
@@ -49820,10 +49779,9 @@ async def paypal_single_check_with_gif(update: Update, context: ContextTypes.DEF
         
     except Exception as e:
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ Error: {traceback.format_exc()}")
         # Refund credits on error
         add_user_credits(u_id, 1)
@@ -51045,6 +51003,56 @@ def format_bt_kaffn8_response(result: Dict, card: str, bin_info: tuple) -> Tuple
     return ui, status_key
 
 
+def format_bt_kaffn8_checking(card: str, bin_info: tuple) -> str:
+    """Instant 'Checking' UI for the Braintree Auth single check (sparkle layout)."""
+    bin_info_text, bank, country, _, _ = bin_info
+
+    card_parts = card.split("|")
+    card_num  = card_parts[0] if len(card_parts) > 0 else card
+    exp_month = card_parts[1] if len(card_parts) > 1 else "XX"
+    exp_year  = card_parts[2] if len(card_parts) > 2 else "XX"
+    exp_year_short = exp_year[-2:] if len(exp_year) == 4 else exp_year
+    cvv       = card_parts[3] if len(card_parts) > 3 else "XXX"
+
+    country_name = str(country).replace("🌐", "").strip() or "Unknown"
+    flag_re = "🇦🇧🇨🇩🇪🇫🇬🇭🇮🇯🇰🇱🇲🇳🇴🇵🇶🇷🇸🇹🇺🇻🇼🇽🇾🇿"
+    if any(ch in country_name for ch in flag_re):
+        country_display = country_name
+    else:
+        flag_map = {
+            "USA": "🇺🇸", "UNITED STATES": "🇺🇸", "UK": "🇬🇧",
+            "UNITED KINGDOM": "🇬🇧", "CANADA": "🇨🇦", "AUSTRALIA": "🇦🇺",
+            "INDIA": "🇮🇳", "UAE": "🇦🇪", "MALAYSIA": "🇲🇾",
+            "SINGAPORE": "🇸🇬", "THAILAND": "🇹🇭", "INDONESIA": "🇮🇩",
+            "PHILIPPINES": "🇵🇭", "VIETNAM": "🇻🇳", "JAPAN": "🇯🇵",
+            "KOREA": "🇰🇷", "GERMANY": "🇩🇪", "FRANCE": "🇫🇷",
+            "ITALY": "🇮🇹", "SPAIN": "🇪🇸", "ECUADOR": "🇪🇨",
+        }
+        flag = "🌍"
+        upper_country = country_name.upper()
+        for k, v in flag_map.items():
+            if k in upper_country:
+                flag = v
+                break
+        country_display = f"{flag} {country_name}"
+
+    bank_display = bank if isinstance(bank, str) and bank and bank != "N/A" else "Unknown"
+    if len(bank_display) > 30:
+        bank_display = bank_display[:27] + "..."
+
+    return (
+        f"<b>Braintree Auth</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
+        f"{_UI_CLOCK} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣   Checking ..... \n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>0$</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_display}</b>"
+    )
+
+
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  SECTION 4 — /bt  (SINGLE CHECK)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -51102,8 +51110,13 @@ async def single_check_bt_kaffn8(update: Update, context: ContextTypes.DEFAULT_T
                 TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
 
+        try:
+            _bin_preview = _get_fallback_bin_info(card[:6])
+        except Exception:
+            _bin_preview = ("Unknown", "Unknown", "🌍 Unknown", "USD", "XX")
         status_msg = await message.reply_text(
-            "🔄 Checking card with Braintree Auth...")
+            format_bt_kaffn8_checking(card, _bin_preview),
+            parse_mode=ParseMode.HTML)
 
         await speed_controller.wait_if_needed()
 
@@ -51122,13 +51135,11 @@ async def single_check_bt_kaffn8(update: Update, context: ContextTypes.DEFAULT_T
 
         bin_info = await get_bin_info(card)
 
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
-
         ui, status_category = format_bt_kaffn8_response(result, card, bin_info)
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
 
         if status_category == "approved":
             await save_hit_to_file(
@@ -51151,10 +51162,11 @@ async def single_check_bt_kaffn8(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         try:
             if status_msg:
-                await status_msg.delete()
+                await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+            else:
+                await message.reply_text(f"❌ Error: {str(e)[:100]}")
         except Exception:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [BT-Kaffn8 Single] {traceback.format_exc()}")
         add_user_credits(user_id, 1)
     finally:
@@ -52545,12 +52557,12 @@ async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [
         [
-            InlineKeyboardButton("🔥 Test  · $2",  callback_data='buy_plan_test',   style='primary'),
-            InlineKeyboardButton("⚡ Lite  · $5",  callback_data='buy_plan_lite',   style='primary'),
+            InlineKeyboardButton("Test · $2", callback_data='buy_plan_test', style='primary', icon_custom_emoji_id="5039670412733055750"),
+            InlineKeyboardButton("Lite · $5", callback_data='buy_plan_lite', style='primary', icon_custom_emoji_id="5397857289216484878"),
         ],
         [
-            InlineKeyboardButton("👑 Crown · $10", callback_data='buy_plan_crown',  style='success'),
-            InlineKeyboardButton("😈 Member· $20", callback_data='buy_plan_member', style='success'),
+            InlineKeyboardButton("Crown · $10", callback_data='buy_plan_crown', style='success', icon_custom_emoji_id="5188344996356448758"),
+            InlineKeyboardButton("Member· $20", callback_data='buy_plan_member', style='success', icon_custom_emoji_id="6268012745776588577"),
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -52609,10 +52621,10 @@ async def buy_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [
-            InlineKeyboardButton("🔐 Crypto Payment", callback_data=f'buy_crypto_{plan_key}', style='success'),
+            InlineKeyboardButton("Crypto Payment", callback_data=f'buy_crypto_{plan_key}', style='success', icon_custom_emoji_id="5197288647275071607"),
         ],
         [
-            InlineKeyboardButton("🔙 Back to Plans", callback_data='buy_back', style='danger')
+            InlineKeyboardButton("Back to Plans", callback_data='buy_back', style='danger', icon_custom_emoji_id="5255703720078879038")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -52648,14 +52660,10 @@ async def buy_crypto_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     keyboard = []
     for wallet_key, wallet in PAYMENT_WALLETS.items():
         keyboard.append([
-            InlineKeyboardButton(
-                f"{wallet['emoji']} {wallet['name']}",
-                callback_data=f'buy_wallet_{plan_key}_{wallet_key}',
-                style='primary'
-            )
+            InlineKeyboardButton(f"{wallet['name']}", callback_data=f'buy_wallet_{plan_key}_{wallet_key}', style='primary', icon_custom_emoji_id="5472250091332993630")
         ])
     
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data=f'buy_back_plan_{plan_key}', style='danger')])
+    keyboard.append([InlineKeyboardButton("Back", callback_data=f'buy_back_plan_{plan_key}', style='danger', icon_custom_emoji_id="5255703720078879038")])
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await query.edit_message_text(message, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
@@ -52752,11 +52760,11 @@ async def buy_wallet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     keyboard = [
         [
-            InlineKeyboardButton("✅ I Have Sent", callback_data='buy_proof_send', style='success'),
-            InlineKeyboardButton("❌ Cancel", callback_data='buy_cancel', style='danger')
+            InlineKeyboardButton("I Have Sent", callback_data='buy_proof_send', style='success', icon_custom_emoji_id="5902002809573740949"),
+            InlineKeyboardButton("Cancel", callback_data='buy_cancel', style='danger', icon_custom_emoji_id="5206121558164573238")
         ],
         [
-            InlineKeyboardButton("📞 Contact Support", url="https://t.me/lencax", style='primary')
+            InlineKeyboardButton("Contact Support", url="https://t.me/lencax", style='primary', icon_custom_emoji_id="5380498417228977451")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -52796,7 +52804,7 @@ async def buy_proof_send_callback(update: Update, context: ContextTypes.DEFAULT_
     )
     
     keyboard = [
-        [InlineKeyboardButton("❌ Cancel", callback_data='buy_cancel', style='danger')]
+        [InlineKeyboardButton("Cancel", callback_data='buy_cancel', style='danger', icon_custom_emoji_id="5206121558164573238")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -52881,8 +52889,8 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
     payment_action_keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Confirm Payment", callback_data=f"confirm_payment_{user_id}", style='success'),
-        InlineKeyboardButton("❌ Reject Payment", callback_data=f"reject_payment_{user_id}", style='danger'),
+        InlineKeyboardButton("Confirm Payment", callback_data=f"confirm_payment_{user_id}", style='success', icon_custom_emoji_id="5902002809573740949"),
+        InlineKeyboardButton("Reject Payment", callback_data=f"reject_payment_{user_id}", style='danger', icon_custom_emoji_id="5206121558164573238"),
     ]])
 
     # ============ SEND TO OWNER'S PRIVATE CHAT ============
@@ -53162,10 +53170,10 @@ async def buy_back_plan_callback(update: Update, context: ContextTypes.DEFAULT_T
     
     keyboard = [
         [
-            InlineKeyboardButton("🔐 Crypto Payment", callback_data=f'buy_crypto_{plan_key}', style='success')
+            InlineKeyboardButton("Crypto Payment", callback_data=f'buy_crypto_{plan_key}', style='success', icon_custom_emoji_id="5197288647275071607")
         ],
         [
-            InlineKeyboardButton("🔙 Back to Plans", callback_data='buy_back', style='danger')
+            InlineKeyboardButton("Back to Plans", callback_data='buy_back', style='danger', icon_custom_emoji_id="5255703720078879038")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -53979,22 +53987,18 @@ async def mass_check_sc1(update: Update, context: ContextTypes.DEFAULT_TYPE):
             charged_emoji_out = premium_emoji(PREMIUM_EMOJI_IDS["charged"], "🔥")
             
             output = (
-                f"┏━━━━━━━⍟\n"
-                f"┃ {charged_emoji_out} CHARGED\n"
-                f"┗━━━━━━━━━━━⊛\n\n"
-                f"[⌬] 𝐂𝐚𝐫𝐝 ↣ {card_num}|{exp_month}|{exp_year_short}|{cvv}\n"
-                f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ Stripe Charger\n"
-                f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ ${amount}\n"
-                f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {message_text[:80]}\n"
-                f"[⌬] 𝐁𝐈𝐍 ↣ {bin_text}\n"
-                f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank}\n"
-                f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
-                f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+                f"<b>Stripe Charger</b> {_UI_SPARKLE}\n\n"
+                f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
+                f"{_ui_lead_icon(charged_emoji_out)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{message_text[:80]}</code>\n"
+                f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>${amount}</b>\n\n"
+                f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_text}</b>\n"
+                f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+                f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
             )
             
             transaction_id = result.get("transaction_id", "N/A")
             if transaction_id != "N/A":
-                output += f"\n[⌬] 𝐓𝐱𝐧 𝐈𝐃 ↣ {transaction_id}"
+                output += f"\n{_UI_GLOBE} 𝐓𝐱𝐧 𝐈𝐃 ↣ <b>{transaction_id}</b>"
             
             try:
                 await message.reply_text(output, parse_mode=ParseMode.HTML)
@@ -54160,17 +54164,13 @@ async def single_check_sc1(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Build output
         output = (
-            f"┏━━━━━━━⍟\n"
-            f"┃ {status_display}\n"
-            f"┗━━━━━━━━━━━⊛\n\n"
-            f"[⌬] 𝐂𝐚𝐫𝐝 ↣ {card_num} | {exp_month} | {exp_year_short} | {cvv}\n"
-            f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ Stripe Charger\n"
-            f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ ${amount}\n"
-            f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {message_text[:80]}\n"
-            f"[⌬] 𝐁𝐈𝐍 ↣ {bin_text}\n"
-            f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank}\n"
-            f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
-            f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+            f"<b>Stripe Charger</b> {_UI_SPARKLE}\n\n"
+            f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num} | {exp_month} | {exp_year_short} | {cvv}</code>\n\n"
+            f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{message_text[:80]}</code>\n"
+            f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>${amount}</b>\n\n"
+            f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_text}</b>\n"
+            f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+            f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
         )
         
         await message.reply_text(output, parse_mode=ParseMode.HTML)
@@ -54953,17 +54953,13 @@ def format_razorpay2_response(result: Dict, card: str, bin_info: tuple) -> Tuple
     
     # Build output with Premium Emojis
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_emoji} {status_display}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ {card_num}|{exp_month}|{exp_year_short}|{cvv}\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway}\n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ ₹10\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_message}\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+        f"<b>{gateway}</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
+        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_message}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>₹10</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
     
     return ui, status_category_fixed
@@ -55027,7 +55023,7 @@ async def single_check_razorpay2(update: Update, context: ContextTypes.DEFAULT_T
             user_speed_controllers[user_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
         
-        status_msg = await message.reply_text(f"🔄 Checking ...")
+        status_msg = await message.reply_text(build_single_check_checking("Razorpay", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -55055,16 +55051,15 @@ async def single_check_razorpay2(update: Update, context: ContextTypes.DEFAULT_T
         # Get BIN info
         bin_info = await get_bin_info(card)
         
-        try:
-            await status_msg.delete()
-        except:
-            pass
         
         # Format response
         ui, status_category = format_razorpay2_response(result, card, bin_info)
         
         # Send result
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
         
         # Save hit if approved or charged
         if status_category in ["charged", "approved"]:
@@ -55092,10 +55087,9 @@ async def single_check_razorpay2(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         print(f"❌ Razorpay2 error: {e}")
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         add_user_credits(user_id, 1)
     finally:
         razorpay_active_tasks.pop(user_id, None)
@@ -56418,17 +56412,13 @@ def format_razorpay_gate2_response(result: Dict, card: str, bin_info: tuple) -> 
     
     # Build output with Premium emojis
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_emoji} {status_text}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ {card_num}|{exp_month}|{exp_year_short}|{cvv}\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway}\n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ ₹10\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_message}\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣  {country_name}\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+        f"<b>{gateway}</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
+        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_message}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>₹10</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
     
     return ui, status_category
@@ -56551,7 +56541,7 @@ async def single_check_razorpay_gate2(update: Update, context: ContextTypes.DEFA
             user_speed_controllers[user_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
         
-        status_msg = await message.reply_text("🔄 Checking ...")
+        status_msg = await message.reply_text(build_single_check_checking("Razorpay Gate2", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -56572,13 +56562,12 @@ async def single_check_razorpay_gate2(update: Update, context: ContextTypes.DEFA
         
         bin_info = await get_bin_info(card)
         
-        try:
-            await status_msg.delete()
-        except:
-            pass
         
         ui, status_category = format_razorpay_gate2_response(result, card, bin_info)
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
         
         if status_category in ["charged", "approved"]:
             await save_hit_to_file(
@@ -56604,10 +56593,9 @@ async def single_check_razorpay_gate2(update: Update, context: ContextTypes.DEFA
         
     except Exception as e:
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         add_user_credits(user_id, 1)
     finally:
         razorpay_active_tasks.pop(user_id, None)
@@ -57461,17 +57449,13 @@ def format_stripe_4usd_response(result: Dict, card: str, bin_info: tuple) -> Tup
     
     # Build output
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_emoji} {status_text}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway}\n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price}\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_message}\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+        f"<b>{gateway}</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
+        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_message}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
     
     return ui, status_category
@@ -57535,7 +57519,7 @@ async def single_check_stripe_4usd(update: Update, context: ContextTypes.DEFAULT
             user_speed_controllers[user_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
         
-        status_msg = await message.reply_text("🔄 Checking card with Stripe 4 USD...")
+        status_msg = await message.reply_text(build_single_check_checking("Stripe 4 USD", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -57556,13 +57540,12 @@ async def single_check_stripe_4usd(update: Update, context: ContextTypes.DEFAULT
         
         bin_info = await get_bin_info(card)
         
-        try:
-            await status_msg.delete()
-        except:
-            pass
         
         ui, status_category = format_stripe_4usd_response(result, card, bin_info)
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
         
         if status_category in ["charged", "approved"]:
             await save_hit_to_file(
@@ -57588,10 +57571,9 @@ async def single_check_stripe_4usd(update: Update, context: ContextTypes.DEFAULT
         
     except Exception as e:
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [Stripe 4 USD] Error: {traceback.format_exc()}")
         add_user_credits(user_id, 1)
     finally:
@@ -59039,7 +59021,7 @@ async def single_check_stripe_chk(update: Update, context: ContextTypes.DEFAULT_
             )
         speed_controller = user_speed_controllers[user_id]
 
-        status_msg = await message.reply_text("🔄 Checking card with Stripe Auth...")
+        status_msg = await message.reply_text(build_single_check_checking("Stripe Auth", card), parse_mode=ParseMode.HTML)
 
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -59063,13 +59045,12 @@ async def single_check_stripe_chk(update: Update, context: ContextTypes.DEFAULT_
 
         bin_info = await get_bin_info(card)
 
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
 
         ui, status_category = format_stripe_chk_response(result, card, bin_info)
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
 
         if status_category == "approved":
             await save_hit_to_file(
@@ -59092,10 +59073,9 @@ async def single_check_stripe_chk(update: Update, context: ContextTypes.DEFAULT_
 
     except Exception as e:
         try:
-            await status_msg.delete()
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
         except Exception:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [Stripe CHK] Error: {traceback.format_exc()}")
         # Refund the credit only on real internal error
         if user_manager.get_tier(user_id) == "free":
@@ -60214,17 +60194,13 @@ def format_razorpay_response(result: Dict, card: str, bin_info: tuple) -> Tuple[
     
     # Format the response
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_display}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ Razorpay\n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ 3₹\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_message}\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {scheme}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank_name}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {processing_time:.2f}s"
+        f"<b>Razorpay</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+        f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_message}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>3₹</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{scheme}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_name}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
     
     return ui, final_category
@@ -60337,7 +60313,7 @@ async def single_check_razorpay(update: Update, context: ContextTypes.DEFAULT_TY
             user_speed_controllers[user_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
         
-        status_msg = await message.reply_text(f" {clock_emoji} Checking...")
+        status_msg = await message.reply_text(build_single_check_checking("Razorpay", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -60359,16 +60335,15 @@ async def single_check_razorpay(update: Update, context: ContextTypes.DEFAULT_TY
         # Get BIN info
         bin_info = await get_bin_info(card)
         
-        try:
-            await status_msg.delete()
-        except:
-            pass
         
         # Format response - use the razorpay2 formatter since it works
         ui, status_category = format_razorpay2_response(result, card, bin_info)
         
         # Send result
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
         
         # Save hit if approved or charged
         if status_category in ["charged", "approved"]:
@@ -60396,10 +60371,9 @@ async def single_check_razorpay(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         print(f"❌ Razorpay error: {e}")
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         add_user_credits(user_id, 1)  # Refund credit on error
     finally:
         razorpay_active_tasks.pop(user_id, None)
@@ -61789,7 +61763,7 @@ async def single_check_princess(update: Update, context: ContextTypes.DEFAULT_TY
             user_speed_controllers[user_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
         
-        status_msg = await message.reply_text("🔄 Checking card with Princess PayPal Gateway...")
+        status_msg = await message.reply_text(build_single_check_checking("Princess PayPal", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -61812,10 +61786,6 @@ async def single_check_princess(update: Update, context: ContextTypes.DEFAULT_TY
         # Get BIN info
         bin_info = await get_bin_info(card)
         
-        try:
-            await status_msg.delete()
-        except:
-            pass
         
         # Format result
         status = result.get('status', 'unknown')
@@ -61852,20 +61822,19 @@ async def single_check_princess(update: Update, context: ContextTypes.DEFAULT_TY
         
         # Build output
         output = (
-            f"┏━━━━━━━⍟\n"
-            f"┃ {status_emoji} {status_display}\n"
-            f"┗━━━━━━━━━━━⊛\n\n"
-            f"<b>Card</b> ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv_display}</code>\n"
-            f"<b>Gateway</b> ↣ Princess PayPal\n"
-            f"<b>Amount</b> ↣ $2.00\n"
-            f"<b>Response</b> ↣ {message_text[:80]}\n"
-            f"<b>BIN</b> ↣ {bin_text}\n"
-            f"<b>Bank</b> ↣ {bank}\n"
-            f"<b>Country</b> ↣ {country}\n"
-            f"<b>Time</b> ↣ {result_time:.2f}s"
+            f"<b>Princess PayPal</b> {_UI_SPARKLE}\n\n"
+            f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv_display}</code>\n\n"
+            f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{message_text[:80]}</code>\n"
+            f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>$2.00</b>\n\n"
+            f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_text}</b>\n"
+            f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+            f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country}</b>"
         )
         
-        await message.reply_text(output, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(output, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(output, parse_mode=ParseMode.HTML)
         
         # Save hit if charged
         if final_status in ['charged', 'approved']:
@@ -61890,10 +61859,9 @@ async def single_check_princess(update: Update, context: ContextTypes.DEFAULT_TY
         
     except Exception as e:
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [Princess] Error: {traceback.format_exc()}")
         add_user_credits(user_id, 1)
     finally:
@@ -62184,17 +62152,13 @@ async def mass_check_princess_logic(update: Update, context: ContextTypes.DEFAUL
                         status_display = "CVV LIVE"
                     
                     output = (
-                        f"┏━━━━━━━⍟\n"
-                        f"┃ {status_emoji} {status_display}\n"
-                        f"┗━━━━━━━━━━━⊛\n\n"
-                        f"<b>Card</b> ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv_display}</code>\n"
-                        f"<b>Gateway</b> ↣ Princess PayPal\n"
-                        f"<b>Amount</b> ↣ $2.00\n"
-                        f"<b>Response</b> ↣ {message_text[:80]}\n"
-                        f"<b>BIN</b> ↣ {bin_text}\n"
-                        f"<b>Bank</b> ↣ {bank}\n"
-                        f"<b>Country</b> ↣ {country}\n"
-                        f"<b>Time</b> ↣ {elapsed:.2f}s"
+                        f"<b>Princess PayPal</b> {_UI_SPARKLE}\n\n"
+                        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv_display}</code>\n\n"
+                        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{message_text[:80]}</code>\n"
+                        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>$2.00</b>\n\n"
+                        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_text}</b>\n"
+                        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+                        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country}</b>"
                     )
                     
                     try:
@@ -62543,7 +62507,7 @@ async def refresh_stats_callback(update: Update, context: ContextTypes.DEFAULT_T
     
     keyboard = [
         [
-            InlineKeyboardButton("🔄 Refresh", callback_data='refresh_stats', style='primary')
+            InlineKeyboardButton("Refresh", callback_data='refresh_stats', style='primary', icon_custom_emoji_id="5206351870765300656")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -62996,7 +62960,7 @@ async def send_gift_notification(context: ContextTypes.DEFAULT_TYPE,
     # Add keyboard with BLADESARKS button
     keyboard = [
         [
-            InlineKeyboardButton(" BUY NOW ", url="https://t.me/BLADESARKS_V3bot", style='success'),
+            InlineKeyboardButton("BUY NOW", url="https://t.me/BLADESARKS_V3bot", style='success', icon_custom_emoji_id="5197434882321567830"),
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -63440,19 +63404,13 @@ def format_braintree_new_response(result: Dict, card: str, bin_info: tuple) -> T
     proxy_display = mask_proxy(proxy_used) if proxy_used and proxy_used != "None" else "None"
     
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_display}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ Braintree\n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price}\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {response_msg}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+        f"<b>Braintree</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+        f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{response_msg}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country}</b>"
     )
     return ui, status_category
 
@@ -63707,7 +63665,7 @@ async def single_check_braintree_advanced(update: Update, context: ContextTypes.
         await update.message.reply_text("❌ Invalid card format. Use: card|mm|yy|cvv")
         return
     
-    status_msg = await update.message.reply_text("🔄 Checking card with Braintree (optimized)...")
+    status_msg = await update.message.reply_text(build_single_check_checking("Braintree", card), parse_mode=ParseMode.HTML)
     
     try:
         # Get user tier for speed control
@@ -64227,17 +64185,13 @@ def format_dabbagh_response(result: Dict, card: str, bin_info: tuple) -> Tuple[s
     
     # Build output
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_emoji} {status_text}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway}\n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price}\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_message}\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+        f"<b>{gateway}</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
+        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_message}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
     
     return ui, status_category
@@ -64299,7 +64253,7 @@ async def single_check_dabbagh(update: Update, context: ContextTypes.DEFAULT_TYP
             user_speed_controllers[user_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
         
-        status_msg = await message.reply_text("🔄 Checking card with Stripe ($1.00)...")
+        status_msg = await message.reply_text(build_single_check_checking("Stripe $1.00", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -64320,13 +64274,12 @@ async def single_check_dabbagh(update: Update, context: ContextTypes.DEFAULT_TYP
         
         bin_info = await get_bin_info(card)
         
-        try:
-            await status_msg.delete()
-        except:
-            pass
         
         ui, status_category = format_dabbagh_response(result, card, bin_info)
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
         
         if status_category in ["charged", "approved"]:
             await save_hit_to_file(
@@ -64352,10 +64305,9 @@ async def single_check_dabbagh(update: Update, context: ContextTypes.DEFAULT_TYP
         
     except Exception as e:
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         add_user_credits(user_id, 1)
     finally:
         dabbagh_active_tasks.pop(user_id, None)
@@ -65159,17 +65111,13 @@ def format_united_way_response(result: Dict, card: str, bin_info: tuple) -> Tupl
     
     # Build output
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_emoji} {status_text}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway}\n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price}\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_message}\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+        f"<b>{gateway}</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
+        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_message}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
     
     return ui, status_category
@@ -65231,7 +65179,7 @@ async def single_check_united_way(update: Update, context: ContextTypes.DEFAULT_
             user_speed_controllers[user_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
         
-        status_msg = await message.reply_text("🔄 Checking card with United Way Stripe...")
+        status_msg = await message.reply_text(build_single_check_checking("United Way Stripe", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -65252,13 +65200,12 @@ async def single_check_united_way(update: Update, context: ContextTypes.DEFAULT_
         
         bin_info = await get_bin_info(card)
         
-        try:
-            await status_msg.delete()
-        except:
-            pass
         
         ui, status_category = format_united_way_response(result, card, bin_info)
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
         
         if status_category in ["charged", "approved"]:
             await save_hit_to_file(
@@ -65284,10 +65231,9 @@ async def single_check_united_way(update: Update, context: ContextTypes.DEFAULT_
         
     except Exception as e:
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         add_user_credits(user_id, 1)
     finally:
         united_way_active_tasks.pop(user_id, None)
@@ -66283,22 +66229,18 @@ def format_b3charged_response(result: Dict, card: str, bin_info: tuple) -> Tuple
         bin_display = bin_info_text
     
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_display}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ B3Charged\n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price}\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {message}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_display}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country}\n"
+        f"<b>B3Charged</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+        f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{message}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_display}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country}</b>"
     )
     
     # Add last4 if available
     if last4 != "N/A":
-        ui += f"\n[⌬] 𝐋𝐚𝐬𝐭𝟒 ↣ {last4}"
+        ui += f"\n{_UI_STAR} 𝐋𝐚𝐬𝐭𝟒 ↣ <b>{last4}</b>"
     
     return ui, status_category
 
@@ -66326,7 +66268,7 @@ async def b3charged_single_check_logic(update: Update, context: ContextTypes.DEF
             user_speed_controllers[u_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[u_id]
         
-        status_msg = await message.reply_text("🔄 Checking card with B3Charged ($3 Braintree)...")
+        status_msg = await message.reply_text(build_single_check_checking("B3Charged", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -66732,8 +66674,8 @@ async def rtrash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Ask for confirmation
     confirm_keyboard = [
         [
-            InlineKeyboardButton("🗑️ YES, REMOVE TRASH SITES", callback_data='confirm_rtrash', style='danger'),
-            InlineKeyboardButton("❌ CANCEL", callback_data='cancel_rtrash', style='primary')
+            InlineKeyboardButton("YES, REMOVE TRASH SITES", callback_data='confirm_rtrash', style='danger', icon_custom_emoji_id="5904542823167824187"),
+            InlineKeyboardButton("CANCEL", callback_data='cancel_rtrash', style='primary', icon_custom_emoji_id="5206121558164573238")
         ]
     ]
     confirm_markup = InlineKeyboardMarkup(confirm_keyboard)
@@ -67482,7 +67424,7 @@ async def autosopi_single_check_logic(update: Update, context: ContextTypes.DEFA
             await message.reply_text(error_msg, parse_mode=ParseMode.HTML)
             return
         
-        status_msg = await message.reply_text("🔄 Checking card with Autosopi...")
+        status_msg = await message.reply_text(build_single_check_checking("Autosopi", card), parse_mode=ParseMode.HTML)
         
         # Site rotation with retry
         max_site_retries = 1
@@ -67579,18 +67521,13 @@ async def autosopi_single_check_logic(update: Update, context: ContextTypes.DEFA
         bin_text, bank, country, _, _ = bin_info
         
         output = (
-            f"┏━━━━━━━⍟\n"
-            f"┃ {status_display}\n"
-            f"┗━━━━━━━━━━━⊛\n\n"
-            f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card}</code>\n"
-            f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ Autosopi\n"
-            f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {response_text}\n"
-            f"[⌬] 𝐏𝐫𝐢𝐜𝐞 ↣ {price_str}\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"[⌬] 𝐁𝐈𝐍 ↣ {bin_text}\n"
-            f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank}\n"
-            f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country}\n"
-            f"━━━━━━━━━━━━━━━━━━━"
+            f"<b>Autosopi</b> {_UI_SPARKLE}\n\n"
+            f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+            f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{response_text}</code>\n"
+            f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price_str}</b>\n\n"
+            f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_text}</b>\n"
+            f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+            f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country}</b>"
         )
         
         await status_msg.edit_text(output, parse_mode=ParseMode.HTML)
@@ -68858,8 +68795,8 @@ async def remove_normal_sites_command(update: Update, context: ContextTypes.DEFA
     # Send confirmation message
     confirm_keyboard = [
         [
-            InlineKeyboardButton("✅ YES, REMOVE NORMAL SITES", callback_data='confirm_remove_normal', style='danger'),
-            InlineKeyboardButton("❌ CANCEL", callback_data='cancel_remove_normal', style='primary')
+            InlineKeyboardButton("YES, REMOVE NORMAL SITES", callback_data='confirm_remove_normal', style='danger', icon_custom_emoji_id="5902002809573740949"),
+            InlineKeyboardButton("CANCEL", callback_data='cancel_remove_normal', style='primary', icon_custom_emoji_id="5206121558164573238")
         ]
     ]
     confirm_markup = InlineKeyboardMarkup(confirm_keyboard)
@@ -69272,8 +69209,8 @@ async def stopall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Confirm with user
     keyboard = [
         [
-            InlineKeyboardButton("✅ YES, STOP ALL", callback_data=f'stopall_confirm_{u_id}', style='danger'),
-            InlineKeyboardButton("❌ CANCEL", callback_data='stopall_cancel', style='primary')
+            InlineKeyboardButton("YES, STOP ALL", callback_data=f'stopall_confirm_{u_id}', style='danger', icon_custom_emoji_id="5902002809573740949"),
+            InlineKeyboardButton("CANCEL", callback_data='stopall_cancel', style='primary', icon_custom_emoji_id="5206121558164573238")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -69807,8 +69744,8 @@ async def stopchk_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Ask for confirmation first
     keyboard = [
         [
-            InlineKeyboardButton("✅ YES, STOP ALL", callback_data='confirm_stop_all', style='danger'),
-            InlineKeyboardButton("❌ CANCEL", callback_data='cancel_stop_all', style='primary')
+            InlineKeyboardButton("YES, STOP ALL", callback_data='confirm_stop_all', style='danger', icon_custom_emoji_id="5902002809573740949"),
+            InlineKeyboardButton("CANCEL", callback_data='cancel_stop_all', style='primary', icon_custom_emoji_id="5206121558164573238")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -70630,16 +70567,13 @@ def format_stripe_charge_v2_response(result: Dict, card: str, bin_info: tuple) -
             break
     
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_display}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"⌬ 𝐂𝐚𝐫𝐝 ↣ <code>{card_num}|{exp_month}|{exp_year}|{cvv}</code>\n"
-        f"⌬ 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway}\n"
-        f"⌬ 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price}\n"
-        f"⌬ 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_response[:100]}\n"
-        f"⌬ 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"⌬ 𝐁𝐚𝐧𝐤 ↣ {bank}\n"
-        f"⌬ 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
+        f"<b>{gateway}</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year}|{cvv}</code>\n\n"
+        f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_response[:100]}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
     
     return ui, status_category
@@ -75000,8 +74934,7 @@ async def send_whop_hit_notification(
             f'{pe("id")} <b>User</b> ➛ {user_display}\n'
         )
 
-    keyboard = [[InlineKeyboardButton("💎 BLADESARKS",
-                                      url="https://t.me/BLADESARKS_V3bot", style='primary')]]
+    keyboard = [[InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_V3bot", style='primary', icon_custom_emoji_id="5427168083074628963")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     try:
@@ -75866,17 +75799,13 @@ async def sc_single_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Build output
         output = (
-            f"┏━━━━━━━⍟\n"
-            f"┃ {status_emoji} {status_display_clean}\n"
-            f"┗━━━━━━━━━━━⊛\n\n"
-            f"⌬ 𝐂𝐚𝐫𝐝 ↣ <code>{card_num}|{exp_month}|{exp_year}|{cvv}</code>\n"
-            f"⌬ 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway_name}\n"
-            f"⌬ 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price_str}\n"
-            f"⌬ 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {response_msg[:100]}\n"
-            f"⌬ 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-            f"⌬ 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-            f"⌬ 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
-            f"⌬ 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+            f"<b>{gateway_name}</b> {_UI_SPARKLE}\n\n"
+            f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year}|{cvv}</code>\n\n"
+            f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{response_msg[:100]}</code>\n"
+            f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price_str}</b>\n\n"
+            f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+            f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+            f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
         )
         
         # Delete checking message and send result
@@ -76999,18 +76928,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ============ KEYBOARD ============
     keyboard = [
         [
-            InlineKeyboardButton("⚡ Checker", callback_data='show_checker', style='primary'),
-            InlineKeyboardButton("💀 Hitter",  callback_data='show_hitter',  style='danger'),
+            InlineKeyboardButton("Checker", callback_data='show_checker', style='primary', icon_custom_emoji_id="5397857289216484878"),
+            InlineKeyboardButton("Hitter", callback_data='show_hitter', style='danger', icon_custom_emoji_id="5042167377869932162"),
         ],
         [
-            InlineKeyboardButton("💰 Buy Now",  callback_data='show_plans',   style='success'),
-            InlineKeyboardButton("🔮 Contact",  callback_data='show_contact', style='primary'),
+            InlineKeyboardButton("Buy Now", callback_data='show_plans', style='success', icon_custom_emoji_id="5197434882321567830"),
+            InlineKeyboardButton("Contact", callback_data='show_contact', style='primary', icon_custom_emoji_id="5380498417228977451"),
         ],
         [
-            InlineKeyboardButton("🎁 Refer & Earn", callback_data='show_refer', style='success'),
+            InlineKeyboardButton("Refer & Earn", callback_data='show_refer', style='success', icon_custom_emoji_id="6269135402855044481"),
         ],
         [
-            InlineKeyboardButton("⚙️ Settings", callback_data='settings_menu', style='primary'),
+            InlineKeyboardButton("Settings", callback_data='settings_menu', style='primary', icon_custom_emoji_id="5042306247047513767"),
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -77228,7 +77157,7 @@ async def reftop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "reftop":
         text = build_leaderboard_text(highlight_uid=user.id)
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="refback", style='danger')]]
+        keyboard = [[InlineKeyboardButton("Back", callback_data="refback", style='danger', icon_custom_emoji_id="5255703720078879038")]]
         await query.edit_message_text(
             text, parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -77237,8 +77166,8 @@ async def reftop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_username = context.bot.username or "BLADESARKS_V3bot"
         text = build_referral_text(user.id, bot_username)
         keyboard = [
-            [InlineKeyboardButton("🏆 Leaderboard", callback_data="reftop", style='primary')],
-            [InlineKeyboardButton("🔙 Back", callback_data="back_main", style='danger')],
+            [InlineKeyboardButton("Leaderboard", callback_data="reftop", style='primary', icon_custom_emoji_id="5188344996356448758")],
+            [InlineKeyboardButton("Back", callback_data="back_main", style='danger', icon_custom_emoji_id="5255703720078879038")],
         ]
         await query.edit_message_text(
             text, parse_mode=ParseMode.HTML,
@@ -77265,10 +77194,10 @@ def build_settings_view(user_id: int):
     )
     keyboard = [
         [
-            InlineKeyboardButton("🙈 Hide", callback_data='settings_hide', style='danger'),
-            InlineKeyboardButton("👁️ Unhide", callback_data='settings_unhide', style='success'),
+            InlineKeyboardButton("Hide", callback_data='settings_hide', style='danger', icon_custom_emoji_id="5043954131415133302"),
+            InlineKeyboardButton("Unhide", callback_data='settings_unhide', style='success', icon_custom_emoji_id="5377336227533969892"),
         ],
-        [InlineKeyboardButton("🔙 Back", callback_data='back_main', style='danger')],
+        [InlineKeyboardButton("Back", callback_data='back_main', style='danger', icon_custom_emoji_id="5255703720078879038")],
     ]
     return text, InlineKeyboardMarkup(keyboard)
 
@@ -77319,8 +77248,8 @@ async def refer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = build_referral_text(user.id, bot_username)
 
     keyboard = [
-        [InlineKeyboardButton("🏆 Leaderboard", callback_data='reftop', style='primary')],
-        [InlineKeyboardButton("🔙 Back", callback_data='back_main', style='danger')],
+        [InlineKeyboardButton("Leaderboard", callback_data='reftop', style='primary', icon_custom_emoji_id="5188344996356448758")],
+        [InlineKeyboardButton("Back", callback_data='back_main', style='danger', icon_custom_emoji_id="5255703720078879038")],
     ]
     await update.message.reply_text(
         text,
@@ -77387,7 +77316,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<code>━━━━━━━━━━━━━━━━━━━━━</code>"
         )
         keyboard = [
-            [InlineKeyboardButton("🔙 Back", callback_data='back_main', style='danger')]
+            [InlineKeyboardButton("Back", callback_data='back_main', style='danger', icon_custom_emoji_id="5255703720078879038")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
@@ -77406,7 +77335,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<code>━━━━━━━━━━━━━━━━━━━━━</code>"
         )
         keyboard = [
-            [InlineKeyboardButton("🔙 Back", callback_data='back_main', style='danger')]
+            [InlineKeyboardButton("Back", callback_data='back_main', style='danger', icon_custom_emoji_id="5255703720078879038")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
@@ -77427,8 +77356,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Use <code>/buy</code> to purchase a plan"
         )
         keyboard = [
-            [InlineKeyboardButton("🛒 Open /buy", callback_data='goto_buy', style='success')],
-            [InlineKeyboardButton("🔙 Back", callback_data='back_main', style='danger')],
+            [InlineKeyboardButton("Open /buy", callback_data='goto_buy', style='success', icon_custom_emoji_id="5197434882321567830")],
+            [InlineKeyboardButton("Back", callback_data='back_main', style='danger', icon_custom_emoji_id="5255703720078879038")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
@@ -77456,7 +77385,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         keyboard = [
-            [InlineKeyboardButton("🔙 Back", callback_data='back_main', style='danger')]
+            [InlineKeyboardButton("Back", callback_data='back_main', style='danger', icon_custom_emoji_id="5255703720078879038")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
@@ -77485,7 +77414,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<code>  /addmyproxy  /pt</code>"
         )
         keyboard = [
-            [InlineKeyboardButton("🔙 Back", callback_data='back_main', style='danger')]
+            [InlineKeyboardButton("Back", callback_data='back_main', style='danger', icon_custom_emoji_id="5255703720078879038")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
@@ -77508,10 +77437,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         keyboard = [
             [
-                InlineKeyboardButton("💬 DM Dev", url="https://t.me/lencax", style='primary'),
-                InlineKeyboardButton("📢 Join Group", url="https://t.me/+a-_7PTkBTe81MGY1", style='success'),
+                InlineKeyboardButton("DM Dev", url="https://t.me/lencax", style='primary', icon_custom_emoji_id="5380498417228977451"),
+                InlineKeyboardButton("Join Group", url="https://t.me/+a-_7PTkBTe81MGY1", style='success', icon_custom_emoji_id="5784914081165087232"),
             ],
-            [InlineKeyboardButton("🔙 Back", callback_data='back_main', style='danger')],
+            [InlineKeyboardButton("Back", callback_data='back_main', style='danger', icon_custom_emoji_id="5255703720078879038")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
@@ -77521,8 +77450,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_username = context.bot.username or "BLADESARKS_V3bot"
         text = build_referral_text(user.id, bot_username)
         keyboard = [
-            [InlineKeyboardButton("🏆 Leaderboard", callback_data='reftop', style='primary')],
-            [InlineKeyboardButton("🔙 Back", callback_data='back_main', style='danger')],
+            [InlineKeyboardButton("Leaderboard", callback_data='reftop', style='primary', icon_custom_emoji_id="5188344996356448758")],
+            [InlineKeyboardButton("Back", callback_data='back_main', style='danger', icon_custom_emoji_id="5255703720078879038")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
@@ -77576,18 +77505,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         keyboard = [
             [
-                InlineKeyboardButton("⚡ Checker", callback_data='show_checker', style='primary'),
-                InlineKeyboardButton("💀 Hitter",  callback_data='show_hitter',  style='danger'),
+                InlineKeyboardButton("Checker", callback_data='show_checker', style='primary', icon_custom_emoji_id="5397857289216484878"),
+                InlineKeyboardButton("Hitter", callback_data='show_hitter', style='danger', icon_custom_emoji_id="5042167377869932162"),
             ],
             [
-                InlineKeyboardButton("💰 Buy Now",  callback_data='show_plans',   style='success'),
-                InlineKeyboardButton("🔮 Contact",  callback_data='show_contact', style='primary'),
+                InlineKeyboardButton("Buy Now", callback_data='show_plans', style='success', icon_custom_emoji_id="5197434882321567830"),
+                InlineKeyboardButton("Contact", callback_data='show_contact', style='primary', icon_custom_emoji_id="5380498417228977451"),
             ],
             [
-                InlineKeyboardButton("🎁 Refer & Earn", callback_data='show_refer', style='success'),
+                InlineKeyboardButton("Refer & Earn", callback_data='show_refer', style='success', icon_custom_emoji_id="6269135402855044481"),
             ],
             [
-                InlineKeyboardButton("⚙️ Settings", callback_data='settings_menu', style='primary'),
+                InlineKeyboardButton("Settings", callback_data='settings_menu', style='primary', icon_custom_emoji_id="5042306247047513767"),
             ],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -77760,7 +77689,7 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def back_menu():
     """Back button menu"""
     keyboard = [
-        [InlineKeyboardButton("🔙 Back", callback_data='back_main', style='danger')]
+        [InlineKeyboardButton("Back", callback_data='back_main', style='danger', icon_custom_emoji_id="5255703720078879038")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -79268,7 +79197,7 @@ async def me_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [
-            InlineKeyboardButton(" Buy ", callback_data='buy_premium', style='success'),
+            InlineKeyboardButton("Buy", callback_data='buy_premium', style='success', icon_custom_emoji_id="5197434882321567830"),
            
         ]
     ]
@@ -79555,7 +79484,7 @@ async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Create keyboard with refresh button
     keyboard = [
         [
-            InlineKeyboardButton("Buy", callback_data='refresh_top', style='primary')
+            InlineKeyboardButton("Buy", callback_data='refresh_top', style='primary', icon_custom_emoji_id="5197434882321567830")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -79618,8 +79547,8 @@ async def refresh_top_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     
     keyboard = [
         [
-            InlineKeyboardButton("🔄 Refresh", callback_data='refresh_top', style='primary'),
-            InlineKeyboardButton("🔙 Back", callback_data='back_main', style='danger')
+            InlineKeyboardButton("Refresh", callback_data='refresh_top', style='primary', icon_custom_emoji_id="5206351870765300656"),
+            InlineKeyboardButton("Back", callback_data='back_main', style='danger', icon_custom_emoji_id="5255703720078879038")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -79658,7 +79587,7 @@ async def single_check_paypal_with_pool(update: Update, context: ContextTypes.DE
         
         amount = context.user_data.get('payment_amount', DEFAULT_AMOUNT)
         
-        status_msg = await message.reply_text("🔄 Checking ...")
+        status_msg = await message.reply_text(build_single_check_checking("PayPal", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -79679,15 +79608,14 @@ async def single_check_paypal_with_pool(update: Update, context: ContextTypes.DE
         
         bin_info = await get_bin_info(card)
         
-        try:
-            await status_msg.delete()
-        except:
-            pass
         
         # Format result
         ui, status_category = format_paypal_response_stylish(result, card, bin_info, amount)
         
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
         
         # Save hit if charged
         if status_category == "charged":
@@ -79713,10 +79641,9 @@ async def single_check_paypal_with_pool(update: Update, context: ContextTypes.DE
         
     except Exception as e:
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ Error: {traceback.format_exc()}")
         add_user_credits(u_id, 1)
 
@@ -79752,7 +79679,7 @@ async def single_check_paypal_with_gif(update: Update, context: ContextTypes.DEF
         
         amount = context.user_data.get('payment_amount', DEFAULT_AMOUNT)
         
-        status_msg = await message.reply_text("🔄 Checking card with PayPal...")
+        status_msg = await message.reply_text(build_single_check_checking("PayPal", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -79765,10 +79692,6 @@ async def single_check_paypal_with_gif(update: Update, context: ContextTypes.DEF
         
         bin_info = await get_bin_info(card)
         
-        try:
-            await status_msg.delete()
-        except:
-            pass
         
         # Determine status
         status_category = result.get("status_category", "unknown")
@@ -79832,20 +79755,19 @@ async def single_check_paypal_with_gif(update: Update, context: ContextTypes.DEF
         
         # Build the output
         output = (
-            f"┏━━━━━━━⍟\n"
-            f"┃ {status_display}\n"
-            f"┗━━━━━━━━━━━⊛\n\n"
-            f"[⌬] 𝐂𝐚𝐫𝐝 ↣ {card_num} | {exp_month} | {exp_year} | {cvv}\n"
-            f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ PayPal\n"
-            f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ ${amount}\n"
-            f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_response}\n"
-            f"[⌬] 𝐁𝐈𝐍 ↣ {bin_text}\n"
-            f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-            f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
-            f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+            f"<b>PayPal</b> {_UI_SPARKLE}\n\n"
+            f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num} | {exp_month} | {exp_year} | {cvv}</code>\n\n"
+            f"{_ui_lead_icon(status_display)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_response}</code>\n"
+            f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>${amount}</b>\n\n"
+            f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_text}</b>\n"
+            f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+            f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
         )
         
-        await message.reply_text(output, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(output, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(output, parse_mode=ParseMode.HTML)
         
         # Only save as hit if ACTUALLY CHARGED
         if final_category == "charged":
@@ -79883,10 +79805,9 @@ async def single_check_paypal_with_gif(update: Update, context: ContextTypes.DEF
         
     except Exception as e:
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ Error: {traceback.format_exc()}")
         # Refund credits on error
         add_user_credits(u_id, 1)
@@ -80168,17 +80089,13 @@ async def paypal_mass_check_with_pool(update: Update, context: ContextTypes.DEFA
                     
                     # Build output with Premium Emojis
                     output = (
-                        f"┏━━━━━━━⍟\n"
-                        f"┃ {status_emoji} {status_display}\n"
-                        f"┗━━━━━━━━━━━⊛\n\n"
-                        f"<b>Card</b> ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv_display}</code>\n"
-                        f"<b>Gateway</b> ↣ {gateway_display}\n"
-                        f"<b>Amount</b> ↣ ${amount}\n"
-                        f"<b>Response</b> ↣ {clean_response}\n"
-                        f"<b>BIN</b> ↣ {bin_text}\n"
-                        f"<b>Bank</b> ↣ {bank_display}\n"
-                        f"<b>Country</b> ↣ {country_name}\n"
-                        f"<b>Time</b> ↣ {elapsed:.2f}s"
+                        f"<b>{gateway_display}</b> {_UI_SPARKLE}\n\n"
+                        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv_display}</code>\n\n"
+                        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_response}</code>\n"
+                        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>${amount}</b>\n\n"
+                        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_text}</b>\n"
+                        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+                        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
                     )
                     
                     try:
@@ -81464,17 +81381,13 @@ def format_stripe_auth0_response(result: Dict, card: str, bin_info: tuple) -> Tu
     
     # Build output
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_emoji} {status_text}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ {gateway}\n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ {price}\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_message}\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+        f"<b>{gateway}</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
+        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_message}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
     
     return ui, status_category
@@ -81538,7 +81451,7 @@ async def single_check_stripe_auth0(update: Update, context: ContextTypes.DEFAUL
             user_speed_controllers[user_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
         
-        status_msg = await message.reply_text("🔄 Checking card with Stripe Auth 0$...")
+        status_msg = await message.reply_text(build_single_check_checking("Stripe Auth 0$", card), parse_mode=ParseMode.HTML)
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -81560,13 +81473,12 @@ async def single_check_stripe_auth0(update: Update, context: ContextTypes.DEFAUL
         
         bin_info = await get_bin_info(card)
         
-        try:
-            await status_msg.delete()
-        except:
-            pass
         
         ui, status_category = format_stripe_auth0_response(result, card, bin_info)
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
         
         if status_category in ["charged", "approved"]:
             await save_hit_to_file(
@@ -81592,10 +81504,9 @@ async def single_check_stripe_auth0(update: Update, context: ContextTypes.DEFAUL
         
     except Exception as e:
         try:
-            await status_msg.delete()
-        except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [Stripe Auth 0$] Error: {traceback.format_exc()}")
         add_user_credits(user_id, 1)
     finally:
@@ -82292,8 +82203,8 @@ async def credits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Add keyboard with useful buttons
     keyboard = [
         [
-            InlineKeyboardButton("💎 Redeem Credits", callback_data='redeem_credits_help', style='primary'),
-            InlineKeyboardButton("💰 Upgrade", callback_data='buy_premium', style='success')
+            InlineKeyboardButton("Redeem Credits", callback_data='redeem_credits_help', style='primary', icon_custom_emoji_id="5427168083074628963"),
+            InlineKeyboardButton("Upgrade", callback_data='buy_premium', style='success', icon_custom_emoji_id="5197434882321567830")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -84500,17 +84411,13 @@ def format_stripe_1usd_response(result: Dict, card: str, bin_info: tuple) -> Tup
         status_text = "DECLINED"
     
     ui = (
-        f"┏━━━━━━━⍟\n"
-        f"┃ {status_emoji} {status_text}\n"
-        f"┗━━━━━━━━━━━⊛\n\n"
-        f"[⌬] 𝐂𝐚𝐫𝐝 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n"
-        f"[⌬] 𝐆𝐚𝐭𝐞𝐰𝐚𝐲 ↣ Strip Charged \n"
-        f"[⌬] 𝐀𝐦𝐨𝐮𝐧𝐭 ↣ 1$\n"
-        f"[⌬] 𝐑𝐞𝐬𝐩𝐨𝐧𝐬𝐞 ↣ {clean_message}\n"
-        f"[⌬] 𝐁𝐈𝐍 ↣ {bin_info_text}\n"
-        f"[⌬] 𝐁𝐚𝐧𝐤 ↣ {bank_display}\n"
-        f"[⌬] 𝐂𝐨𝐮𝐧𝐭𝐫𝐲 ↣ {country_name}\n"
-        f"[⌬] 𝐓𝐢𝐦𝐞 ↣ {elapsed:.2f}s"
+        f"<b>Strip Charged</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_num}|{exp_month}|{exp_year_short}|{cvv}</code>\n\n"
+        f"{_ui_lead_icon(status_emoji)} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_message}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>1$</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
     )
     
     return ui, status_category
@@ -85734,7 +85641,7 @@ async def single_check_st1_charge_logic(update: Update, context: ContextTypes.DE
 
     tier = user_manager.get_tier(user_id)
     st1_charge_active_tasks[user_id] = True
-    status_msg = await message.reply_text("🔄 Checking card with ST1 $1...")
+    status_msg = await message.reply_text(build_single_check_checking("ST1 $1", card), parse_mode=ParseMode.HTML)
 
     try:
         proxy_str = None
@@ -85748,10 +85655,9 @@ async def single_check_st1_charge_logic(update: Update, context: ContextTypes.DE
         ui, status_category = format_st1_charge_response(result, card, bin_info)
 
         try:
-            await status_msg.delete()
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
         except Exception:
-            pass
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
 
         if status_category in ("charged", "approved"):
             await save_hit_to_file(
@@ -85773,10 +85679,9 @@ async def single_check_st1_charge_logic(update: Update, context: ContextTypes.DE
 
     except Exception as e:
         try:
-            await status_msg.delete()
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
         except Exception:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [ST1 $1] Error: {traceback.format_exc()}")
         add_user_credits(user_id, 1)
     finally:
