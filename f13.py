@@ -396,12 +396,12 @@ def build_single_check_checking(gateway_name: str, card: str, price: str = "0$")
 
     return (
         f"<b>{gateway_name}</b> {_UI_SPARKLE}\n\n"
-        f"{_UI_STAR} 𝗖𝗔𝗡𝗗 ↣ <code>{card_display}</code>\n\n"
-        f"{_UI_CLOCK} 𝗥𝗲𝘀𝗱𝗼𝗻𝘀𝗲 ↣   Checking ..... \n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card_display}</code>\n\n"
+        f"{_UI_CLOCK} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣   Checking ..... \n"
         f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price}</b>\n\n"
         f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
         f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
-        f"{_UI_BIN} 𝗖𝗼𝗾𝗻𝘁𝗿𝘂 ↣ <b>{country_display}</b>"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_display}</b>"
     )
 
 
@@ -11699,7 +11699,7 @@ async def stripe_auth_single_check_logic(update: Update, context: ContextTypes.D
         await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [Stripe Auth Single] Error: {traceback.format_exc()}")
 
-# --- CONFIG 
+# --- CONFIG ---
 BOT_TOKEN = "8240924682:AAEq3wiuVUrvEJO6ZuT6LEdq8X8UYIGrHSY"
 OWNER_ID = 6299808404
 PAYPAL_API_BASE = "https://web-production-9c43d.up.railway.app"
@@ -16299,9 +16299,7 @@ async def single_check_payglocal_lite(update: Update, context: ContextTypes.DEFA
         tier = user_manager.get_tier(user_id)
         
         status_msg = await message.reply_text(
-            f"🔄 <b>Checking via PayGlocal...</b>\n\n"
-            f"📱 Using Jio backend with amount ₹{test_amount}\n"
-            f"💳 Card: <code>{cc[:4]}****{cc[-4:]}</code>",
+            build_single_check_checking("PayGlocal", card),
             parse_mode=ParseMode.HTML
         )
         
@@ -16329,18 +16327,13 @@ async def single_check_payglocal_lite(update: Update, context: ContextTypes.DEFA
         bin_info = await get_bin_info(card)
         
         # Format response
-        try:
-            await status_msg.delete()
-        except:
-            pass
-        
         ui, status_category = format_jio_response(result, card)
         
         # Rename gateway in the output
         ui = ui.replace("Site - Jio", "Site - PayGlocal")
         ui = ui.replace("Jio Recharge Result", "PayGlocal Result")
         
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
         
         # Save hit
         if status_category in ["charged", "approved"]:
@@ -16368,10 +16361,9 @@ async def single_check_payglocal_lite(update: Update, context: ContextTypes.DEFA
         print(f"❌ PayGlocal error: {e}")
         traceback.print_exc()
         try:
-            await status_msg.delete()
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
         except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         add_user_credits(user_id, 1)
     finally:
         payglocal_active_tasks.pop(user_id, None)
@@ -22637,7 +22629,7 @@ async def single_check_stripe_auth_v2(update: Update, context: ContextTypes.DEFA
         return
     
     checking_msg = await message.reply_text(
-        f"{premium_emoji(PREMIUM_EMOJI_IDS['time'], '🔄')} Checking...",
+        build_single_check_checking("Stripe Auth", card),
         parse_mode=ParseMode.HTML
     )
     
@@ -22659,14 +22651,8 @@ async def single_check_stripe_auth_v2(update: Update, context: ContextTypes.DEFA
         # Format response
         ui, status_category = format_stripe_auth_v2_response(result, card, bin_info)
         
-        # Delete checking message
-        try:
-            await checking_msg.delete()
-        except:
-            pass
-        
-        # Send result
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        # Edit the checking card in place with the result
+        await checking_msg.edit_text(ui, parse_mode=ParseMode.HTML)
         
         # Save hit if approved
         if status_category == "approved":
@@ -22700,10 +22686,9 @@ async def single_check_stripe_auth_v2(update: Update, context: ContextTypes.DEFA
         
     except Exception as e:
         try:
-            await checking_msg.delete()
+            await checking_msg.edit_text(f"❌ Error: {str(e)[:100]}")
         except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [Stripe Auth V2] Error: {traceback.format_exc()}")
         add_user_credits(user_id, 1)  # Refund credit on error
 
@@ -24850,6 +24835,12 @@ async def auto_detect_reply_with_command(update: Update, context: ContextTypes.D
     # which uses the dedicated Shopify progress-card UI for both single and
     # multi-card replies. Bail here so it isn't ALSO single-checked old-style.
     if command == '/sh':
+        return
+
+    # /pp and /mpp are handled exclusively by handle_reply_with_command
+    # (group 1), which deducts credits and runs the PayPal-key check. Bail
+    # here so a replied /pp is not ALSO single-checked by single_check_paypal_with_gif.
+    if command.split('@')[0] in ('/pp', '/mpp'):
         return
 
     # /addapi & /bulkaddapi manage the API pool and are routed through
@@ -39119,39 +39110,14 @@ def format_paypal_key_response(result: Dict, card: str, bin_info: tuple,
 # ═══════════════════════════════════════════════════════════════════════════
 #  /pp — SINGLE
 # ═══════════════════════════════════════════════════════════════════════════
-@check_gateway("paypal")
-async def paypal_key_single_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await verify_group_access(update, context):
-        return
+async def _paypal_key_do_single(update: Update, context: ContextTypes.DEFAULT_TYPE, card: str):
+    """Core single-card PayPal-key check.
 
-    if not context.args:
-        await update.message.reply_text(
-            "💳 <b>PayPal — Single Check</b>\n\n"
-            "Usage: <code>/pp &lt;card&gt;</code>\n"
-            "Example: <code>/pp 4111111111111111|12|2028|123</code>\n\n"
-            f"💰 Amount: ${PAYPAL_KEY_AMOUNT}",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
+    Assumes the gateway-access check and credit deduction have already been
+    performed by the caller (the /pp command or the reply handler).
+    """
     user_id = update.effective_user.id
     message = update.effective_message
-    card_text = " ".join(context.args).strip()
-
-    card = card_formatter.extract_single_card_from_text(card_text)
-    if not card:
-        await message.reply_text("❌ Invalid card format. Use: NUMBER|MM|YYYY|CVV")
-        return
-
-    if not await require_gateway_access(user_id, "paypal", message):
-        return
-
-    can_proceed, error_msg = await check_and_deduct_credits(
-        user_id, update, context, is_mass_check=False, card_count=1
-    )
-    if not can_proceed:
-        await message.reply_text(error_msg, parse_mode=ParseMode.HTML)
-        return
 
     paypal_key_active_tasks[user_id] = True
     status_msg = None
@@ -39203,6 +39169,49 @@ async def paypal_key_single_command(update: Update, context: ContextTypes.DEFAUL
         add_user_credits(user_id, 1)
     finally:
         paypal_key_active_tasks.pop(user_id, None)
+
+
+@check_gateway("paypal")
+async def paypal_key_single_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # If this /pp is a reply, handle_reply_with_command (group 1) owns it —
+    # bail here so the card isn't checked twice (once by this command, once
+    # by the reply handler).
+    if update.message and update.message.reply_to_message:
+        return
+
+    if not await verify_group_access(update, context):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "💳 <b>PayPal — Single Check</b>\n\n"
+            "Usage: <code>/pp &lt;card&gt;</code>\n"
+            "Example: <code>/pp 4111111111111111|12|2028|123</code>\n\n"
+            f"💰 Amount: ${PAYPAL_KEY_AMOUNT}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    user_id = update.effective_user.id
+    message = update.effective_message
+    card_text = " ".join(context.args).strip()
+
+    card = card_formatter.extract_single_card_from_text(card_text)
+    if not card:
+        await message.reply_text("❌ Invalid card format. Use: NUMBER|MM|YYYY|CVV")
+        return
+
+    if not await require_gateway_access(user_id, "paypal", message):
+        return
+
+    can_proceed, error_msg = await check_and_deduct_credits(
+        user_id, update, context, is_mass_check=False, card_count=1
+    )
+    if not can_proceed:
+        await message.reply_text(error_msg, parse_mode=ParseMode.HTML)
+        return
+
+    await _paypal_key_do_single(update, context, card)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -47855,7 +47864,7 @@ async def single_check_stripe_sk(update: Update, context: ContextTypes.DEFAULT_T
 
     try:
         status_msg = await message.reply_text(
-            f"{premium_emoji(PREMIUM_EMOJI_IDS['time'], '🔄')} Checking card with Stripe SK...",
+            build_single_check_checking("Stripe SK", card),
             parse_mode=ParseMode.HTML,
         )
 
@@ -47875,12 +47884,7 @@ async def single_check_stripe_sk(update: Update, context: ContextTypes.DEFAULT_T
         bin_info = await get_bin_info(card)
         ui, category = _sk_format_result(parsed, card, bin_info)
 
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
-
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
 
         if category in ("charged", "approved"):
             await save_hit_to_file(
@@ -47915,10 +47919,9 @@ async def single_check_stripe_sk(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         print(f"❌ [Stripe SK single] {traceback.format_exc()}")
         try:
-            await status_msg.delete()
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
         except Exception:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         add_user_credits(user_id, 1)
     finally:
         stripe_sk_active_tasks.pop(user_id, None)
@@ -48506,8 +48509,11 @@ async def single_check_stc1(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text("❌ Your tier doesn't have access to Stripe Charge gateway.")
             return
         
-        # Send checking animation
-        checking_msg = await send_checking_animation(update, context, sticker=True)
+        # Send the instant checking card
+        checking_msg = await message.reply_text(
+            build_single_check_checking("STC1", card),
+            parse_mode=ParseMode.HTML
+        )
         
         if checking_msg:
             await asyncio.sleep(0.5)
@@ -48535,15 +48541,8 @@ async def single_check_stc1(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Format response
         ui, status_category = format_stc1_response(result, card, bin_info)
         
-        # Delete checking animation
-        if checking_msg:
-            try:
-                await checking_msg.delete()
-            except:
-                pass
-        
-        # Send result
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        # Edit the checking card in place with the result
+        await checking_msg.edit_text(ui, parse_mode=ParseMode.HTML)
         
         # Save hit if approved or charged
         if status_category in ["charged", "approved"]:
@@ -48576,12 +48575,10 @@ async def single_check_stc1(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_manager.increment_checks(user_id)
         
     except Exception as e:
-        if checking_msg:
-            try:
-                await checking_msg.delete()
-            except:
-                pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+        try:
+            await checking_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [STC1 Single] Error: {traceback.format_exc()}")
     finally:
         stripe_charge_active_tasks.pop(user_id, None)
@@ -52138,9 +52135,8 @@ async def single_check_shopify_pool(update: Update, context: ContextTypes.DEFAUL
 
     try:
         # ── Checking animation ────────────────────────────────────────
-        time_emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("time", "5382194935057372936"), "🔄")
         checking_msg = await message.reply_text(
-            f"{time_emoji} Checking card with Shopify...",
+            build_single_check_checking("Shopify Payments", card, price="0.00$"),
             parse_mode=ParseMode.HTML,
         )
 
@@ -52245,14 +52241,8 @@ async def single_check_shopify_pool(update: Update, context: ContextTypes.DEFAUL
             f"{premium_emoji('5904542823167824187', '🗑')} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_display}</b>"
         )
 
-        # ── Delete "Checking..." and send result ──────────────────────
-        if checking_msg:
-            try:
-                await checking_msg.delete()
-            except Exception:
-                pass
-
-        await message.reply_text(output, parse_mode=ParseMode.HTML)
+        # ── Edit the checking card in place with the result ───────────
+        await checking_msg.edit_text(output, parse_mode=ParseMode.HTML)
 
         # ══════════════════════════════════════════════════════════════
         #  SAVE HIT + NOTIFY (only for charged/approved)
@@ -52299,12 +52289,10 @@ async def single_check_shopify_pool(update: Update, context: ContextTypes.DEFAUL
         user_manager.increment_checks(u_id)
 
     except Exception as e:
-        if checking_msg:
-            try:
-                await checking_msg.delete()
-            except Exception:
-                pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+        try:
+            await checking_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [Shopify Pool] Error: {traceback.format_exc()}")
         # Refund credit only on real internal error
         if user_manager.get_tier(u_id) == "free":
@@ -52764,7 +52752,7 @@ async def buy_wallet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             InlineKeyboardButton("Cancel", callback_data='buy_cancel', style='danger', icon_custom_emoji_id="5206121558164573238")
         ],
         [
-            InlineKeyboardButton("Contact Support", url="https://t.me/lencax", style='primary', icon_custom_emoji_id="5380498417228977451")
+            InlineKeyboardButton("Contact Support", url="https://t.me/lencax", style='primary', icon_custom_emoji_id="5307905813451397794")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -54001,7 +53989,7 @@ async def mass_check_sc1(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 output += f"\n{_UI_GLOBE} 𝐓𝐱𝐧 𝐈𝐃 ↣ <b>{transaction_id}</b>"
             
             try:
-                await message.reply_text(output, parse_mode=ParseMode.HTML)
+                await status_msg.edit_text(output, parse_mode=ParseMode.HTML)
             except:
                 pass
             
@@ -54109,7 +54097,10 @@ async def single_check_sc1(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         amount = context.user_data.get('payment_amount', DEFAULT_AMOUNT)
         
-        status_msg = await message.reply_text(f"🔄 Charging card with Stripe (${amount})...")
+        status_msg = await message.reply_text(
+            build_single_check_checking("Stripe Charger", card, price=f"${amount}"),
+            parse_mode=ParseMode.HTML
+        )
         
         await speed_controller.wait_if_needed()
         start = time.time()
@@ -54138,11 +54129,6 @@ async def single_check_sc1(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Get BIN info
         bin_info = await get_bin_info(card)
-        
-        try:
-            await status_msg.delete()
-        except:
-            pass
         
         # Format result
         status_category = result.get("status_category", "unknown")
@@ -54200,10 +54186,9 @@ async def single_check_sc1(update: Update, context: ContextTypes.DEFAULT_TYPE):
         import traceback
         traceback.print_exc()
         try:
-            await status_msg.delete()
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
         except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         add_user_credits(user_id, 1)
     finally:
         stripe_charge_active_tasks.pop(user_id, None)
@@ -70613,7 +70598,7 @@ async def single_check_stripe_charge_v2(update: Update, context: ContextTypes.DE
         return
     
     checking_msg = await message.reply_text(
-            f"{premium_emoji(PREMIUM_EMOJI_IDS['time'], '🔄')} Checking...",
+            build_single_check_checking("Stripe Charge", card),
             parse_mode=ParseMode.HTML
         )
     
@@ -70643,14 +70628,8 @@ async def single_check_stripe_charge_v2(update: Update, context: ContextTypes.DE
         # Format response
         ui, status_category = format_stripe_charge_v2_response(result, card, bin_info)
         
-        # Delete checking message
-        try:
-            await checking_msg.delete()
-        except:
-            pass
-        
-        # Send result
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        # Edit the checking card in place with the result
+        await checking_msg.edit_text(ui, parse_mode=ParseMode.HTML)
         
         # ============ YIELD AFTER SENDING RESULT ============
         await asyncio.sleep(0)
@@ -70687,10 +70666,9 @@ async def single_check_stripe_charge_v2(update: Update, context: ContextTypes.DE
         
     except Exception as e:
         try:
-            await checking_msg.delete()
+            await checking_msg.edit_text(f"❌ Error: {str(e)[:100]}")
         except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [Stripe Charge V2] Error: {traceback.format_exc()}")
         add_user_credits(user_id, 1)  # Refund credit on error
     finally:
@@ -75713,7 +75691,7 @@ async def sc_single_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     status_msg = await message.reply_text(
-        f"🔄 Checking card with SC...\n📍 Site: <code>{site}</code>",
+        build_single_check_checking("SC", card),
         parse_mode=ParseMode.HTML
     )
     
@@ -75808,9 +75786,8 @@ async def sc_single_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_name}</b>"
         )
         
-        # Delete checking message and send result
-        await status_msg.delete()
-        await message.reply_text(output, parse_mode=ParseMode.HTML)
+        # Edit the checking card in place with the result
+        await status_msg.edit_text(output, parse_mode=ParseMode.HTML)
         
         # Save hit if approved/charged
         if status_category in ["charged", "approved"]:
@@ -75841,10 +75818,9 @@ async def sc_single_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except Exception as e:
         try:
-            await status_msg.delete()
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
         except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [SC Single] Error: {traceback.format_exc()}")
         add_user_credits(user_id, 1)
 
@@ -76933,7 +76909,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("Buy Now", callback_data='show_plans', style='success', icon_custom_emoji_id="5197434882321567830"),
-            InlineKeyboardButton("Contact", callback_data='show_contact', style='primary', icon_custom_emoji_id="5380498417228977451"),
+            InlineKeyboardButton("Contact", callback_data='show_contact', style='primary', icon_custom_emoji_id="5307905813451397794"),
         ],
         [
             InlineKeyboardButton("Refer & Earn", callback_data='show_refer', style='success', icon_custom_emoji_id="6269135402855044481"),
@@ -77437,7 +77413,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         keyboard = [
             [
-                InlineKeyboardButton("DM Dev", url="https://t.me/lencax", style='primary', icon_custom_emoji_id="5380498417228977451"),
+                InlineKeyboardButton("DM Dev", url="https://t.me/lencax", style='primary', icon_custom_emoji_id="5307905813451397794"),
                 InlineKeyboardButton("Join Group", url="https://t.me/+a-_7PTkBTe81MGY1", style='success', icon_custom_emoji_id="5784914081165087232"),
             ],
             [InlineKeyboardButton("Back", callback_data='back_main', style='danger', icon_custom_emoji_id="5255703720078879038")],
@@ -77510,7 +77486,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ],
             [
                 InlineKeyboardButton("Buy Now", callback_data='show_plans', style='success', icon_custom_emoji_id="5197434882321567830"),
-                InlineKeyboardButton("Contact", callback_data='show_contact', style='primary', icon_custom_emoji_id="5380498417228977451"),
+                InlineKeyboardButton("Contact", callback_data='show_contact', style='primary', icon_custom_emoji_id="5307905813451397794"),
             ],
             [
                 InlineKeyboardButton("Refer & Earn", callback_data='show_refer', style='success', icon_custom_emoji_id="6269135402855044481"),
@@ -78230,7 +78206,7 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
 
         elif gateway == 'paypal_key':
             context.args = [card]
-            asyncio.create_task(paypal_key_single_command(update, context))
+            asyncio.create_task(_paypal_key_do_single(update, context, card))
 
         elif gateway == 'princess':
             context.args = [card]
@@ -84480,9 +84456,8 @@ async def single_check_stripe_1usd(update: Update, context: ContextTypes.DEFAULT
             user_speed_controllers[user_id] = SpeedController(TIER_SPEEDS.get(tier, 900), tier)
         speed_controller = user_speed_controllers[user_id]
         
-        # ============ ADD PREMIUM EMOJI TO CHECKING MESSAGE ============
         status_msg = await message.reply_text(
-            f"{premium_emoji(PREMIUM_EMOJI_IDS['time'], '🔄')} Checking card with Stripe $1...",
+            build_single_check_checking("Stripe $1", card),
             parse_mode=ParseMode.HTML
         )
         
@@ -84505,13 +84480,8 @@ async def single_check_stripe_1usd(update: Update, context: ContextTypes.DEFAULT
         
         bin_info = await get_bin_info(card)
         
-        try:
-            await status_msg.delete()
-        except:
-            pass
-        
         ui, status_category = format_stripe_1usd_response(result, card, bin_info)
-        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+        await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
         
         if status_category in ["charged", "approved"]:
             await save_hit_to_file(
@@ -84535,10 +84505,9 @@ async def single_check_stripe_1usd(update: Update, context: ContextTypes.DEFAULT
         
     except Exception as e:
         try:
-            await status_msg.delete()
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
         except:
-            pass
-        await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
         print(f"❌ [Stripe $1] Error: {traceback.format_exc()}")
         add_user_credits(user_id, 1)
     finally:
