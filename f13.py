@@ -2192,7 +2192,7 @@ async def bin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🏦 <b>Bank</b> ➛ {bank}\n"
                 f"🌍 <b>Country</b> ➛ {flag_emoji} {country_name}\n"
                 f"💵 <b>Currency</b> ➛ {currency}\n"
-                f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             await processing_msg.edit_text(response_text, parse_mode=ParseMode.HTML)
@@ -2227,7 +2227,7 @@ async def bin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🎯 <b>Type</b> ➛ UNKNOWN\n"
                 f"🏦 <b>Bank</b> ➛ Unknown\n"
                 f"🌍 <b>Country</b> ➛ {flag_emoji} {country_name}\n"
-                f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             await processing_msg.edit_text(response_text, parse_mode=ParseMode.HTML)
@@ -2475,7 +2475,7 @@ async def check_group_membership(update: Update, context: ContextTypes.DEFAULT_T
         f"Please join the following group(s) first:\n"
         f"{missing_lines}\n\n"
         "After joining, tap <b>✅ Verify Membership</b> below.\n\n"
-        "<b>Bot</b> ➛ @BLADESARKS_V3bot"
+        "<b>Bot</b> ➛ @BLADESARKS_v4_bot"
     )
 
     try:
@@ -2533,7 +2533,7 @@ async def verify_membership_callback(update: Update, context: ContextTypes.DEFAU
             await query.edit_message_text(
                 "✅ <b>Verification Successful!</b>\n\n"
                 "You can now use /start \n\n"
-                "<b>Bot</b> ➛ @BLADESARKS_V3bot",
+                "<b>Bot</b> ➛ @BLADESARKS_v4_bot",
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:
@@ -2573,7 +2573,7 @@ async def verify_membership_callback(update: Update, context: ContextTypes.DEFAU
         f"{missing_lines}\n\n"
         "Tap the buttons below to join, then tap "
         "<b>✅ Verify Membership</b> again.\n\n"
-        "<b>Bot</b> ➛ @BLADESARKS_V3bot"
+        "<b>Bot</b> ➛ @BLADESARKS_v4_bot"
     )
 
     try:
@@ -3505,7 +3505,7 @@ async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ <b>You have already used this key!</b>\n\n"
             f"🔑 Key: <code>{key}</code>\n"
             f"Each user can only redeem a key once.\n\n"
-            f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot",
+            f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot",
             parse_mode=ParseMode.HTML
         )
         return
@@ -3592,7 +3592,7 @@ async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{remaining_text}\n"
         f"👤 <b>Redeemed By:</b> @{user.username or user.first_name}\n"
         f"{one_time_note}\n"
-        f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot",
+        f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot",
         parse_mode=ParseMode.HTML
     )
     
@@ -3699,7 +3699,7 @@ async def send_key_redeem_notification(
     
     keyboard = [
         [
-            InlineKeyboardButton("BUY NOW", url="https://t.me/BLADESARKS_V3bot", style='success', icon_custom_emoji_id="5197434882321567830")
+            InlineKeyboardButton("BUY NOW", url="https://t.me/BLADESARKS_v4_bot", style='success', icon_custom_emoji_id="5197434882321567830")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -3823,7 +3823,7 @@ async def plan_purchase_command(update: Update, context: ContextTypes.DEFAULT_TY
             f"💰 <b>Price</b> ➛ {price_display}\n"
             f"⏱️ <b>Duration</b> ➛ {duration_text}\n"
             f"🧾 <b>Receipt</b> ➛ <code>{receipt_number}</code>\n"
-            f"🤖 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+            f"🤖 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
         )
         
         # Send notification to hit group
@@ -11942,7 +11942,7 @@ def check_free_hit_limit(hit_type: str):
                     f"{diamond_emoji} <b>Premium Only</b>\n\n"
                     f"Your free hit has already been used.\n\n"
                     f"Use /buy  to upgrade and keep hitting!\n\n"
-                    f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot",
+                    f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot",
                     parse_mode=ParseMode.HTML,
                 )
                 return
@@ -12875,7 +12875,7 @@ def check_gateway(gateway_name: str):
                     f"🚧 <b>Gate under maintenance</b>\n\n"
                     f"The <code>{gateway_name}</code> gateway is currently disabled.\n\n"
                     f"Please try again later or use another gateway.\n"
-                    f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot",
+                    f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot",
                     parse_mode=ParseMode.HTML
                 )
                 return
@@ -13037,7 +13037,7 @@ def check_gateway(gateway_name: str):
                     f"🚧 <b>Gate under maintenance</b>\n\n"
                     f"The <code>{gateway_name}</code> gateway is currently disabled.\n\n"
                     f"Please try again later or use another gateway.\n"
-                    f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot",
+                    f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot",
                     parse_mode=ParseMode.HTML
                 )
                 return
@@ -16609,7 +16609,7 @@ async def _mass_check_payglocal_logic(update, context, cards, progress_msg):
                 f"❌ Declined ➛ {stats['declined']}\n"
                 f"📝 Total ➛ {total}\n"
                 f"⏱️ Time ➛ {m}m {s}s\n"
-                f"💀 @BLADESARKS_V3bot",
+                f"💀 @BLADESARKS_v4_bot",
                 parse_mode=ParseMode.HTML
             )
     except Exception as e:
@@ -16801,7 +16801,7 @@ async def mass_check_payglocal_logic(update: Update, context: ContextTypes.DEFAU
                 f"⚠️ <b>Errors</b> ➛ {stats['errors']}\n"
                 f"📝 <b>Total</b> ➛ {total}\n"
                 f"⏱️ <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             await message.reply_text(summary, parse_mode=ParseMode.HTML)
@@ -18381,6 +18381,25 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await message.reply_text(f"❌ Failed to read file: {str(e)[:50]}")
                 return
 
+    # ── DEDUPE ───────────────────────────────────────────────────────────
+    # Cards can arrive twice: Telegram splits the WHOLE command text on
+    # whitespace, so `context.args` already contains every line (card 1 from
+    # line 1 + cards 2..N from the following lines), and then the
+    # "remaining lines" block above parses cards 2..N a second time. That is
+    # why 10 pasted cards were being checked as 19 (10 + 9). Keep only the
+    # first occurrence of each card, preserving order.
+    _seen_cards = set()
+    _unique_cards = []
+    for _c in cards:
+        _ck = (_c.get("cc"), _c.get("month"), _c.get("year"), _c.get("cvv"))
+        if _ck in _seen_cards:
+            continue
+        _seen_cards.add(_ck)
+        _unique_cards.append(_c)
+    if len(_unique_cards) != len(cards):
+        print(f"🧹 [stco] Removed {len(cards) - len(_unique_cards)} duplicate card(s)")
+    cards = _unique_cards
+
     # ── BIN MODE ─────────────────────────────────────────────────────────
     # A lone numeric token after the URL (e.g. /stco <url> 601100) is a BIN.
     # Generate STCO_BIN_GEN_COUNT random cards from it (remaining PAN digits,
@@ -18489,21 +18508,30 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text(credit_err, parse_mode=ParseMode.HTML)
         return
 
+    def _stco_card_line(_card) -> str:
+        """Render a card as a monospace (tap-to-copy) line."""
+        if isinstance(_card, dict):
+            _s = (f"{_card.get('cc', '')}|{_card.get('month', '')}"
+                  f"|{_card.get('year', '')}|{_card.get('cvv', '')}")
+        else:
+            _s = str(_card)
+        return f"<code>{_s}</code>"
+
     # Show progress
-    progress_text = f"{pe(PREMIUM_EMOJI_IDS['globe'], '🌐')} <b>Site</b> ➳ {merchant_name}\n"
-    progress_text += f"{pe(PREMIUM_EMOJI_IDS['money'], '💰')} <b>Amount</b> ➳ {price_display}\n"
-    progress_text += f"{pe(PREMIUM_EMOJI_IDS['time'], '⚡')} <b>Status</b> ➳ Hitting\n"
+    progress_text = f"{pe(PREMIUM_EMOJI_IDS['globe'], '🌐')} <b>Site</b> ➳ <b>{merchant_name}</b>\n"
+    progress_text += f"{pe(PREMIUM_EMOJI_IDS['money'], '💰')} <b>Amount</b> ➳ <b>{price_display}</b>\n"
+    progress_text += f"{pe(PREMIUM_EMOJI_IDS['time'], '⚡')} <b>Status</b> ➳ <b>Hitting</b>\n"
     
     if success_url:
         success_display = success_url[:50] + ('...' if len(success_url) > 50 else '')
-        progress_text += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ {success_display}\n"
+        progress_text += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ <b>{success_display}</b>\n"
     else:
-        progress_text += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ N/A\n"
+        progress_text += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ <b>N/A</b>\n"
     
-    progress_text += f"{pe(PREMIUM_EMOJI_IDS['stats'], '📊')} <b>Progress</b> ➳ 0/{len(cards)}\n\n"
+    progress_text += f"{pe(PREMIUM_EMOJI_IDS['stats'], '📊')} <b>Progress</b> ➳ <b>0/{len(cards)}</b>\n\n"
     if cards:
-        progress_text += f" {cards[0].get('cc', '')}|{cards[0].get('month', '')}|{cards[0].get('year', '')}|{cards[0].get('cvv', '')}\n"
-    progress_text += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['time'], '⏳')} Processing..."
+        progress_text += f"{_stco_card_line(cards[0])}\n"
+    progress_text += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['time'], '⏳')} <b>Processing...</b>"
     
     progress_msg = await message.reply_text(progress_text, parse_mode=ParseMode.HTML)
     
@@ -18512,23 +18540,86 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     charged_card = None
     charged_card_data = None
     card_results = []
+    live_results = []          # verdict blocks shown inside the live progress msg
+    _stopped_dead_session = False   # set when the checkout session dies mid-run
+
+    def _stco_status_badge(_status):
+        """Map a charge status to (premium emoji, label) for the UI."""
+        _s = str(_status or "").upper()
+        if _s in ('3DS', '3DS SKIP'):
+            return pe(PREMIUM_EMOJI_IDS['lock'], '🔐'), "3DS required"
+        if _s == 'DECLINED':
+            return pe(PREMIUM_EMOJI_IDS['declined'], '❌'), "declined"
+        if _s == 'NOT SUPPORTED':
+            return pe(PREMIUM_EMOJI_IDS['warning'], '⚠️'), "not supported"
+        if _s == 'CHARGED':
+            return pe(PREMIUM_EMOJI_IDS['charged'], '🔥'), "charged ✅"
+        if _s == 'SESSION_ERROR':
+            return pe(PREMIUM_EMOJI_IDS['warning'], '⚠️'), "session expired"
+        if _s == 'INSUFFICIENT_FUNDS':
+            return pe(PREMIUM_EMOJI_IDS['money'], '💰'), "insufficient funds"
+        if _s == 'CVV_LIVE':
+            return pe(PREMIUM_EMOJI_IDS['approved'], '✅'), "cvv live"
+        if _s == 'TIMEOUT':
+            return pe(PREMIUM_EMOJI_IDS['time'], '⏰'), "timeout"
+        if _s == 'PROXY_ERROR':
+            return pe(PREMIUM_EMOJI_IDS['error'], '🔌'), "proxy error"
+        return pe(PREMIUM_EMOJI_IDS['error'], '⚠️'), _status
+
+    def _stco_is_dead_session(_res) -> bool:
+        """True when Stripe says the CHECKOUT SESSION itself is dead.
+
+        That is not a card verdict — every remaining card would fail the
+        same way — so the caller stops the run instead of burning through
+        the rest of the list.
+        """
+        _st = str(_res.get('status') or '').upper()
+        _msg = str(_res.get('response') or '').lower()
+        if _st in ('SESSION_EXPIRED', 'SESSION_ERROR'):
+            return True
+        for _a in reversed(_res.get('attempts') or []):
+            _code = str(_a.get('error_code') or '').lower()
+            if _code in ('checkout_session_expired', 'checkout_session_not_active'):
+                return True
+        if _st == 'ERROR':
+            return any(_k in _msg for _k in (
+                'no longer active',
+                'no longer valid',
+                'session has expired',
+                'session expired',
+                'checkout session is no longer',
+            ))
+        return False
+
+    def _stco_live_body(_blocks, _limit: int = 3200) -> str:
+        """Newest verdict blocks that still fit in one Telegram message."""
+        _out, _used = [], 0
+        for _b in reversed(_blocks):
+            if _used + len(_b) > _limit:
+                break
+            _out.append(_b)
+            _used += len(_b)
+        return "".join(reversed(_out))
     
     for idx, card in enumerate(cards, 1):
         try:
             # Update progress
-            progress_text = f"{pe(PREMIUM_EMOJI_IDS['globe'], '🌐')} <b>Site</b> ➳ {merchant_name}\n"
-            progress_text += f"{pe(PREMIUM_EMOJI_IDS['money'], '💰')} <b>Amount</b> ➳ {price_display}\n"
-            progress_text += f"{pe(PREMIUM_EMOJI_IDS['time'], '⚡')} <b>Status</b> ➳ Hitting\n"
+            progress_text = f"{pe(PREMIUM_EMOJI_IDS['globe'], '🌐')} <b>Site</b> ➳ <b>{merchant_name}</b>\n"
+            progress_text += f"{pe(PREMIUM_EMOJI_IDS['money'], '💰')} <b>Amount</b> ➳ <b>{price_display}</b>\n"
+            progress_text += f"{pe(PREMIUM_EMOJI_IDS['time'], '⚡')} <b>Status</b> ➳ <b>Hitting</b>\n"
             
             if success_url:
                 success_display = success_url[:50] + ('...' if len(success_url) > 50 else '')
-                progress_text += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ {success_display}\n"
+                progress_text += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ <b>{success_display}</b>\n"
             else:
-                progress_text += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ N/A\n"
+                progress_text += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ <b>N/A</b>\n"
             
-            progress_text += f"{pe(PREMIUM_EMOJI_IDS['stats'], '📊')} <b>Progress</b> ➳ {idx-1}/{len(cards)}\n\n"
-            progress_text += f" {card.get('cc', '')}|{card.get('month', '')}|{card.get('year', '')}|{card.get('cvv', '')}\n"
-            progress_text += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['time'], '⏳')} Processing..."
+            progress_text += f"{pe(PREMIUM_EMOJI_IDS['stats'], '📊')} <b>Progress</b> ➳ <b>{idx-1}/{len(cards)}</b>\n\n"
+            # Already-checked cards stay on screen with their verdict, then the
+            # card currently being hit is appended with its live status line.
+            progress_text += _stco_live_body(live_results)
+            progress_text += f"{_stco_card_line(card)}\n"
+            progress_text += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['time'], '⏳')} <b>Processing...</b>"
             
             await progress_msg.edit_text(progress_text, parse_mode=ParseMode.HTML)
         except:
@@ -18563,8 +18654,26 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'attempts': len(result.get('attempts', []))
         })
         
+        # Append this card's verdict to the live progress body (same format
+        # as the final "Stripe Charge Result" box).
+        _st_emoji, _st_label = _stco_status_badge(result.get('status', 'UNKNOWN'))
+        _st_resp = result.get('response') or result.get('status') or 'Unknown'
+        _live_line = f"{_stco_card_line(card_str)}\n    ⤷ {_st_emoji} <b>{_st_resp} ({_st_label})</b>"
+        _live_attempts = len(result.get('attempts', []))
+        if _live_attempts > 0:
+            _live_line += f" <b>[attempts: {_live_attempts}]</b>"
+        live_results.append(_live_line + "\n")
+
         print(f"📊 Result: {result.get('status', 'UNKNOWN')} - {result.get('response', 'Unknown')[:50]}")
-        
+
+        # ── Fatal checkout error: stop, the session is gone ──────────────
+        # e.g. "This Checkout Session is no longer active." — hitting the
+        # remaining cards is pointless, so end the run here.
+        if _stco_is_dead_session(result):
+            _stopped_dead_session = True
+            print("🛑 [stco] Checkout session is no longer active — stopping run")
+            break
+
         if result['status'] == 'CHARGED':
             charged_card = result
             charged_card_data = {
@@ -18584,28 +18693,31 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response += f"┃ {pe(PREMIUM_EMOJI_IDS['diamond'], '💳')} <b>Stripe Charge Result</b>\n"
     response += f"┗━━━━━━━━━━━⊛\n\n"
     
-    response += f"{pe(PREMIUM_EMOJI_IDS['globe'], '🌐')} <b>Site</b> ➳ {merchant_name}\n"
-    response += f"{pe(PREMIUM_EMOJI_IDS['money'], '💰')} <b>Amount</b> ➳ {price_display}\n"
+    response += f"{pe(PREMIUM_EMOJI_IDS['globe'], '🌐')} <b>Site</b> ➳ <b>{merchant_name}</b>\n"
+    response += f"{pe(PREMIUM_EMOJI_IDS['money'], '💰')} <b>Amount</b> ➳ <b>{price_display}</b>\n"
     
     if charged_card:
-        response += f"{pe(PREMIUM_EMOJI_IDS['charged'], '🔥')} <b>Status</b> ➳ Paid ✅\n"
+        response += f"{pe(PREMIUM_EMOJI_IDS['charged'], '🔥')} <b>Status</b> ➳ <b>Paid ✅</b>\n"
     else:
-        response += f"{pe(PREMIUM_EMOJI_IDS['declined'], '❌')} <b>Status</b> ➳ Not Paid\n"
+        response += f"{pe(PREMIUM_EMOJI_IDS['declined'], '❌')} <b>Status</b> ➳ <b>Not Paid</b>\n"
     
     if success_url:
-        response += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ <a href=\"{success_url}\">CLICK</a>\n"
+        response += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ <a href=\"{success_url}\"><b>CLICK</b></a>\n"
     
-    response += f"{pe(PREMIUM_EMOJI_IDS['stats'], '📊')} <b>Progress</b> ➳ {len(results)}/{len(cards)}\n\n"
+    response += f"{pe(PREMIUM_EMOJI_IDS['stats'], '📊')} <b>Progress</b> ➳ <b>{len(results)}/{len(cards)}</b>\n\n"
+    
+    if _stopped_dead_session:
+        response += f"{pe(PREMIUM_EMOJI_IDS['warning'], '⚠️')} <b>Stopped</b> ➳ <b>Checkout session is no longer active</b>\n\n"
     
     # Show results
     if charged_card:
-        response += f" {charged_card['card_display']}\n"
-        response += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['charged'], '🔥')} {charged_card['response']} ✅\n"
+        response += f"{_stco_card_line(charged_card['card_display'])}\n"
+        response += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['charged'], '🔥')} <b>{charged_card['response']} ✅</b>\n"
         for r in results:
             if r != charged_card:
-                response += f" {r['card_display']}\n"
+                response += f"{_stco_card_line(r['card_display'])}\n"
                 status_text = r['response'] if r['response'] else r['status']
-                response += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['declined'], '❌')} {status_text}\n"
+                response += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['declined'], '❌')} <b>{status_text}</b>\n"
     else:
         for r in card_results:
             card = r['card']
@@ -18613,41 +18725,12 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response_text = r['response']
             attempts = r.get('attempts', 0)
             
-            if status == '3DS' or status == '3DS SKIP':
-                status_emoji = pe(PREMIUM_EMOJI_IDS['lock'], '🔐')
-                status_display = "3DS required"
-            elif status == 'DECLINED':
-                status_emoji = pe(PREMIUM_EMOJI_IDS['declined'], '❌')
-                status_display = "declined"
-            elif status == 'NOT SUPPORTED':
-                status_emoji = pe(PREMIUM_EMOJI_IDS['warning'], '⚠️')
-                status_display = "not supported"
-            elif status == 'CHARGED':
-                status_emoji = pe(PREMIUM_EMOJI_IDS['charged'], '🔥')
-                status_display = "charged ✅"
-            elif status == 'SESSION_ERROR':
-                status_emoji = pe(PREMIUM_EMOJI_IDS['warning'], '⚠️')
-                status_display = "session expired"
-            elif status == 'INSUFFICIENT_FUNDS':
-                status_emoji = pe(PREMIUM_EMOJI_IDS['money'], '💰')
-                status_display = "insufficient funds"
-            elif status == 'CVV_LIVE':
-                status_emoji = pe(PREMIUM_EMOJI_IDS['approved'], '✅')
-                status_display = "cvv live"
-            elif status == 'TIMEOUT':
-                status_emoji = pe(PREMIUM_EMOJI_IDS['time'], '⏰')
-                status_display = "timeout"
-            elif status == 'PROXY_ERROR':
-                status_emoji = pe(PREMIUM_EMOJI_IDS['error'], '🔌')
-                status_display = "proxy error"
-            else:
-                status_emoji = pe(PREMIUM_EMOJI_IDS['error'], '⚠️')
-                status_display = status
+            status_emoji, status_display = _stco_status_badge(status)
             
-            response += f" {card}\n"
-            response += f"    ⤷ {status_emoji} {response_text} ({status_display})"
+            response += f"{_stco_card_line(card)}\n"
+            response += f"    ⤷ {status_emoji} <b>{response_text} ({status_display})</b>"
             if attempts > 0:
-                response += f" [attempts: {attempts}]"
+                response += f" <b>[attempts: {attempts}]</b>"
             response += "\n"
 
     await progress_msg.edit_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
@@ -18669,7 +18752,7 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # ============ BLADESARKS BUTTON - LIKE SHOPIFY ============
                 keyboard = [
                     [
-                        InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_V3bot", style='primary', icon_custom_emoji_id="5427168083074628963"),
+                        InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_v4_bot", style='primary', icon_custom_emoji_id="5427168083074628963"),
                     ]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
@@ -19852,7 +19935,7 @@ def format_jio_response(result: Dict, card: str, compact: bool = False) -> Tuple
         f"  ⤷ {status_emoji} {status_text}\n"
         f"\n"
         f"{time_emoji} Time: {elapsed:.2f}s\n"
-        f"{skull_emoji} Bot ➛ @BLADESARKS_V3bot"
+        f"{skull_emoji} Bot ➛ @BLADESARKS_v4_bot"
     )
 
     return ui, status_category
@@ -19992,7 +20075,7 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"├─ Redeem a credit key: /redeemcredits &lt;key&gt;\n"
                 f"├─ Upgrade to Premium/Ultimate for unlimited\n"
                 f"└─ Contact @lencax\n\n"
-                f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot",
+                f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot",
                 parse_mode=ParseMode.HTML
             )
             return
@@ -20764,7 +20847,7 @@ async def getsite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"💀 Dead: {dead_count}\n"
                     f"━━━━━━━━━━━━━━━━━━━\n"
                     f"📅 Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                    f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
                 ),
                 parse_mode=ParseMode.HTML
             )
@@ -21226,7 +21309,7 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [
-            InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_V3bot", style='primary', icon_custom_emoji_id="5427168083074628963")
+            InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_v4_bot", style='primary', icon_custom_emoji_id="5427168083074628963")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -22236,7 +22319,7 @@ async def mass_check_st1_logic(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"{errors_emoji} <b>Errors</b> ➛ {stats['errors']}\n"
                 f"{total_emoji} <b>Total</b> ➛ {total}\n"
                 f"{time_emoji} <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             await update_progress(total)
@@ -22963,7 +23046,7 @@ async def stripe_auth_v2_mass_check_logic(update: Update, context: ContextTypes.
                 f"{errors_emoji} <b>Errors</b> ➛ {stats['errors']}\n"
                 f"{total_emoji} <b>Total</b> ➛ {total}\n"
                 f"{time_emoji} <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             # Update final progress
@@ -24380,12 +24463,12 @@ async def send_hit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'<tg-emoji emoji-id="{PREMIUM_EMOJI_IDS["money"]}">🙈</tg-emoji> <b>Price</b> ➛ {price_str}\n'
             f'<tg-emoji emoji-id="{PREMIUM_EMOJI_IDS["smile"]}">😁</tg-emoji> <b>Response</b> ➛ {response}\n'
             f'<tg-emoji emoji-id="{PREMIUM_EMOJI_IDS["devil"]}">😈</tg-emoji> <b>User</b> ➛ {user_display}\n'
-            f'<tg-emoji emoji-id="{PREMIUM_EMOJI_IDS["skull"]}">💀</tg-emoji> <b>Hit From</b> ➛ @BLADESARKS_V3bot'
+            f'<tg-emoji emoji-id="{PREMIUM_EMOJI_IDS["skull"]}">💀</tg-emoji> <b>Hit From</b> ➛ @BLADESARKS_v4_bot'
         )
         
         keyboard = [
         [
-            InlineKeyboardButton("BUY NOW", url="https://t.me/BLADESARKS_V3bot", style='success', icon_custom_emoji_id="5197434882321567830")
+            InlineKeyboardButton("BUY NOW", url="https://t.me/BLADESARKS_v4_bot", style='success', icon_custom_emoji_id="5197434882321567830")
         ]
 
     ]
@@ -24479,14 +24562,14 @@ async def chk_card_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Simply redirect to bot
     keyboard = [
-        [InlineKeyboardButton("Open BLADESARKS", url="https://t.me/BLADESARKS_V3bot", style='primary', icon_custom_emoji_id="6041705726206808304")]
+        [InlineKeyboardButton("Open BLADESARKS", url="https://t.me/BLADESARKS_v4_bot", style='primary', icon_custom_emoji_id="6041705726206808304")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await query.edit_message_text(
         f"✅ <b>BLADESARKS</b>\n\n"
         f"Click the button below to check cards with BLADESARKS bot:\n\n"
-        f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot",
+        f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot",
         parse_mode=ParseMode.HTML,
         reply_markup=reply_markup
     )
@@ -24665,13 +24748,13 @@ async def send_hit_notification(context: ContextTypes.DEFAULT_TYPE,
     if is_charged:
         keyboard = [
             [
-                InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_V3bot", style='primary', icon_custom_emoji_id="5427168083074628963"),
+                InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_v4_bot", style='primary', icon_custom_emoji_id="5427168083074628963"),
             ]
         ]
     else:
         keyboard = [
             [
-                InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_V3bot", style='primary', icon_custom_emoji_id="5427168083074628963")
+                InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_v4_bot", style='primary', icon_custom_emoji_id="5427168083074628963")
             ]
         ]
     
@@ -28112,7 +28195,7 @@ async def proxy_stripe_check_command(update: Update, context: ContextTypes.DEFAU
         if len(dead) > 5:
             response += f"    • <code>... and {len(dead) - 5} more</code>\n"
     
-    response += f"\n💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+    response += f"\n💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
     
     await checking_msg.edit_text(response, parse_mode=ParseMode.HTML)
 
@@ -28430,7 +28513,7 @@ async def co_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 response += f" [attempts: {attempts}]"
             response += "\n"
     
-    response += f"\n{pe(PREMIUM_EMOJI_IDS['skull'], '💀')} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+    response += f"\n{pe(PREMIUM_EMOJI_IDS['skull'], '💀')} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
     response += f"\n⏱️ Time: {total_time}s"
     
     await progress_msg.edit_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
@@ -33235,7 +33318,7 @@ async def ezycourse_mass_check_logic(update: Update, context: ContextTypes.DEFAU
                 f"📝 <b>Total</b> ➛ {total}\n"
                 f"⚡ <b>Speed</b> ➛ {total / (total_time / 60):.1f} cards/min\n"
                 f"⏱️ <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             await update_progress(total, force=True)
@@ -34320,7 +34403,7 @@ async def st1_gateway_mass_check_logic(update: Update, context: ContextTypes.DEF
                 f"{errors_emoji} <b>Errors</b> ➛ {stats['errors']}\n"
                 f"📝 <b>Total</b> ➛ {total}\n"
                 f"⏱️ <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
 
             await update_progress(total)
@@ -36965,7 +37048,7 @@ async def adyen_mass_check_logic(update: Update, context: ContextTypes.DEFAULT_T
                 f"{errors_emoji} <b>Errors</b> ➛ {stats['errors']}\n"
                 f"📝 <b>Total</b> ➛ {total}\n"
                 f"⏱️ <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             await update_progress(total)
@@ -38051,7 +38134,7 @@ async def stripe_pl_mass_check_logic(update: Update, context: ContextTypes.DEFAU
                 f"{errors_emoji} <b>Errors</b> ➛ {stats['errors']}\n"
                 f"📝 <b>Total</b> ➛ {total}\n"
                 f"⏱️ <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             await update_progress(total)
@@ -39875,7 +39958,7 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f'💰 <b>Amount:</b> ${pending["amount"]:.2f}\n'
                 f'⏱️ <b>Time Remaining:</b> {minutes}m {seconds}s\n\n'
                 f'⚠️ <i>You have a pending payment. Continue or cancel to start a new one.</i>\n'
-                f'💀 <b>Bot</b> ➛ @BLADESARKS_V3bot'
+                f'💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot'
             )
             
             await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
@@ -39910,7 +39993,7 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f'🔥 <b>Member</b> - $20 (30 Days)\n\n'
         f'━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
         f'📌 All plans include unlimited checks\n'
-        f'💀 <b>Bot</b> ➛ @BLADESARKS_V3bot'
+        f'💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot'
     )
     
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
@@ -39934,7 +40017,7 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f'❌ <b>Payment Cancelled</b>\n\n'
             f'You can start again with <code>/pay</code>\n'
-            f'💀 <b>Bot</b> ➛ @BLADESARKS_V3bot',
+            f'💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot',
             parse_mode=ParseMode.HTML,
             reply_markup=back_menu()
         )
@@ -39989,7 +40072,7 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'1. Send exactly <b>${plan["price"]}</b>\n'
             f'2. After sending payment, click:\n'
             f'   ✅ <b>I Have Sent Payment</b>\n\n'
-            f'💀 <b>Bot</b> ➛ @BLADESARKS_V3bot'
+            f'💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot'
         )
         
         keyboard = [
@@ -40019,7 +40102,7 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += (
             f'━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
             f'📌 Select a plan first, then send payment\n'
-            f'💀 <b>Bot</b> ➛ @BLADESARKS_V3bot'
+            f'💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot'
         )
         
         keyboard = [[InlineKeyboardButton("Back to Plans", callback_data='pay_back', style='danger', icon_custom_emoji_id="5255703720078879038")]]
@@ -40057,7 +40140,7 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'🔥 <b>Member</b> - $20 (30 Days)\n\n'
             f'━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
             f'📌 All plans include unlimited checks\n'
-            f'💀 <b>Bot</b> ➛ @BLADESARKS_V3bot'
+            f'💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot'
         )
         
         await query.edit_message_text(msg, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
@@ -40110,7 +40193,7 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'💰 <b>Price:</b> ${plan["price"]}\n'
             f'━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n'
             f'🎯 <b>Choose your payment method:</b>\n'
-            f'💀 <b>Bot</b> ➛ @BLADESARKS_V3bot'
+            f'💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot'
         )
         
         await query.edit_message_text(msg, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
@@ -40218,7 +40301,7 @@ async def pay_wallet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         f'2. After sending payment, click:\n'
         f'   ✅ <b>I Have Sent Payment</b>\n'
         f'3. Payment auto-cancels after 30 minutes\n\n'
-        f'💀 <b>Bot</b> ➛ @BLADESARKS_V3bot'
+        f'💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot'
     )
     
     keyboard = [
@@ -40293,7 +40376,7 @@ async def pay_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f'<i>Or reject with reason:</i>\n'
         f'<code>/rejectpayment {user_id} {payment_id} &lt;reason&gt;</code>\n'
         f'━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
-        f'💀 <b>Bot</b> ➛ @BLADESARKS_V3bot'
+        f'💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot'
     )
     
     # Send to owner and payment group
@@ -40333,7 +40416,7 @@ async def pay_done_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f'📝 <i>If you haven\'t sent the payment yet, please send it now.</i>\n'
         f'Payment auto-cancels after 30 minutes.\n'
         f'━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
-        f'💀 <b>Bot</b> ➛ @BLADESARKS_V3bot',
+        f'💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot',
         parse_mode=ParseMode.HTML,
         reply_markup=reply_markup
     )
@@ -40419,7 +40502,7 @@ async def paywallets_button_command(update: Update, context: ContextTypes.DEFAUL
     msg += (
         f'━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
         f'📌 Use <code>/pay</code> to start a payment\n'
-        f'💀 <b>Bot</b> ➛ @BLADESARKS_V3bot'
+        f'💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot'
     )
     
     keyboard = [
@@ -40450,7 +40533,7 @@ async def payment_expiry_worker(context: ContextTypes.DEFAULT_TYPE):
                     f'⏰ <b>Payment Request Expired</b>\n\n'
                     f'Your payment request has been automatically cancelled after 30 minutes.\n\n'
                     f'Please start a new payment with <code>/pay</code>\n'
-                    f'💀 <b>Bot</b> ➛ @BLADESARKS_V3bot'
+                    f'💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot'
                 ),
                 parse_mode=ParseMode.HTML
             )
@@ -40509,7 +40592,7 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Or reject with reason:\n"
         f"<code>/rejectpayment {user_id} {payment_id} &lt;reason&gt;</code>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+        f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
     )
     
     try:
@@ -40543,7 +40626,7 @@ async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"You will be notified once your payment is confirmed.\n\n"
         f"📝 <b>Note:</b> If you haven't sent the payment yet, please send it now.\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot",
+        f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot",
         parse_mode=ParseMode.HTML
     )
 
@@ -40649,7 +40732,7 @@ async def approvepayment_command(update: Update, context: ContextTypes.DEFAULT_T
                     f"💰 Amount: ${amount:.2f}\n"
 
                     f"🎉 Your account has been upgraded to <b>{plan_name.upper()}</b> tier!\n"
-                    f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                    f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
                 ),
                 parse_mode=ParseMode.HTML
             )
@@ -40778,7 +40861,7 @@ async def rejectpayment_command(update: Update, context: ContextTypes.DEFAULT_TY
                 f"📝 Reason: {reason}\n\n"
                 f"Please contact @Cypher099 for assistance.\n"
                 f"━━━━━━━━━━━━━━━━━━━\n"
-                f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             ),
             parse_mode=ParseMode.HTML
         )
@@ -40864,7 +40947,7 @@ async def send_payment_notification(context: ContextTypes.DEFAULT_TYPE, user_id:
         f"💰 <b>Amount:</b> ${amount:.2f}\n"
         f"📊 <b>Status:</b> {status_emoji} {status_text}\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+        f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
     )
     
     try:
@@ -40968,7 +41051,7 @@ async def send_plan_purchase_notification_clean(
     
     keyboard = [
         [
-            InlineKeyboardButton("BUY NOW", url="https://t.me/BLADESARKS_V3bot", style='success', icon_custom_emoji_id="5197434882321567830")
+            InlineKeyboardButton("BUY NOW", url="https://t.me/BLADESARKS_v4_bot", style='success', icon_custom_emoji_id="5197434882321567830")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -43026,7 +43109,7 @@ async def paypal_donation_mass_check_logic(update: Update, context: ContextTypes
                 f"{errors_emoji} <b>Errors</b> ➛ {stats['errors']}\n"
                 f"📝 <b>Total</b> ➛ {total}\n"
                 f"⏱️ <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             await update_progress(total)
@@ -46577,7 +46660,7 @@ async def rgood_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"\n━━━━━━━━━━━━━━━━━━━\n"
         f"🌟 Remaining GOOD sites: {good_count}\n"
         f"🌐 Remaining sites in rotation: {len(autosopi_site_manager.sites)}\n\n"
-        f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+        f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
     )
     
     await update.message.reply_text(response_msg, parse_mode=ParseMode.HTML, reply_markup=back_menu())
@@ -51503,7 +51586,7 @@ async def bt_kaffn8_mass_logic(update, context, cards, progress_msg=None):
                 f"{errors_emoji} <b>Errors</b> ➛ {stats['errors']}\n"
                 f"📝 <b>Total</b> ➛ {total}\n"
                 f"⏱️ <b>Time</b> ➛ {mins}m {secs}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             try:
                 await message.reply_text(summary, parse_mode=ParseMode.HTML)
@@ -52718,7 +52801,7 @@ async def buy_crypto_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"💰 <b>Price:</b> ${plan['price']} USD\n"
 
         f"📤 <b>Available Wallets:</b>\n"
-        f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+        f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
     )
     
     keyboard = []
@@ -52931,7 +53014,7 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         f"⏳ <b>Status:</b> ⏳ Waiting for admin confirmation...\n"
         f"\n\n"
         f"📌 You will be notified once your payment is confirmed.\n"
-        f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot",
+        f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot",
         parse_mode=ParseMode.HTML
     )
     
@@ -52949,7 +53032,7 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
         f"📅 <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"\n\n"
         f"👇 Use the buttons below to confirm or reject.\n"
-        f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+        f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
     )
 
     payment_action_keyboard = InlineKeyboardMarkup([[
@@ -53076,7 +53159,7 @@ async def _reject_payment_core(context: ContextTypes.DEFAULT_TYPE, target_user_i
                 f"📝 <b>Reason:</b> {reason}\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"💡 Please contact @lencax for assistance.\n"
-                f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             ),
             parse_mode=ParseMode.HTML
         )
@@ -53196,7 +53279,7 @@ async def buy_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Your payment has been cancelled.\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"💡 You can start a new payment with <code>/buy</code>\n"
-        f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot",
+        f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot",
         parse_mode=ParseMode.HTML,
         reply_markup=back_menu()
     )
@@ -53229,7 +53312,7 @@ async def buy_back_plan_callback(update: Update, context: ContextTypes.DEFAULT_T
         f"💰 <b>Price:</b> ${plan['price']} USD\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🎯 <b>Select Payment Method:</b>\n"
-        f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+        f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
     )
     
     keyboard = [
@@ -54109,7 +54192,7 @@ async def mass_check_sc1(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{errors_emoji} <b>Errors</b> ➛ {stats['errors']}\n"
         f"{checked_emoji} <b>Total</b> ➛ {len(cards)}\n"
         f"{time_emoji} <b>Time</b> ➛ {minutes}m {seconds}s\n"
-        f"<b>Bot</b> ➛ @BLADESARKS_V3bot"
+        f"<b>Bot</b> ➛ @BLADESARKS_v4_bot"
     )
     
     await progress_msg.edit_text(summary, parse_mode=ParseMode.HTML)
@@ -55382,7 +55465,7 @@ async def razorpay2_mass_check_logic(update, context, cards, progress_msg=None):
                 f"{errors_emoji_sum} <b>Errors</b> ➛ {stats['errors']}\n"
                 f"{total_emoji} <b>Total</b> ➛ {total}\n"
                 f"{time_emoji_sum} <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             await update_progress(total)
@@ -56863,7 +56946,7 @@ async def razorpay_gate2_mass_check_logic(update: Update, context: ContextTypes.
                 f"{errors_emoji} <b>Errors</b> ➛ {stats['errors']}\n"
                 f"📝 <b>Total</b> ➛ {total}\n"
                 f"⏱️ <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             await update_progress(total)
@@ -57949,7 +58032,7 @@ async def stripe_4usd_mass_check_logic(update: Update, context: ContextTypes.DEF
                 f"{errors_emoji} <b>Errors</b> ➛ 0\n"
                 f"📝 <b>Total</b> ➛ {total}\n"
                 f"⏱️ <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             await update_progress(total)
@@ -58217,7 +58300,7 @@ async def send_hour_key_notification(context: ContextTypes.DEFAULT_TYPE, user_id
     if remaining_uses is not None and max_uses is not None:
         notification += f'\n🔋 <b>Remaining Uses</b> ➛ {remaining_uses}/{max_uses}'
     
-    notification += f'\n💀 <b>Bot</b> ➛ @BLADESARKS_V3bot'
+    notification += f'\n💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot'
     
     try:
         await context.bot.send_message(
@@ -58697,7 +58780,7 @@ async def skkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response += (
         f"\n"
         f"👤 <b>Checked By</b> ➳ {update.effective_user.first_name}\n"
-        f"💀 <b>Bot</b> ➳ @BLADESARKS_V3bot"
+        f"💀 <b>Bot</b> ➳ @BLADESARKS_v4_bot"
     )
 
     await status_msg.edit_text(
@@ -59185,7 +59268,7 @@ async def mass_check_stripe_chk_command(update: Update, context: ContextTypes.DE
                 f"├─ /credits - Check balance\n"
                 f"├─ /redeemcredits - Add credits\n"
                 f"└─ /buy - Upgrade\n\n"
-                f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             await message.reply_text(error_msg, parse_mode=ParseMode.HTML)
             return
@@ -60325,7 +60408,7 @@ async def single_check_razorpay(update: Update, context: ContextTypes.DEFAULT_TY
                 f"├─ /credits - Check balance\n"
                 f"├─ /redeemcredits - Add credits\n"
                 f"└─ /buy - Upgrade\n\n"
-                f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             await message.reply_text(error_message, parse_mode=ParseMode.HTML)
             # Refund credits since gateway not available
@@ -60712,7 +60795,7 @@ async def razorpay_mass_check_with_pool(update: Update, context: ContextTypes.DE
                 f"{errors_emoji} <b>Errors</b> ➛ 0\n"
                 f"{total_emoji} <b>Total</b> ➛ {total}\n"
                 f"{time_emoji} <b>Time</b> ➛ {int((time.time() - start_time)//60)}m {int((time.time() - start_time)%60)}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             
@@ -60763,7 +60846,7 @@ async def mass_check_razorpay_command(update: Update, context: ContextTypes.DEFA
                 f"├─ /credits - Check balance\n"
                 f"├─ /redeemcredits - Add credits\n"
                 f"└─ /buy - Upgrade\n\n"
-                f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             await message.reply_text(error_message, parse_mode=ParseMode.HTML)
             return
@@ -62275,7 +62358,7 @@ async def mass_check_princess_logic(update: Update, context: ContextTypes.DEFAUL
                 f"{errors_emoji} <b>Errors</b> ➛ {stats['errors']}\n"
                 f"📝 <b>Total</b> ➛ {total}\n"
                 f"⏱️ <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             await update_progress(total)
@@ -62927,7 +63010,7 @@ async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👑 <b>New Tier:</b> {tier.upper()}\n"
         f"📅 <b>Expires:</b> {expiry_dt}\n"
         f"\n"
-        f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot",
+        f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot",
         parse_mode=ParseMode.HTML,
         reply_markup=back_menu()
     )
@@ -63021,7 +63104,7 @@ async def send_gift_notification(context: ContextTypes.DEFAULT_TYPE,
     # Add keyboard with BLADESARKS button
     keyboard = [
         [
-            InlineKeyboardButton("BUY NOW", url="https://t.me/BLADESARKS_V3bot", style='success', icon_custom_emoji_id="5197434882321567830"),
+            InlineKeyboardButton("BUY NOW", url="https://t.me/BLADESARKS_v4_bot", style='success', icon_custom_emoji_id="5197434882321567830"),
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -63155,7 +63238,7 @@ async def addcr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>Change</b>   ➛ {sign}{amount}\n"
         f"<b>Before</b>   ➛ {old_total}\n"
         f"<b>After</b>    ➛ {new_total}\n"
-        f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+        f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
     )
     await message.reply_text(admin_msg, parse_mode=ParseMode.HTML)
 
@@ -63167,14 +63250,14 @@ async def addcr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🎉 <b>+{amt_abs} credits</b> have been added to your account.\n"
                 f"💰 <b>New Balance:</b> {new_total} credits\n\n"
                 f"Use /credits to check your balance.\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
         else:
             user_msg = (
                 f"⚠️ <b>Credits Deducted</b>\n\n"
                 f"<b>-{amt_abs} credits</b> have been removed from your account.\n"
                 f"💰 <b>New Balance:</b> {new_total} credits\n\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
         await context.bot.send_message(
             chat_id=target_user_id,
@@ -63241,7 +63324,7 @@ async def gift_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<code>/gift 6299808404 Lɪᴛᴇ</code>\n"
         f"<code>/gift 6299808404 Cʀᴏᴡɴ</code>\n"
         f"<code>/gift 6299808404 Mᴇᴍʙᴇʀ</code>\n\n"
-        f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+        f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
     )
     
     await update.message.reply_text(message, parse_mode=ParseMode.HTML, reply_markup=back_menu())
@@ -63293,7 +63376,7 @@ async def gift_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         count = plan_counts.get(key, 0)
         message += f"   • {plan['emoji']} {plan['display_name']}: {count}\n"
     
-    message += f"\n{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+    message += f"\n{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
     
     await update.message.reply_text(message, parse_mode=ParseMode.HTML, reply_markup=back_menu())
 
@@ -63527,7 +63610,7 @@ async def hit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f'<tg-emoji emoji-id="{PREMIUM_EMOJI_IDS["doller"]}">💵</tg-emoji> <b>Response</b> ↬  ORDER_PLACED\n'
         f'<tg-emoji emoji-id="{PREMIUM_EMOJI_IDS["toy"]}">📍</tg-emoji> <b>User</b> ↬ @lencax\n'
         f'<tg-emoji emoji-id="{PREMIUM_EMOJI_IDS["target"]}">🎯</tg-emoji> <b>Tier</b> ↬ ADMIN\n'
-        f'<tg-emoji emoji-id="{PREMIUM_EMOJI_IDS["skull"]}">☠️</tg-emoji> <b>Hit From</b> ↬ @BLADESARKS_V3bot'
+        f'<tg-emoji emoji-id="{PREMIUM_EMOJI_IDS["skull"]}">☠️</tg-emoji> <b>Hit From</b> ↬ @BLADESARKS_v4_bot'
     )
     
     try:
@@ -64572,7 +64655,7 @@ async def dabbagh_mass_check_logic(update: Update, context: ContextTypes.DEFAULT
                 f"{errors_emoji} <b>Errors</b> ➛ {stats['errors']}\n"
                 f"📝 <b>Total</b> ➛ {total}\n"
                 f"⏱️ <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             await update_progress(total)
@@ -65501,7 +65584,7 @@ async def united_way_mass_check_logic(update: Update, context: ContextTypes.DEFA
                 f"{errors_emoji} <b>Errors</b> ➛ {stats['errors']}\n"
                 f"📝 <b>Total</b> ➛ {total}\n"
                 f"⏱️ <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             await update_progress(total)
@@ -68596,7 +68679,7 @@ async def autosopi_mass_check_logic(update: Update, context: ContextTypes.DEFAUL
                 f"{errors_emoji_sum} <b>Errors</b> ➛ {stats['errors']}\n\n"
                 f"{id_emoji_sum} <b>Session ID</b> ➛ <code>{session_id}</code>\n"
                 f"{clock_emoji_sum} <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"{skull_emoji_sum} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji_sum} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
 
             await message.reply_text(
@@ -71060,7 +71143,7 @@ async def stripe_charge_v2_mass_check_logic(update: Update, context: ContextType
                 f"{errors_emoji} <b>Errors</b> ➛ {stats['errors']}\n"
                 f"{total_emoji} <b>Total</b> ➛ {total}\n"
                 f"{time_emoji} <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             try:
@@ -72672,7 +72755,7 @@ async def process_chkadd_sites_api(update: Update, context: ContextTypes.DEFAULT
     response += f"📊 Total GOOD sites: {len(site_quality_tracker.good_sites)}\n"
     response += f"📊 Total NORMAL sites: {len(site_quality_tracker.normal_sites)}\n"
     response += f"🌐 Total sites in rotation: {len(autosopi_site_manager.sites)}\n"
-    response += f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+    response += f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
     
     await progress_msg.edit_text(response, parse_mode=ParseMode.HTML, reply_markup=back_menu())
     
@@ -72824,7 +72907,7 @@ async def process_chkadd_enhanced(update: Update, context: ContextTypes.DEFAULT_
     response += f"📊 Total GOOD sites: {len(site_quality_tracker.good_sites)}\n"
     response += f"📊 Total NORMAL sites: {len(site_quality_tracker.normal_sites)}\n"
     response += f"🌐 Total sites in rotation: {len(autosopi_site_manager.sites)}\n"
-    response += f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+    response += f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
     
     await progress_msg.edit_text(response, parse_mode=ParseMode.HTML, reply_markup=back_menu())
     
@@ -73701,7 +73784,7 @@ async def bin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🎯 <b>Type</b> ➛ {card_type}\n"
                 f"{premium_emoji(PREMIUM_EMOJI_IDS['bank'], '🏦')} <b>Bank</b> ➛ {bank}\n"
                 f"{premium_emoji(PREMIUM_EMOJI_IDS['globe'], '🌍')} <b>Country</b> ➛  {country.replace('🌐', '').strip()}\n"
-                f"{premium_emoji(PREMIUM_EMOJI_IDS['declined'], '💀')} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{premium_emoji(PREMIUM_EMOJI_IDS['declined'], '💀')} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             await processing_msg.edit_text(response, parse_mode=ParseMode.HTML)
@@ -73719,7 +73802,7 @@ async def bin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🎯 <b>Type</b> ➛ UNKNOWN\n"
                 f"{premium_emoji(PREMIUM_EMOJI_IDS['bank'], '🏦')} <b>Bank</b> ➛ Unknown\n"
                 f"{premium_emoji(PREMIUM_EMOJI_IDS['globe'], '🌍')} <b>Country</b> ➛ 🌍 Unknown\n"
-                f"{premium_emoji(PREMIUM_EMOJI_IDS['declined'], '💀')} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{premium_emoji(PREMIUM_EMOJI_IDS['declined'], '💀')} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             await processing_msg.edit_text(response, parse_mode=ParseMode.HTML)
@@ -74925,7 +75008,7 @@ def format_whop_response(result: Dict, bin_info: tuple,
         f"  ⤷ {clean_msg}\n"
         f"\n"
         f"{pe('time')} {datetime.now().strftime('%I:%M %p')}\n"
-        f"{pe('skull')} Bot ➛ @BLADESARKS_V3bot"
+        f"{pe('skull')} Bot ➛ @BLADESARKS_v4_bot"
     )
     return ui, status_category
 
@@ -74988,7 +75071,7 @@ async def send_whop_hit_notification(
             f'{pe("id")} <b>User</b> ➛ {user_display}\n'
         )
 
-    keyboard = [[InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_V3bot", style='primary', icon_custom_emoji_id="5427168083074628963")]]
+    keyboard = [[InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_v4_bot", style='primary', icon_custom_emoji_id="5427168083074628963")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     try:
@@ -76222,7 +76305,7 @@ async def sc_mass_check_logic(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"{errors_emoji} <b>Errors</b> ➛ 0\n"
                 f"📝 <b>Total</b> ➛ {total}\n"
                 f"⏱️ <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             await update_progress(total)
@@ -77215,7 +77298,7 @@ async def reftop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
     else:  # refback → back to the Refer & Earn screen
-        bot_username = context.bot.username or "BLADESARKS_V3bot"
+        bot_username = context.bot.username or "BLADESARKS_v4_bot"
         text = build_referral_text(user.id, bot_username)
         keyboard = [
             [InlineKeyboardButton("Leaderboard", callback_data="reftop", style='primary', icon_custom_emoji_id="5188344996356448758")],
@@ -77296,7 +77379,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def refer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show the user's referral link and stats - /refer"""
     user = update.effective_user
-    bot_username = context.bot.username or "BLADESARKS_V3bot"
+    bot_username = context.bot.username or "BLADESARKS_v4_bot"
     text = build_referral_text(user.id, bot_username)
 
     keyboard = [
@@ -77480,7 +77563,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             f"<b>🔮 CONTACT</b>\n"
             f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
-            f"🤖  Bot     <code>@BLADESARKS_V3bot</code>\n"
+            f"🤖  Bot     <code>@BLADESARKS_v4_bot</code>\n"
             f"👤  Dev     <a href=\"https://t.me/lencax\">@lencax</a>\n"
             f"🌐  Group   <a href=\"https://t.me/+a-_7PTkBTe81MGY1\">Join here</a>\n"
             f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
@@ -77499,7 +77582,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ============ REFER & EARN ============
     elif query.data == 'show_refer':
-        bot_username = context.bot.username or "BLADESARKS_V3bot"
+        bot_username = context.bot.username or "BLADESARKS_v4_bot"
         text = build_referral_text(user.id, bot_username)
         keyboard = [
             [InlineKeyboardButton("Leaderboard", callback_data='reftop', style='primary', icon_custom_emoji_id="5188344996356448758")],
@@ -80226,7 +80309,7 @@ async def paypal_mass_check_with_pool(update: Update, context: ContextTypes.DEFA
                     f"{errors_emoji_sum} <b>Errors</b> ➛ 0\n"
                     f"{total_emoji} <b>Total</b> ➛ {total}\n"
                     f"{time_emoji_sum} <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                    f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                    f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
                 )
             else:
                 summary = (
@@ -80237,7 +80320,7 @@ async def paypal_mass_check_with_pool(update: Update, context: ContextTypes.DEFA
                     f"{errors_emoji_sum} <b>Errors</b> ➛ 0\n"
                     f"{total_emoji} <b>Total</b> ➛ {total}\n"
                     f"{time_emoji_sum} <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                    f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                    f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
                 )
             
             await update_progress(total)
@@ -80637,7 +80720,7 @@ async def mass_check_logic(update: Update, context: ContextTypes.DEFAULT_TYPE, c
                 f"{total_emoji} <b>Total</b> ➛ {total}\n"
                 f"📈 <b>Rate</b> ➛ {cards_per_minute:.1f} cards/min\n"
                 f"{time_emoji} <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             await message.reply_text(summary, parse_mode=ParseMode.HTML)
@@ -81594,7 +81677,7 @@ async def mass_check_stripe_auth0(update: Update, context: ContextTypes.DEFAULT_
                 f"├─ /credits - Check balance\n"
                 f"├─ /redeemcredits - Add credits\n"
                 f"└─ /buy - Upgrade\n\n"
-                f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             await message.reply_text(error_msg, parse_mode=ParseMode.HTML)
             return
@@ -82104,7 +82187,7 @@ async def check_and_deduct_credits(
             f"└─ Contact @lencax\n\n"
             f"📊 <b>You need {needed} more credit"
             f"{'s' if needed != 1 else ''}</b>\n"
-            f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+            f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
         )
         print(f"❌ [CREDIT CHECK] Insufficient credits: "
               f"{credits}/{card_count}")
@@ -82198,7 +82281,7 @@ async def check_and_deduct_mass_credits(
             f"└─ Contact @lencax\n\n"
             f"📊 <b>You need {needed} more credit"
             f"{'s' if needed != 1 else ''}</b>\n"
-            f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+            f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
         )
 
     deduct_user_credits(user_id, card_count)
@@ -83798,7 +83881,7 @@ async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"✅ <b>You Have Been Unbanned</b>\n\n"
                     f"Your ban has been lifted. You can now use the bot again.\n"
                     f"━━━━━━━━━━━━━━━━━━━\n"
-                    f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                    f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
                 ),
                 parse_mode=ParseMode.HTML
             )
@@ -84896,7 +84979,7 @@ async def mass_check_stripe_1usd_logic(update: Update, context: ContextTypes.DEF
                 f"{errors_emoji} <b>Errors</b> ➛ 0\n"
                 f"📝 <b>Total</b> ➛ {total}\n"
                 f"⏱️ <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             
             await update_progress(total)
@@ -85954,7 +86037,7 @@ async def mass_check_st1_charge_logic(update: Update, context: ContextTypes.DEFA
                 f"{errors_emoji} <b>Errors</b> ➛ {stats['errors']}\n"
                 f"📝 <b>Total</b> ➛ {total}\n"
                 f"⏱️ <b>Time</b> ➛ {minutes}m {seconds}s\n"
-                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_V3bot"
+                f"{skull_emoji} <b>Bot</b> ➛ @BLADESARKS_v4_bot"
             )
             await update_progress(total)
             await message.reply_text(summary, parse_mode=ParseMode.HTML)
