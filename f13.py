@@ -326,6 +326,10 @@ _UI_ROCKET  = '<tg-emoji emoji-id="6041705726206808304">🚀</tg-emoji>'
 _UI_BIN     = '<tg-emoji emoji-id="5904542823167824187">🗑</tg-emoji>'
 _UI_CLOCK   = '<tg-emoji emoji-id="6267229004311303657">⌛</tg-emoji>'
 
+# Premium emoji used on the FEEDBACK RECEIVED card.
+_UI_THUMBSUP = '<tg-emoji emoji-id="5465465194056525619">👍</tg-emoji>'
+_UI_CROWN    = '<tg-emoji emoji-id="6235252066554484059">👑</tg-emoji>'
+
 
 def _ui_lead_icon(status_text, default: str = "⌛") -> str:
     """Return the leading emoji (or premium-emoji tag) from a status string.
@@ -17452,6 +17456,61 @@ def parse_card_stco(line: str) -> Optional[Dict]:
         return None
     return {"cc": cc, "month": month, "year": year, "cvv": cvv}
 
+
+# ============ /stco BIN MODE — RANDOM CARD GENERATION ============
+# /stco accepts either full cards (cc|mm|yy|cvv) or a numeric BIN/prefix. When a
+# BIN is given, the remaining PAN digits, the expiry and the CVV are
+# generated randomly and STCO_BIN_GEN_COUNT cards are checked.
+STCO_BIN_GEN_COUNT = 10
+
+
+def _luhn_check_digit_stco(partial: str) -> str:
+    """Return the Luhn check digit that completes ``partial``."""
+    total = 0
+    for i, ch in enumerate(reversed(partial)):
+        d = int(ch)
+        if i % 2 == 0:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return str((10 - (total % 10)) % 10)
+
+
+def generate_cards_from_bin_stco(bin_str: str,
+                                 count: int = STCO_BIN_GEN_COUNT) -> list:
+    """Generate ``count`` random, Luhn-valid cards from a BIN.
+
+    The BIN is kept as the leading digits; the rest of the PAN, the expiry
+    month/year and the CVV are randomised. Amex BINs (34/37) produce a
+    15-digit PAN with a 4-digit CVV, everything else 16-digit with 3.
+    """
+    bin_digits = re.sub(r'\D', '', bin_str or '')
+    if len(bin_digits) < 6:
+        return []
+
+    is_amex = bin_digits[:2] in ('34', '37')
+    pan_len = 15 if is_amex else 16
+    cvv_len = 4 if is_amex else 3
+
+    cards = []
+    for _ in range(max(1, int(count))):
+        if len(bin_digits) >= pan_len - 1:
+            partial = bin_digits[:pan_len - 1]
+        else:
+            fill = pan_len - 1 - len(bin_digits)
+            partial = bin_digits + ''.join(
+                random.choice('0123456789') for _ in range(fill)
+            )
+        cc = partial + _luhn_check_digit_stco(partial)
+        month = f"{random.randint(1, 12):02d}"
+        year = f"{(datetime.now().year + random.randint(1, 5)) % 100:02d}"
+        cvv = ''.join(random.choice('0123456789') for _ in range(cvv_len))
+        cards.append({"cc": cc, "month": month, "year": year, "cvv": cvv})
+
+    return cards
+
+
 def get_stripe_user_proxy(user_id: int) -> Optional[str]:
     """Get a working proxy for the user - with better error handling"""
     try:
@@ -18279,10 +18338,13 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  <code>/stco &lt;url&gt;</code> - Get checkout info\n"
             "  <code>/stco &lt;url&gt; &lt;card&gt;</code> - Charge single card\n"
             "  <code>/stco &lt;url&gt; &lt;card1&gt; &lt;card2&gt; ...</code> - Charge multiple\n"
+            f"  <code>/stco &lt;url&gt; &lt;bin&gt;</code> - Generate {STCO_BIN_GEN_COUNT} cards from a BIN (6+ digits) &amp; check them\n"
             "  Reply to .txt file with <code>/stco &lt;url&gt;</code>\n"
             "  Reply to a Stripe URL with <code>/stco &lt;card&gt;</code>\n\n"
             "Card format: <code>cc|mm|yy|cvv</code>\n"
-            "Example: <code>/stco https://checkout.stripe.com/xxx 4242424242424242|12|26|123</code>\n\n"
+            "BIN format: <code>601100</code> or <code>374355129</code> (6+ digits — rest generated randomly)\n"
+            "Example: <code>/stco https://checkout.stripe.com/xxx 4242424242424242|12|26|123</code>\n"
+            "Example: <code>/stco https://checkout.stripe.com/xxx 601100</code>\n\n"
             "Proxy: <code>/addproxy user:pass@host:port</code>\n"
             "",
             parse_mode=ParseMode.HTML
@@ -18318,25 +18380,42 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 await message.reply_text(f"❌ Failed to read file: {str(e)[:50]}")
                 return
-    
+
+    # ── BIN MODE ─────────────────────────────────────────────────────────
+    # A lone numeric token after the URL (e.g. /stco <url> 601100) is a BIN.
+    # Generate STCO_BIN_GEN_COUNT random cards from it (remaining PAN digits,
+    # expiry and CVV randomised) and check them, so the same command supports
+    # both the full-card format and the BIN format.
+    _bin_tokens = []
+    _scan_tokens = list(args) + [
+        _tok for _ln in lines[1:] for _tok in _ln.split()
+    ]
+    for _tok in _scan_tokens:
+        _tok_clean = _tok.strip().strip('.,;:')
+        if re.fullmatch(r'\d{6,11}', _tok_clean) and _tok_clean not in _bin_tokens:
+            _bin_tokens.append(_tok_clean)
+
+    for _bin in _bin_tokens:
+        _gen_cards = generate_cards_from_bin_stco(_bin, count=STCO_BIN_GEN_COUNT)
+        if _gen_cards:
+            cards.extend(_gen_cards)
+            print(f"🎲 [BIN] {_bin} → generated {len(_gen_cards)} cards")
+
     if not cards:
         await message.reply_text("❌ No valid cards found")
         return
     
     print(f"📊 Found {len(cards)} cards to check")
     
-    # Check proxy
+    # Proxy: prefer the admin-shared proxy, then the caller's own proxy.
+    # When neither exists we fall back to a DIRECT connection (proxy=None is
+    # already supported end-to-end by stco_tls.get_client / the charge funcs)
+    # instead of refusing to run.
     user_proxy = get_stco_proxy(user_id)
-    if not user_proxy:
-        await message.reply_text(
-            "❌ No proxy found.\n\n"
-            "The admin hasn't set a shared proxy yet, and you have none of your own.\n"
-            "Set one with: /addproxy user:pass@host:port",
-            parse_mode=ParseMode.HTML
-        )
-        return
-    
-    print(f"🔌 Using proxy: {mask_proxy(user_proxy)}")
+    if user_proxy:
+        print(f"🔌 Using proxy: {mask_proxy(user_proxy)}")
+    else:
+        print("🌐 [stco] No proxy configured — using DIRECT connection")
     
     # Get checkout info WITHOUT consuming session
     checkout_data = await get_checkout_info_stco(url)
@@ -43912,17 +43991,14 @@ async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Build feedback header
     feedback_header = (
-        f" #  <b>FEEDBACK RECEIVED</b>\n"
-        f"<b>From</b> ➛ {user_mention}\n"
-        f"<b>Tier</b> ➛ {tier_emoji} {tier.upper()}\n"
+        f"<b>FEEDBACK RECEIVED</b>  {_UI_THUMBSUP}\n"
+        f"<b>From</b> ➛ {user_mention} {_UI_CROWN}\n"
     )
     
     # Add extra text if provided
     if user_extra_text:
         feedback_header += f"📧 <b>Message</b> ➛ {user_extra_text}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     
-    feedback_header += f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
-
     fid = _next_feedback_id()
     review_kb = _feedback_review_keyboard(fid)
 
@@ -44275,8 +44351,8 @@ async def feedback_text_command(update: Update, context: ContextTypes.DEFAULT_TY
     fid = _next_feedback_id()
     review_kb = _feedback_review_keyboard(fid)
     feedback_message = (
-        f" #  <b>FEEDBACK RECEIVED</b>\n"
-        f"<b>From</b> ➛ {user_mention}\n"
+        f"<b>FEEDBACK RECEIVED</b>  {_UI_THUMBSUP}\n"
+        f"<b>From</b> ➛ {user_mention} {_UI_CROWN}\n"
         f"<b>Feedback</b> ➛ {feedback_text}\n"
     )
     
@@ -44365,8 +44441,8 @@ async def feedback_text_command(update: Update, context: ContextTypes.DEFAULT_TY
     
     # Build feedback message
     feedback_message = (
-        f" #  <b>FEEDBACK RECEIVED</b>\n"
-        f"<b>From</b> ➛ {user_mention}\n"
+        f"<b>FEEDBACK RECEIVED</b>  {_UI_THUMBSUP}\n"
+        f"<b>From</b> ➛ {user_mention} {_UI_CROWN}\n"
         f"<b>Feedback</b> ➛ {feedback_text}\n"
     )
     
@@ -82693,15 +82769,13 @@ async def process_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Build feedback header
     feedback_header = (
-        f" #  <b>FEEDBACK RECEIVED</b>\n"
-        f"<b>From</b> ➛ {user_mention}\n"
+        f"<b>FEEDBACK RECEIVED</b>  {_UI_THUMBSUP}\n"
+        f"<b>From</b> ➛ {user_mention} {_UI_CROWN}\n"
     )
     
     # Add extra text if provided
     if user_extra_text:
         feedback_header += f"📧 <b>Message</b> ➛ {user_extra_text}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    
-    feedback_header += f"💀 <b>Bot</b> ➛ @BLADESARKS_V3bot"
     
     try:
         # Handle different types of replied messages
@@ -82891,8 +82965,8 @@ async def feedback_text_command(update: Update, context: ContextTypes.DEFAULT_TY
     
     # Build feedback message
     feedback_message = (
-        f" #  <b>FEEDBACK RECEIVED</b>\n"
-        f"<b>From</b> ➛ {user_mention}\n"
+        f"<b>FEEDBACK RECEIVED</b>  {_UI_THUMBSUP}\n"
+        f"<b>From</b> ➛ {user_mention} {_UI_CROWN}\n"
         f"<b>Feedback</b> ➛ {feedback_text}\n"
     )
     
