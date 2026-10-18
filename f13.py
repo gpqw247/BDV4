@@ -52675,28 +52675,35 @@ payment_session_manager = PaymentSessionManager()
 # ============ BUY COMMAND - COMPLETE FLOW ============
 
 async def buy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show pricing plans with premium emojis - /buy"""
-    
-    if not await verify_group_access(update, context):
-        return
-    
+    """Show pricing plans with premium emojis - /buy
+
+    Deliberately NOT gated by verify_group_access: buying must be available to
+    everyone, everywhere — including private chats / DMs. The gate is also
+    wrong for button presses, because it inspects the *button message's* text
+    (e.g. "💰 PREMIUM PLANS") instead of the command, which made it fall
+    through to the private-chat FREE wall and show "Access Required".
+    """
     user_id = update.effective_user.id
     user = update.effective_user
     username = user.username or user.first_name
     
     money_emoji  = premium_emoji(PREMIUM_EMOJI_IDS.get("money", "5197434882321567830"), "💰")
-    fire_emoji   = premium_emoji(PREMIUM_EMOJI_IDS.get("fire",  "5211438057774783669"), "🔥")
+    # Plan emojis — premium custom emoji (the plain emoji is the fallback shown
+    # to users without Telegram Premium).
+    fire_emoji   = premium_emoji("6264785189394717307", "🔥")
+    crown_emoji  = premium_emoji("6235252066554484059", "👑")
+    trophy_emoji = premium_emoji("5188344996356448758", "🏆")
 
     message = (
         f"{money_emoji} <b>PREMIUM PLANS</b>\n"
         f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
         f"{fire_emoji}  <b>Test</b>\n"
-        f"<code>    $2  ·  1 day  ·  Trial</code>\n\n"
-        f"⚡  <b>Lite</b>\n"
+        f"<code>    $2  ·  1 day</code>\n"
+        f"{fire_emoji}  <b>Lite</b>\n"
         f"<code>    $5  ·  7 days</code>\n\n"
-        f"👑  <b>Crown</b>\n"
+        f"{crown_emoji}  <b>Crown</b>\n"
         f"<code>    $10 ·  15 days</code>\n\n"
-        f"😈  <b>Member</b>\n"
+        f"{trophy_emoji}  <b>Member</b>\n"
         f"<code>    $20 ·  30 days</code>\n"
         f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
         f"Select a plan below to continue"
@@ -74205,6 +74212,21 @@ BT_TOKENIZE_URL = "https://api.basistheory.com/tokenize"
 BASIS_KEY       = "key_prod_us_pub_Ew4Bw1f81FPoqphvpuX1VR"
 WHOP_RETURN_URL = "https://whop.com/order-complete"
 
+# ── /whop BIN MODE ──────────────────────────────────────────────────────────
+# A lone numeric token after the URL (e.g. /whop <url> 517805) is treated as
+# a BIN: the rest of the PAN, the expiry and the CVV are generated randomly
+# and checked, so the command supports both full cards and BINs.
+WHOP_BIN_GEN_COUNT = 10
+
+
+def whop_generate_cards_from_bin(bin_str: str,
+                                 count: int = WHOP_BIN_GEN_COUNT) -> List[str]:
+    """Return ``count`` random, Luhn-valid cards formatted cc|mm|yy|cvv."""
+    return [
+        f"{c['cc']}|{c['month']}|{c['year']}|{c['cvv']}"
+        for c in generate_cards_from_bin_stco(bin_str, count=count)
+    ]
+
 WHOP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
            "AppleWebKit/537.36 (KHTML, like Gecko) "
            "Chrome/131.0.0.0 Safari/537.36")
@@ -75104,7 +75126,6 @@ async def send_whop_hit_notification(
 #  /whop COMMAND
 # ═══════════════════════════════════════════════════════════════════════════
 
-@check_gateway("whop")
 # ═══════════════════════════════════════════════════════════════════════════
 #  SAFE STRING COERCION (prevents HTML parse errors from coroutines/None)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -75167,7 +75188,6 @@ def _whop_status_label(status: str, message: str) -> str:
 #  • Fires hit notification for CHARGED and INSUFFICIENT_FUNDS
 # ═══════════════════════════════════════════════════════════════════════════
 
-@check_gateway("whop")
 def _whop_extract_url_from_message(msg) -> Optional[str]:
     """Pull a Whop checkout URL out of a Telegram message.
 
@@ -75209,9 +75229,10 @@ def _whop_extract_url_from_message(msg) -> Optional[str]:
     return None
 
 
+@check_gateway("whop")
 async def whop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Whop Checkout Hitter — /whop <url> <card1> <card2> ...
+    Whop Checkout Hitter — /whop <url> <card1> <card2> ... | /whop <url> <bin>
     Single live-edited progress message with running card list.
     """
     print("\n" + "=" * 80)
@@ -75310,18 +75331,20 @@ async def whop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if not context.args:
+    if not context.args and not message.reply_to_message:
         await message.reply_text(
             "💳 <b>Whop Checkout Hitter</b>\n\n"
             "Usage: <code>/whop &lt;url&gt; &lt;card1&gt; &lt;card2&gt; ...</code>\n"
             "Reply: <b>reply</b> to a message with a Whop URL and send "
-            "<code>/whop &lt;card&gt;</code>\n\n"
+            "<code>/whop &lt;card&gt;</code> or <code>/whop &lt;bin&gt;</code>\n\n"
             "Supported URL formats:\n"
             "• <code>https://whop.com/checkout/plan_XXX</code>\n"
             "• <code>https://store.whop.site/checkout/plan_XXX</code>\n"
             "• <code>https://whop.com/{store}/products/{slug}</code>\n"
             "• <code>https://whop.com/{store}/{slug}</code>\n\n"
-            "Card format: <code>cc|mm|yy|cvv</code>",
+            "Card format: <code>cc|mm|yy|cvv</code>\n"
+            f"BIN format: <code>517805</code> — generates {WHOP_BIN_GEN_COUNT} "
+            "cards from the BIN &amp; checks them",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -75387,10 +75410,31 @@ async def whop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if card:
                     cards.append(card)
 
+    # ── BIN MODE ───────────────────────────────────────────────────────
+    # A lone numeric token (6–11 digits) is a BIN rather than a card:
+    # generate WHOP_BIN_GEN_COUNT random cards from it and check those.
+    _bin_tokens: List[str] = []
+    _scan_tokens = list(args[card_index:]) if card_index < len(args) else []
+    if message.reply_to_message:
+        _replied_txt = (message.reply_to_message.text
+                        or message.reply_to_message.caption or "")
+        _scan_tokens += _replied_txt.split()
+    for _tok in _scan_tokens:
+        _tok_clean = _tok.strip().strip('.,;:')
+        if re.fullmatch(r'\d{6,11}', _tok_clean) and _tok_clean not in _bin_tokens:
+            _bin_tokens.append(_tok_clean)
+
+    for _bin in _bin_tokens:
+        _gen_cards = whop_generate_cards_from_bin(_bin, count=WHOP_BIN_GEN_COUNT)
+        if _gen_cards:
+            cards.extend(_gen_cards)
+            print(f"🎲 [WHOP BIN] {_bin} → generated {len(_gen_cards)} cards")
+
     if not cards:
         await message.reply_text(
             "❌ <b>No valid cards found</b>\n\n"
-            "Card format: <code>cc|mm|yy|cvv</code>",
+            "Card format: <code>cc|mm|yy|cvv</code>\n"
+            "BIN format: <code>517805</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -75440,20 +75484,23 @@ async def whop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                              if hitting 
                              else f'<tg-emoji emoji-id="{clock_id}">⌛</tg-emoji>')
 
+            # Same styling convention as /stco: card numbers are monospace
+            # (tap-to-copy) and every other text run is bold. Premium-emoji
+            # tags stay OUTSIDE the <b> wrapper, exactly like /stco.
             header = (
-                f"<b>Site</b> ➳ Whop {diamond_emoji}\n"
-                f"<b>Amount</b> ➳ {_safe_str(amount_display)} USD\n"
-                f"<b>Status</b> ➳ {status_word} {status_emoji}\n"
-                f"<b>Progress</b> ➳ {progress_count}/{total_cards}\n"
+                f"<b>Site</b> ➳ <b>Whop</b> {diamond_emoji}\n"
+                f"<b>Amount</b> ➳ <b>{_safe_str(amount_display)} USD</b>\n"
+                f"<b>Status</b> ➳ <b>{status_word}</b> {status_emoji}\n"
+                f"<b>Progress</b> ➳ <b>{progress_count}/{total_cards}</b>\n"
             )
 
             if not card_results:
-                return header + "\n<i>Starting…</i>"
+                return header + "\n<b>Starting…</b>"
 
             body_lines = []
             for c, reason in card_results:
                 body_lines.append(
-                    f"{_safe_str(c)}\n  ⤷ {_safe_str(reason)}"
+                    f"<code>{_safe_str(c)}</code>\n  ⤷ <b>{_safe_str(reason)}</b>"
                 )
             body = "\n".join(body_lines)
 
@@ -77478,15 +77525,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ============ PLANS ============
     elif query.data == 'show_plans':
         money_emoji  = premium_emoji(PREMIUM_EMOJI_IDS.get("money", "5197434882321567830"), "💰")
-        fire_emoji   = premium_emoji(PREMIUM_EMOJI_IDS.get("fire",  "5211438057774783669"), "🔥")
+        fire_emoji   = premium_emoji("6264785189394717307", "🔥")
+        crown_emoji  = premium_emoji("6235252066554484059", "👑")
+        trophy_emoji = premium_emoji("5188344996356448758", "🏆")
 
         text = (
             f"{money_emoji} <b>PREMIUM PLANS</b>\n"
             f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
             f"{fire_emoji}  <b>Test</b>    · $2  · 1 day\n"
-            f"⚡  <b>Lite</b>    · $5  · 7 days\n"
-            f"👑  <b>Crown</b>   · $10 · 15 days\n"
-            f"😈  <b>Member</b>  · $20 · 30 days\n"
+            f"{fire_emoji}  <b>Lite</b>    · $5  · 7 days\n"
+            f"{crown_emoji}  <b>Crown</b>   · $10 · 15 days\n"
+            f"{trophy_emoji}  <b>Member</b>  · $20 · 30 days\n"
             f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
             f"Use <code>/buy</code> to purchase a plan"
         )
@@ -77555,7 +77604,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
 
     # ============ GOTO BUY ============
-    elif query.data == 'goto_buy':
+    elif query.data in ('goto_buy', 'buy_premium'):
         await buy_command(update, context)
     
     # ============ CONTACT ============
@@ -87012,7 +87061,7 @@ def main():
     app.add_handler(CommandHandler("feedback_text", feedback_text_command))
     
     # ============ BUTTON CALLBACKS ============
-    app.add_handler(CallbackQueryHandler(button_callback, pattern='^(show_checker|show_hitter|show_plans|show_profile|show_commands|show_contact|show_refer|goto_buy|back_main)$'))
+    app.add_handler(CallbackQueryHandler(button_callback, pattern='^(show_checker|show_hitter|show_plans|show_profile|show_commands|show_contact|show_refer|goto_buy|buy_premium|back_main)$'))
     
     # ============ TEXT HANDLER ============
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
