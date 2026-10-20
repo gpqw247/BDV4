@@ -12684,12 +12684,15 @@ class GatewayManager:
                     for gateway, data in saved.items():
                         if gateway in self.gateways:
                             self.gateways[gateway]["enabled"] = data.get("enabled", True)
+                            # Proxy support flag set by /offproxy & /onproxy
+                            self.gateways[gateway]["proxy"] = data.get("proxy", True)
                         else:
                             # Restore auto-registered gateways so /on & /off persist
                             self.gateways[gateway] = {
                                 "enabled": data.get("enabled", True),
                                 "name": data.get("name") or gateway.replace("_", " ").title(),
                                 "emoji": data.get("emoji", "💳"),
+                                "proxy": data.get("proxy", True),
                             }
                 print(f"✅ Loaded gateway status from {self.status_file}")
             except Exception as e:
@@ -12704,6 +12707,7 @@ class GatewayManager:
                     "enabled": info["enabled"],
                     "name": info.get("name", gateway),
                     "emoji": info.get("emoji", "💳"),
+                    "proxy": info.get("proxy", True),
                 }
             with open(self.status_file, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -12721,6 +12725,33 @@ class GatewayManager:
         # Unknown gateway - allow by default
         return True
     
+    def is_proxy_enabled(self, gateway: str) -> bool:
+        """True when this gateway is allowed to use proxies.
+
+        Toggled with /offproxy <gateway> and /onproxy <gateway>. Missing
+        entries default to True so existing behaviour is unchanged.
+        """
+        gateway_key = self._map_gateway(gateway)
+        info = self.gateways.get(gateway_key)
+        if not info:
+            return True
+        return bool(info.get("proxy", True))
+
+    def set_proxy_status(self, gateway: str, enabled: bool) -> bool:
+        """Turn proxy support on/off for a gateway (persisted)."""
+        gateway_key = self._map_gateway(gateway)
+        if not gateway_key:
+            return False
+        if gateway_key not in self.gateways:
+            self.gateways[gateway_key] = {
+                "enabled": True,
+                "name": gateway_key.replace("_", " ").title(),
+                "emoji": "💳",
+            }
+        self.gateways[gateway_key]["proxy"] = enabled
+        self.save_status()
+        return True
+
     def _map_gateway(self, gateway: str) -> str:
         """Map command names to gateway keys"""
         gateway_map = {
@@ -12827,6 +12858,8 @@ class GatewayManager:
                 if gw in self.gateways:
                     info = self.gateways[gw]
                     status = "✅ ON" if info["enabled"] else "❌ OFF"
+                    if not info.get("proxy", True):
+                        status += "  🔌 no-proxy"
                     result += f"   {info['emoji']} <code>{gw}</code> ➛ {status}\n"
                     shown.add(gw)
             result += "\n"
@@ -12838,6 +12871,8 @@ class GatewayManager:
             for gw in sorted(extras):
                 info = self.gateways[gw]
                 status = "✅ ON" if info["enabled"] else "❌ OFF"
+                if not info.get("proxy", True):
+                    status += "  🔌 no-proxy"
                 result += f"   {info['emoji']} <code>{gw}</code> ➛ {status}\n"
             result += "\n"
         
@@ -12847,13 +12882,46 @@ class GatewayManager:
         result += "   /on &lt;gateway&gt; - Turn on gateway\n"
         result += "   /gateways - Show status\n"
         result += "   /off all - Turn off ALL gateways\n"
-        result += "   /on all - Turn on ALL gateways"
+        result += "   /on all - Turn on ALL gateways\n"
+        result += "\n"
+        result += "🔌 <b>Proxy per gateway:</b>\n"
+        result += "   /offproxy &lt;gateway&gt; - Direct connection (no proxy)\n"
+        result += "   /onproxy &lt;gateway&gt; - Allow proxy again\n"
+        result += "   /offproxy all / /onproxy all"
         
         return result
 
 
 # ============ CREATE GLOBAL INSTANCE ============
 gateway_manager = GatewayManager()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PER-GATEWAY PROXY SUPPORT  ( /offproxy <gw>  ·  /onproxy <gw> )
+#  The gateway a command belongs to is tagged by @check_gateway below, so
+#  every proxy lookup can ask "is this gateway allowed to use a proxy?".
+#  A ContextVar keeps it task-safe when several users run commands at once.
+# ═══════════════════════════════════════════════════════════════════════════
+import contextvars
+
+_CURRENT_GATEWAY: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "current_gateway", default=None
+)
+
+
+def proxy_enabled_for(gateway: Optional[str]) -> bool:
+    """True when ``gateway`` may use proxies (see /offproxy)."""
+    if not gateway:
+        return True
+    try:
+        return gateway_manager.is_proxy_enabled(gateway)
+    except Exception:
+        return True
+
+
+def proxy_allowed_now() -> bool:
+    """True when the gateway currently executing may use proxies."""
+    return proxy_enabled_for(_CURRENT_GATEWAY.get())
 
 
 # ============ GATEWAY CHECK DECORATOR ============
@@ -12865,22 +12933,27 @@ def check_gateway(gateway_name: str):
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-            # Skip check for owner
-            if update.effective_user.id == OWNER_ID:
+            # Tag the running gateway so proxy lookups honour /offproxy.
+            _gw_token = _CURRENT_GATEWAY.set(gateway_name)
+            try:
+                # Skip check for owner
+                if update.effective_user.id == OWNER_ID:
+                    return await func(update, context, *args, **kwargs)
+                
+                # Check if gateway is enabled
+                if not gateway_manager.is_enabled(gateway_name):
+                    await update.message.reply_text(
+                        f"🚧 <b>Gate under maintenance</b>\n\n"
+                        f"The <code>{gateway_name}</code> gateway is currently disabled.\n\n"
+                        f"Please try again later or use another gateway.\n"
+                        f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot",
+                        parse_mode=ParseMode.HTML
+                    )
+                    return
+                
                 return await func(update, context, *args, **kwargs)
-            
-            # Check if gateway is enabled
-            if not gateway_manager.is_enabled(gateway_name):
-                await update.message.reply_text(
-                    f"🚧 <b>Gate under maintenance</b>\n\n"
-                    f"The <code>{gateway_name}</code> gateway is currently disabled.\n\n"
-                    f"Please try again later or use another gateway.\n"
-                    f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot",
-                    parse_mode=ParseMode.HTML
-                )
-                return
-            
-            return await func(update, context, *args, **kwargs)
+            finally:
+                _CURRENT_GATEWAY.reset(_gw_token)
         return wrapper
     return decorator
 
@@ -13003,6 +13076,111 @@ async def gateways_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     result = gateway_manager.list_gateways()
     await update.message.reply_text(result, parse_mode=ParseMode.HTML, reply_markup=back_menu())
+
+
+async def offproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Disable proxy support for a gateway - /offproxy <gateway>"""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Admin only command.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "🔌 <b>Disable Gateway Proxy</b>\n\n"
+            "Usage: <code>/offproxy &lt;gateway&gt;</code>\n"
+            "Example: <code>/offproxy mpp</code>\n"
+            "Example: <code>/offproxy sq</code>\n"
+            "Example: <code>/offproxy all</code> - Disable proxy for ALL gateways\n\n"
+            "The gateway then runs on a <b>direct connection</b>.\n"
+            "Use <code>/onproxy &lt;gateway&gt;</code> to turn it back on.\n\n"
+            "Use <code>/gateways</code> to see all gateways.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    target = str(context.args[0]).lower()
+
+    if target == "all":
+        count = 0
+        for gw in list(gateway_manager.gateways.keys()):
+            if gateway_manager.set_proxy_status(gw, False):
+                count += 1
+        await update.message.reply_text(
+            f"🔌 <b>Proxy DISABLED for ALL gateways</b>\n\n"
+            f"✅ {count} gateways now use a direct connection.\n\n"
+            f"Use <code>/onproxy all</code> to turn proxies back on.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu()
+        )
+        return
+
+    if gateway_manager.set_proxy_status(target, False):
+        _enabled, name, emoji = gateway_manager.get_status(target)
+        gw_key = gateway_manager._map_gateway(target)
+        await update.message.reply_text(
+            f"🔌 <b>Proxy Turned OFF</b>\n\n"
+            f"{emoji} <code>{gw_key}</code> ({name}) now uses a "
+            f"<b>DIRECT connection</b> — no proxy.\n\n"
+            f"Use <code>/onproxy {target}</code> to turn it back on.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu()
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ Unknown gateway: <code>{target}</code>\n\n"
+            f"Use <code>/gateways</code> to see available gateways.",
+            parse_mode=ParseMode.HTML
+        )
+
+
+async def onproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Enable proxy support for a gateway - /onproxy <gateway>"""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Admin only command.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "🔌 <b>Enable Gateway Proxy</b>\n\n"
+            "Usage: <code>/onproxy &lt;gateway&gt;</code>\n"
+            "Example: <code>/onproxy mpp</code>\n"
+            "Example: <code>/onproxy sq</code>\n"
+            "Example: <code>/onproxy all</code> - Enable proxy for ALL gateways\n\n"
+            "Use <code>/gateways</code> to see all gateways.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    target = str(context.args[0]).lower()
+
+    if target == "all":
+        count = 0
+        for gw in list(gateway_manager.gateways.keys()):
+            if gateway_manager.set_proxy_status(gw, True):
+                count += 1
+        await update.message.reply_text(
+            f"🔌 <b>Proxy ENABLED for ALL gateways</b>\n\n"
+            f"✅ {count} gateways can use proxies again.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu()
+        )
+        return
+
+    if gateway_manager.set_proxy_status(target, True):
+        _enabled, name, emoji = gateway_manager.get_status(target)
+        gw_key = gateway_manager._map_gateway(target)
+        await update.message.reply_text(
+            f"🔌 <b>Proxy Turned ON</b>\n\n"
+            f"{emoji} <code>{gw_key}</code> ({name}) can use proxies again.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu()
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ Unknown gateway: <code>{target}</code>\n\n"
+            f"Use <code>/gateways</code> to see available gateways.",
+            parse_mode=ParseMode.HTML
+        )
 
 
 # ============ ADD TO main() ============
@@ -13027,22 +13205,27 @@ def check_gateway(gateway_name: str):
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-            # Skip check for owner
-            if update.effective_user.id == OWNER_ID:
+            # Tag the running gateway so proxy lookups honour /offproxy.
+            _gw_token = _CURRENT_GATEWAY.set(gateway_name)
+            try:
+                # Skip check for owner
+                if update.effective_user.id == OWNER_ID:
+                    return await func(update, context, *args, **kwargs)
+                
+                # Check if gateway is enabled
+                if not gateway_manager.is_enabled(gateway_name):
+                    await update.message.reply_text(
+                        f"🚧 <b>Gate under maintenance</b>\n\n"
+                        f"The <code>{gateway_name}</code> gateway is currently disabled.\n\n"
+                        f"Please try again later or use another gateway.\n"
+                        f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot",
+                        parse_mode=ParseMode.HTML
+                    )
+                    return
+                
                 return await func(update, context, *args, **kwargs)
-            
-            # Check if gateway is enabled
-            if not gateway_manager.is_enabled(gateway_name):
-                await update.message.reply_text(
-                    f"🚧 <b>Gate under maintenance</b>\n\n"
-                    f"The <code>{gateway_name}</code> gateway is currently disabled.\n\n"
-                    f"Please try again later or use another gateway.\n"
-                    f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot",
-                    parse_mode=ParseMode.HTML
-                )
-                return
-            
-            return await func(update, context, *args, **kwargs)
+            finally:
+                _CURRENT_GATEWAY.reset(_gw_token)
         return wrapper
     return decorator
 
@@ -13177,22 +13360,27 @@ def check_gateway(gateway_name: str):
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-            # Skip check for owner
-            if update.effective_user.id == OWNER_ID:
+            # Tag the running gateway so proxy lookups honour /offproxy.
+            _gw_token = _CURRENT_GATEWAY.set(gateway_name)
+            try:
+                # Skip check for owner
+                if update.effective_user.id == OWNER_ID:
+                    return await func(update, context, *args, **kwargs)
+                
+                # Check if gateway is enabled
+                if not gateway_manager.is_enabled(gateway_name):
+                    await update.message.reply_text(
+                        f"🚧 <b>Gate under maintenance</b>\n\n"
+                        f"The <code>{gateway_name}</code> gateway is currently disabled.\n\n"
+                        f"Please try again later or use another gateway.\n"
+                        f"",
+                        parse_mode=ParseMode.HTML
+                    )
+                    return
+                
                 return await func(update, context, *args, **kwargs)
-            
-            # Check if gateway is enabled
-            if not gateway_manager.is_enabled(gateway_name):
-                await update.message.reply_text(
-                    f"🚧 <b>Gate under maintenance</b>\n\n"
-                    f"The <code>{gateway_name}</code> gateway is currently disabled.\n\n"
-                    f"Please try again later or use another gateway.\n"
-                    f"",
-                    parse_mode=ParseMode.HTML
-                )
-                return
-            
-            return await func(update, context, *args, **kwargs)
+            finally:
+                _CURRENT_GATEWAY.reset(_gw_token)
         return wrapper
     return decorator
 
@@ -18209,6 +18397,10 @@ def get_stco_proxy(user_id: int) -> Optional[str]:
       2. The caller's own proxies (fallback).
     Returns None when neither the admin nor the caller has a proxy.
     """
+    # /offproxy <gateway> → direct connection
+    if not proxy_allowed_now():
+        return None
+
     try:
         proxies = load_stripe_proxies()
     except Exception as e:
@@ -25742,6 +25934,10 @@ class UserManager:
     def can_use_proxy(self, user_id: int,
                        from_ultimate_group: bool = False) -> bool:
         """True if the tier allows it, the group overrides, or a global pool is available."""
+        # /offproxy <gateway> forces a direct connection for that gateway.
+        if not proxy_allowed_now():
+            return False
+
         if from_ultimate_group:
             return True
 
@@ -28735,6 +28931,10 @@ class ProxyManager:
         return len(self.user_proxies.get(user_id, []))
     
     def can_use_proxy(self, user_id: int) -> bool:
+        # /offproxy <gateway> forces a direct connection for that gateway.
+        if not proxy_allowed_now():
+            return False
+
         return user_id in self.user_proxies and bool(self.user_proxies[user_id])
     
     def mark_proxy_for_api(self, user_id: int, proxy: str, api_name: str, is_working: bool):
@@ -32771,6 +32971,10 @@ def get_proxy_for_user(user_id: int, gateway: str = 'default') -> Optional[str]:
     2. Global proxy pool (fallback)
     3. No proxy (direct connection)
     """
+    # /offproxy <gateway> → direct connection
+    if not proxy_allowed_now():
+        return None
+
     # ============ PRIORITY 1: User's personal proxies ============
     if user_id in proxy_manager.user_proxies and proxy_manager.user_proxies[user_id]:
         # Use user's personal proxy
@@ -32795,6 +32999,10 @@ def get_proxy_for_user(user_id: int, gateway: str = 'default') -> Optional[str]:
 
 def get_rotating_proxy_for_user(user_id: int, gateway: str = 'paypal') -> Optional[str]:
     """Get next proxy in rotation for a specific user"""
+    # /offproxy <gateway> → direct connection
+    if not proxy_allowed_now():
+        return None
+
     
     # ============ PRIORITY 1: User's personal proxies ============
     if user_id in proxy_manager.user_proxies and proxy_manager.user_proxies[user_id]:
@@ -32835,6 +33043,10 @@ def get_proxy_for_global_gateway(user_id: int, gateway: str = 'default') -> Opti
     Get proxy ONLY from global pool for /aumc and /sh
     Ignores user's personal proxies completely
     """
+    # /offproxy <gateway> → direct connection
+    if not proxy_allowed_now():
+        return None
+
     print(f"🔍 [GLOBAL ONLY] Getting proxy for user {user_id} (gateway: {gateway})")
     
     # ============ ONLY USE GLOBAL PROXY POOL ============
@@ -32864,6 +33076,11 @@ def get_proxy_with_fallback(user_id: int, gateway: str = 'default', force_global
     Returns:
         Proxy string or None
     """
+    # /offproxy <gateway> → direct connection
+    if not proxy_allowed_now():
+        print(f"🚫 [PROXY WARPER] Proxy disabled for gateway '{gateway}' → direct connection")
+        return None
+
     print(f"🔍 [PROXY WARPER] Looking for proxy for user {user_id} (gateway: {gateway})")
     
     # ============ GLOBAL ONLY MODE FOR /aumc AND /sh ============
@@ -32914,6 +33131,10 @@ def get_proxy_with_fallback_for_api(user_id: int, api_type: str = 'shopify') -> 
     Returns:
         Formatted proxy string or None
     """
+    # /offproxy <gateway> → direct connection
+    if not proxy_allowed_now():
+        return None
+
     raw_proxy = get_proxy_with_fallback(user_id, api_type)
     
     if not raw_proxy:
@@ -38630,20 +38851,8 @@ PAYPAL_KEY_POOL = [
     },
     {
         "name":           "PayPal Key #2",
-        "client_id":      "AdpGwhOWb2JVMWuH-eHgVJssICugBJ4rKWnStNLZYVOniyvojJBa7X0oik5L-0F2ASwUdum5bUNVCtn1",
-        "client_secret":  "EKSFM0d1aNV-Fh5MBApXj4uky5gv2w5ORFDrrQqd36-6GKaTpJcPCAcA5bg507Smvzr39CNW7NXgnh94",
-        "enabled":        True,
-        "fail_count":     0,
-        "success_count":  0,
-        "token":          None,
-        "token_expires":  0,
-        "last_used":      0,
-        "cooldown_until": 0,
-    },
-    {
-        "name":           "PayPal Key #3",
-        "client_id":      "AVaRND-jngUPPnF5jEwcFuBeZvyw8PqJ1sTKkNkseiPJcv249ukN62frI5apjKK_AOA5-HKFBfGUtCZ3",
-        "client_secret":  "EHWGCIsPf6zVCiURQCOXXkOR8jsqxxx5sd_GXjtOGePZJIZJxlW2fqxkSiUVb0tg_l3YoP15qbIHB_3d",
+        "client_id":      "AX2tHdwwYqtVO24Z7rb-9IuXbOD84CJD8QJ8fQvrnUO0W_EfewVxuj3qfkVSW5eQ9o--yn_gFxVLahOR",
+        "client_secret":  "EBPYmQkclX-Im_iG3Cj5_1hfUMG0of6GlltZxFDnkSUKLzVKRPSNBXINSipBUalSwcrv5ByYeuTIX3Kb",
         "enabled":        True,
         "fail_count":     0,
         "success_count":  0,
@@ -38700,6 +38909,10 @@ def _ppk_proxy_url(proxy: str) -> Optional[str]:
 
 def _ppk_pick_proxy(user_id: int) -> Optional[str]:
     """3-tier proxy lookup: tracker → raw user pool → global pool."""
+    # /offproxy <gateway> → direct connection
+    if not proxy_allowed_now():
+        return None
+
     if not user_manager.can_use_proxy(user_id):
         print(f"⚠️ [PPK] User {user_id} not allowed to use proxies")
         return None
@@ -45669,6 +45882,10 @@ async def msh_single_worker(update: Update, context: ContextTypes.DEFAULT_TYPE,
     
 def get_working_proxy_for_shopify_mass(user_id: int, worker_id: str = None) -> Optional[str]:
     """Get a working proxy for MSH from user's proxy pool"""
+    # /offproxy <gateway> → direct connection
+    if not proxy_allowed_now():
+        return None
+
     if user_id not in proxy_manager.user_proxies or not proxy_manager.user_proxies[user_id]:
         return None
     
@@ -52568,6 +52785,10 @@ payment_sessions_file = PAYMENT_SESSIONS_FILE
 class PaymentSessionManager:
     """Manage payment sessions with expiry"""
     
+    # How long a payment stays actionable for the admin after the user says
+    # they have sent it (Confirm / Reject must still work the next day).
+    ADMIN_REVIEW_WINDOW = 24 * 60 * 60  # 24 hours
+
     def __init__(self):
         self.sessions = {}
         self.load_sessions()
@@ -52611,6 +52832,7 @@ class PaymentSessionManager:
             "expires_at": time.time() + self.session_timeout,
             "status": "pending",  # pending, paid, confirmed, expired
             "proof_message_id": None,
+            "request_message_id": None,   # the user's Payment Request message
             "confirmed_at": None
         }
         
@@ -52643,6 +52865,30 @@ class PaymentSessionManager:
         self.save_sessions()
         return True
     
+    def set_request_message(self, user_id: int, message_id: int) -> bool:
+        """Remember the user's Payment Request message so it can be updated
+        later when the admin confirms or rejects."""
+        session = self.get_session(user_id)
+        if not session:
+            return False
+        session["request_message_id"] = message_id
+        self.save_sessions()
+        return True
+
+    def mark_processing(self, user_id: int) -> bool:
+        """User tapped 'I Have Sent'.
+
+        Moves the session to 'paid' (awaiting admin review) and extends it to
+        the 24h admin-review window so Confirm / Reject still work later.
+        """
+        session = self.get_session(user_id)
+        if not session:
+            return False
+        session["status"] = "paid"
+        session["expires_at"] = time.time() + self.ADMIN_REVIEW_WINDOW
+        self.save_sessions()
+        return True
+
     def confirm_payment(self, user_id: int) -> bool:
         """Confirm payment and upgrade user"""
         session = self.get_session(user_id)
@@ -52671,6 +52917,119 @@ class PaymentSessionManager:
 
 # Create global instance
 payment_session_manager = PaymentSessionManager()
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CRYPTO PAYMENT CARD  ( /buy → wallet → "I Have Sent" )
+#  Premium custom emoji, monospace address, bold text — same convention as
+#  the /stco and /whop result cards.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Premium emoji IDs used on the crypto payment card. A missing ID falls back
+# to the plain emoji (so the card still renders while IDs are being added).
+PAYMENT_UI_EMOJI = {
+    "diamond":  "5427168083074628963",   # 💎  Payment Request title
+    "fire":     "6264785189394717307",   # 🔥  Plan
+    "money":    "5197434882321567830",   # 💰  Price
+    "party":    "6266936886405633043",   # 🥳  Network
+    # "address":  (not supplied yet)     # 🎉  Address
+    "alert":    "6267144651153609853",   # 🚨  Expires in
+    "clock":    "6267229004311303657",   # ⌛  Status
+    "approved": "6266967801580231067",   # ✅  Paid
+    "declined": "6267000941547885720",   # 👎  Failed
+}
+
+
+def _pay_emoji(key: str, fallback: str) -> str:
+    """Premium emoji tag for the payment card, or the plain emoji."""
+    eid = PAYMENT_UI_EMOJI.get(key)
+    return premium_emoji(eid, fallback) if eid else fallback
+
+
+def _payment_request_text(session: dict, status_key: str) -> str:
+    """Render the crypto Payment Request card for a given status.
+
+    status_key: 'waiting' | 'processing' | 'paid' | 'failed'
+    The countdown line is only shown while still waiting for the payment.
+    """
+    plan = PAYMENT_PLANS[session["plan_key"]]
+    wallet = PAYMENT_WALLETS[session["wallet_key"]]
+
+    title  = _pay_emoji("diamond", "💎")
+    fire   = _pay_emoji("fire", "🔥")
+    money  = _pay_emoji("money", "💰")
+    party  = _pay_emoji("party", "🥳")
+    addr_e = _pay_emoji("address", "🎉")
+    alert  = _pay_emoji("alert", "🚨")
+    clock  = _pay_emoji("clock", "⌛")
+    ok     = _pay_emoji("approved", "✅")
+    no     = _pay_emoji("declined", "👎")
+
+    status_text = {
+        "waiting":    "Waiting...",
+        "processing": "Processing",
+        "paid":       f"Paid {ok}",
+        "failed":     f"Failed {no}",
+    }.get(status_key, "Waiting...")
+
+    text = (
+        f"{title} <b>Payment Request</b>\n"
+        f"{fire} <b>Plan</b> ➳ <b>{plan['display_name']}</b>\n"
+        f"{money} <b>Price</b> ➳ <b>${plan['price']:.2f} USD</b>\n"
+        f"{party} <b>Network</b> ➳ <b>{wallet['network']}</b>\n"
+        f"{addr_e} <b>Address</b> ➳\n"
+        f"<code>{wallet['address']}</code>\n"
+    )
+
+    if status_key == "waiting":
+        expiry_seconds = max(0, int(session.get("expires_at", 0) - time.time()))
+        minutes, seconds = expiry_seconds // 60, expiry_seconds % 60
+        text += f"{alert} <b>Expires in</b> ➳ <b>{minutes}m {seconds}s</b>\n"
+
+    text += f"{clock} <b>Status</b> ➳ <b>{status_text}</b>"
+    return text
+
+
+async def _edit_user_payment_card(context: ContextTypes.DEFAULT_TYPE,
+                                  user_id: int,
+                                  status_key: str,
+                                  session: Optional[dict] = None,
+                                  message_id: Optional[int] = None) -> None:
+    """Re-render the user's crypto payment card with a new status.
+
+    The Confirm / Reject buttons live on the ADMIN's copy, so this is how the
+    user sees the outcome (Processing → Paid ✅ / Failed 👎).
+    """
+    try:
+        if session is None:
+            session = payment_session_manager.sessions.get(str(user_id))
+        if not session:
+            return
+        if message_id is None:
+            message_id = session.get("request_message_id")
+        if not message_id:
+            return
+
+        text = _payment_request_text(session, status_key)
+        try:
+            # Empty markup removes the inline keyboard (buttons are done with).
+            await context.bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([]),
+            )
+        except Exception:
+            # Fallback: update the text even if the keyboard removal failed.
+            await context.bot.edit_message_text(
+                chat_id=user_id,
+                message_id=message_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+            )
+        print(f"✅ Payment card for user {user_id} → {status_key}")
+    except Exception as e:
+        print(f"⚠️ Could not update payment card for user {user_id}: {e}")
 
 # ============ BUY COMMAND - COMPLETE FLOW ============
 
@@ -52889,28 +53248,8 @@ async def buy_wallet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     minutes = expiry_seconds // 60
     seconds = expiry_seconds % 60
     
-    # Determine crypto amount based on plan price
-    crypto_amount = plan["price"]
-    
-    diamond_emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("diamond", "5427168083074628963"), "💎")
-    skull_emoji = premium_emoji(PREMIUM_EMOJI_IDS["skull"], "💀")
-    money_emoji = premium_emoji(PREMIUM_EMOJI_IDS["money"], "💰")
-    
-    message = (
-        f"{diamond_emoji} <b>Payment Request</b>\n"
-
-        f"👑 <b>Plan</b> ➳ {plan['display_name']}\n"
-        f"{money_emoji} <b>Price</b> ➳ ${plan['price']:.2f} USD\n"
-        f"💵 <b>Pay</b> ➳ {crypto_amount} {wallet['currency']}\n"
-        f"🌐 <b>Network</b> ➳ {wallet['network']}\n"
-
-        f"📤 <b>Address</b> ➳\n"
-        f"<code>{wallet['address']}</code>\n"
-
-        f"⏱️ <b>Expires in</b> ➳ {minutes}m {seconds}s\n"
-        f"📊 <b>Status</b> ➳ ⏳ Waiting...\n"
-
-    )
+    # Payment card — premium emoji, monospace address, bold text
+    message = _payment_request_text(session, "waiting")
     
     keyboard = [
         [
@@ -52925,14 +53264,26 @@ async def buy_wallet_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     await query.edit_message_text(message, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
 
+    # Remember the message so Confirm / Reject can update it later.
+    try:
+        payment_session_manager.set_request_message(user_id, query.message.message_id)
+    except Exception as e:
+        print(f"⚠️ Could not store payment message id: {e}")
+
 
 async def buy_proof_send_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle proof send - ask for screenshot"""
+    """User tapped 'I Have Sent' → card becomes Processing, admin is notified.
+
+    No screenshot is requested any more: the card moves straight to
+    'Processing' and the admin gets the Confirm / Reject notification, which
+    stays actionable for 24 hours.
+    """
     query = update.callback_query
     await query.answer()
-    
+
     user_id = update.effective_user.id
-    
+    user = update.effective_user
+
     session = payment_session_manager.get_session(user_id)
     if not session:
         await query.edit_message_text(
@@ -52942,30 +53293,69 @@ async def buy_proof_send_callback(update: Update, context: ContextTypes.DEFAULT_
             reply_markup=back_menu()
         )
         return
-    
-    plan = PAYMENT_PLANS[session["plan_key"]]
-    
-    message = (
-        f"📸 <b>Send Payment Proof</b>\n"
 
+    plan = PAYMENT_PLANS[session["plan_key"]]
+    wallet = PAYMENT_WALLETS[session["wallet_key"]]
+
+    # Remember which message to update on Confirm / Reject
+    try:
+        payment_session_manager.set_request_message(user_id, query.message.message_id)
+    except Exception as e:
+        print(f"⚠️ Could not store payment message id: {e}")
+
+    # status → paid (awaiting admin), session kept alive for 24h
+    payment_session_manager.mark_processing(user_id)
+
+    # Card → "⌛ Status ➳ Processing"
+    try:
+        await query.edit_message_text(
+            _payment_request_text(session, "processing"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([]),
+        )
+    except Exception as e:
+        print(f"⚠️ Could not set payment card to Processing: {e}")
+        try:
+            await query.edit_message_text(
+                _payment_request_text(session, "processing"),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e2:
+            print(f"⚠️ Processing card fallback failed: {e2}")
+
+    # ============ NOTIFY ADMIN (Confirm / Reject) ============
+    notification = (
+        f"🔔 <b>💳 New Payment Received!</b>\n"
+        f"\n\n"
+        f"👤 <b>User:</b> @{user.username or user.first_name} (ID: {user_id})\n"
         f"👑 <b>Plan:</b> {plan['display_name']}\n"
         f"💰 <b>Amount:</b> ${plan['price']:.2f}\n"
-
-        f"📤 <b>Please send a screenshot of your transaction:</b>\n"
-
-        f"⚠️ <i>Send the screenshot as a photo or document</i>\n"
-
+        f"⏱️ <b>Duration:</b> {plan['duration']} Days\n"
+        f"📤 <b>Wallet:</b> {wallet['name']}\n"
+        f"🌐 <b>Network:</b> {wallet['network']}\n"
+        f"🔐 <b>Address:</b> <code>{wallet['address']}</code>\n"
+        f"📅 <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"🕒 <b>Valid for:</b> 24 hours\n"
+        f"\n\n"
+        f"👇 Use the buttons below to confirm or reject.\n"
+        f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot"
     )
-    
-    keyboard = [
-        [InlineKeyboardButton("Cancel", callback_data='buy_cancel', style='danger', icon_custom_emoji_id="5206121558164573238")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(message, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
-    
-    # Store that user is waiting to send proof
-    context.user_data['waiting_for_payment_proof'] = True
+
+    payment_action_keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Confirm Payment", callback_data=f"confirm_payment_{user_id}", style='success', icon_custom_emoji_id="5902002809573740949"),
+        InlineKeyboardButton("Reject Payment", callback_data=f"reject_payment_{user_id}", style='danger', icon_custom_emoji_id="5206121558164573238"),
+    ]])
+
+    try:
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=notification,
+            parse_mode=ParseMode.HTML,
+            reply_markup=payment_action_keyboard
+        )
+        print(f"✅ New payment notification sent to admin for user {user_id}")
+    except Exception as e:
+        print(f"❌ Failed to notify admin: {e}")
 
 
 async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -53095,6 +53485,9 @@ async def _confirm_payment_core(context: ContextTypes.DEFAULT_TYPE, target_user_
     if not payment_session_manager.confirm_payment(target_user_id):
         return False, "❌ Failed to confirm payment."
 
+    # Update the user's Payment Request card → Paid ✅
+    await _edit_user_payment_card(context, target_user_id, "paid", session=session)
+
     plan = PAYMENT_PLANS[session["plan_key"]]
 
     try:
@@ -53108,11 +53501,9 @@ async def _confirm_payment_core(context: ContextTypes.DEFAULT_TYPE, target_user_
         await context.bot.send_message(
             chat_id=target_user_id,
             text=(
-                f"🎉 <b>Payment Confirmed!</b>\n"
+                f"<b>Payment Confirmed!</b>\n"
                 f"\n"
-                f"👑 <b>Plan:</b> {plan['display_name']}\n"
-                f"⏱️ <b>Duration:</b> {plan['duration']} Days\n"
-                f"💰 <b>Amount:</b> ${plan['price']:.2f}\n"
+                f"<b>YOUR PLAN WAS ACTIVATED</b>   {_pay_emoji('approved', '✅')}"
             ),
             parse_mode=ParseMode.HTML
         )
@@ -53152,7 +53543,12 @@ async def _reject_payment_core(context: ContextTypes.DEFAULT_TYPE, target_user_i
         return False, f"❌ No active payment session found for user {target_user_id}."
 
     plan = PAYMENT_PLANS[session["plan_key"]]
+    _req_msg_id = session.get("request_message_id")
     payment_session_manager.expire_session(target_user_id)
+
+    # Update the user's Payment Request card → Failed 👎
+    await _edit_user_payment_card(context, target_user_id, "failed",
+                                  session=session, message_id=_req_msg_id)
 
     try:
         await context.bot.send_message(
@@ -66050,6 +66446,10 @@ def fix_b3_proxy_format(proxy: str) -> str:
 
 
 def get_working_proxy_for_b3(user_id: int, skip_proxy: str = None) -> Optional[str]:
+    # /offproxy <gateway> → direct connection
+    if not proxy_allowed_now():
+        return None
+
     if user_id not in proxy_manager.user_proxies or not proxy_manager.user_proxies[user_id]:
         return None
     
@@ -70650,6 +71050,10 @@ async def check_card_stripe_charge_v2(card: str, proxy: str = None, retry_count:
 
 def get_different_proxy_for_user(user_id: int, current_proxy: str = None) -> Optional[str]:
     """Get a different proxy for retry (rotate to next proxy)"""
+    # /offproxy <gateway> → direct connection
+    if not proxy_allowed_now():
+        return None
+
     if user_id is None:
         # For single checks without user_id, just return None to try direct connection
         return None
@@ -86972,6 +87376,8 @@ def main():
     # ============ GATEWAY MANAGEMENT COMMANDS ============
     app.add_handler(CommandHandler("off", off_command))
     app.add_handler(CommandHandler("on", on_command))
+    app.add_handler(CommandHandler("offproxy", offproxy_command))
+    app.add_handler(CommandHandler("onproxy", onproxy_command))
     app.add_handler(CommandHandler("gateways", gateways_command))
     
     # ============ PLAN MANAGEMENT COMMANDS ============
