@@ -36913,10 +36913,9 @@ async def sy_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cards = await _cc_collect_cards(update, context)
     if not cards:
         await message.reply_text(
-            "🔥 <b>COUSTOM CHARGED — Single Check</b>\n\n"
+            "🔥 <b>COUSTOM CHARGED </b>\n\n"
             "Usage: <code>/sy &lt;card&gt;</code>\n"
-            "Example: <code>/sy 4031630721650843|06|29|910</code>\n\n"
-            "You can also reply to a card (or a .txt of cards) with <code>/sy</code>.",
+            "",
             parse_mode=ParseMode.HTML,
         )
         return
