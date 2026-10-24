@@ -12675,6 +12675,9 @@ class GatewayManager:
             "payglocal": {"enabled": True, "name": "PayGlocal", "emoji": "💳"},
             "dork": {"enabled": True, "name": "Dork", "emoji": "💳"},
         }
+        # Commands switched off individually with /off <command> (e.g. /off msy).
+        # Kept separate from the gateway flag so /sy keeps working.
+        self.disabled_commands = set()
         self.load_status()
     
     def load_status(self):
@@ -12684,6 +12687,9 @@ class GatewayManager:
                 with open(self.status_file, 'r') as f:
                     saved = json.load(f)
                     for gateway, data in saved.items():
+                        if gateway == "__disabled_commands__":
+                            self.disabled_commands = set(data or [])
+                            continue
                         if gateway in self.gateways:
                             self.gateways[gateway]["enabled"] = data.get("enabled", True)
                             # Proxy support flag set by /offproxy & /onproxy
@@ -12711,6 +12717,9 @@ class GatewayManager:
                     "emoji": info.get("emoji", "💳"),
                     "proxy": info.get("proxy", True),
                 }
+            data["__disabled_commands__"] = sorted(
+                getattr(self, "disabled_commands", set())
+            )
             with open(self.status_file, 'w') as f:
                 json.dump(data, f, indent=2)
             print(f"💾 Saved gateway status to {self.status_file}")
@@ -12726,6 +12735,31 @@ class GatewayManager:
         
         # Unknown gateway - allow by default
         return True
+
+    # ── Per-command switches (/off msy disables ONLY /msy) ───────────────
+    def is_command_enabled(self, command: str) -> bool:
+        """False only when this exact command was switched off."""
+        cmd = str(command or "").lower().lstrip("/").split("@")[0]
+        return cmd not in getattr(self, "disabled_commands", set())
+
+    def set_command_status(self, command: str, enabled: bool) -> bool:
+        """Switch ONE command on/off without touching its gateway."""
+        cmd = str(command or "").lower().lstrip("/").split("@")[0]
+        if not cmd:
+            return False
+        if not hasattr(self, "disabled_commands"):
+            self.disabled_commands = set()
+        if enabled:
+            self.disabled_commands.discard(cmd)
+        else:
+            self.disabled_commands.add(cmd)
+        self.save_status()
+        return True
+
+    def is_command_alias(self, name: str) -> bool:
+        """True when `name` is a command (msy/shsy/msh) and not a gateway key."""
+        token = str(name or "").lower().lstrip("/")
+        return bool(token) and token != self._map_gateway(token)
     
     def is_proxy_enabled(self, gateway: str) -> bool:
         """True when this gateway is allowed to use proxies.
@@ -12884,6 +12918,12 @@ class GatewayManager:
         result += "   /off &lt;gateway&gt; - Turn off gateway\n"
         result += "   /on &lt;gateway&gt; - Turn on gateway\n"
         result += "   /gateways - Show status\n"
+        _off_cmds = sorted(getattr(self, "disabled_commands", set()))
+        if _off_cmds:
+            result += "\n<b>🚧 Disabled commands</b>\n"
+            for _c in _off_cmds:
+                result += f"   /{_c}\n"
+            result += "   <i>(other commands of those gateways still work)</i>\n"
         result += "   /off all - Turn off ALL gateways\n"
         result += "   /on all - Turn on ALL gateways\n"
         result += "\n"
@@ -12936,6 +12976,28 @@ def check_gateway(gateway_name: str):
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+            # ── Per-command switch: /off msy disables ONLY /msy ──────────
+            _cmd = ""
+            try:
+                _m = update.effective_message
+                _t = getattr(_m, "text", None) if _m else None
+                if _t and _t.startswith("/"):
+                    _cmd = _t.split()[0][1:].split("@")[0].lower()
+            except Exception:
+                _cmd = ""
+
+            if _cmd and not gateway_manager.is_command_enabled(_cmd):
+                try:
+                    await update.effective_message.reply_text(
+                        f"🚧 <b>Command turned off</b>\n\n"
+                        f"<code>/{_cmd}</code> is currently disabled by the admin.\n\n"
+                        f"Other commands keep working.",
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    pass
+                return
+
             # Tag the running gateway so proxy lookups honour /offproxy.
             _gw_token = _CURRENT_GATEWAY.set(gateway_name)
             try:
@@ -12976,6 +13038,10 @@ async def off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Example: <code>/off aumc</code>\n"
             "Example: <code>/off paypal</code>\n"
             "Example: <code>/off all</code> - Turn off ALL gateways\n\n"
+            "One command only: <code>/off msy</code> — turns off <b>/msy</b> "
+            "while <b>/sy</b> keeps working.\n"
+            "Whole gateway   : <code>/off coustom_charged</code> — turns off "
+            "both /sy and /msy.\n\n"
             "Use <code>/gateways</code> to see all gateways.",
             parse_mode=ParseMode.HTML
         )
@@ -12999,7 +13065,25 @@ async def off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Turn off specific gateway
+    # ── Command-level switch: /off msy disables ONLY /msy ───────────────
+    # Any alias that maps to a different gateway key is a COMMAND
+    # (msy -> coustom_charged, msh -> shopify), so only that command goes off
+    # while the rest of the gateway keeps working.
+    if gateway_manager.is_command_alias(gateway):
+        gateway_manager.set_command_status(gateway, False)
+        gateway_key = gateway_manager._map_gateway(gateway)
+        await update.message.reply_text(
+            f"🔴 <b>Command Turned OFF</b>\n\n"
+            f"<code>/{gateway}</code> is now <b>DISABLED</b>.\n"
+            f"Gateway <code>{gateway_key}</code> is still <b>ON</b> — "
+            f"its other commands keep working.\n\n"
+            f"Use <code>/on {gateway}</code> to turn it back on.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu()
+        )
+        return
+
+    # Turn off specific gateway (all of its commands)
     if gateway_manager.set_status(gateway, False):
         enabled, name, emoji = gateway_manager.get_status(gateway)
         await update.message.reply_text(
@@ -13031,6 +13115,9 @@ async def on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Example: <code>/on aumc</code>\n"
             "Example: <code>/on paypal</code>\n"
             "Example: <code>/on all</code> - Turn on ALL gateways\n\n"
+            "One command only: <code>/on msy</code> — re-enables just "
+            "<b>/msy</b>.\n"
+            "Whole gateway   : <code>/on coustom_charged</code>.\n\n"
             "Use <code>/gateways</code> to see all gateways.",
             parse_mode=ParseMode.HTML
         )
@@ -13044,16 +13131,35 @@ async def on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for gw in gateway_manager.gateways:
             if gateway_manager.set_status(gw, True):
                 count += 1
-        
+        # also lift every per-command switch, so /on all is a full reset
+        _cmds = len(getattr(gateway_manager, "disabled_commands", set()))
+        if _cmds:
+            gateway_manager.disabled_commands.clear()
+            gateway_manager.save_status()
+
         await update.message.reply_text(
             f"🟢 <b>All Gateways Turned ON</b>\n\n"
-            f"✅ {count} gateways enabled.",
+            f"✅ {count} gateways enabled."
+            + (f"\n✅ {_cmds} disabled command(s) re-enabled." if _cmds else ""),
             parse_mode=ParseMode.HTML,
             reply_markup=back_menu()
         )
         return
     
-    # Turn on specific gateway
+    # ── Command-level switch: /on msy re-enables ONLY /msy ──────────────
+    if gateway_manager.is_command_alias(gateway):
+        gateway_manager.set_command_status(gateway, True)
+        gateway_key = gateway_manager._map_gateway(gateway)
+        await update.message.reply_text(
+            f"🟢 <b>Command Turned ON</b>\n\n"
+            f"<code>/{gateway}</code> is <b>ENABLED</b> again "
+            f"(gateway <code>{gateway_key}</code>).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu()
+        )
+        return
+
+    # Turn on specific gateway (all of its commands)
     if gateway_manager.set_status(gateway, True):
         enabled, name, emoji = gateway_manager.get_status(gateway)
         await update.message.reply_text(
@@ -13208,6 +13314,28 @@ def check_gateway(gateway_name: str):
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+            # ── Per-command switch: /off msy disables ONLY /msy ──────────
+            _cmd = ""
+            try:
+                _m = update.effective_message
+                _t = getattr(_m, "text", None) if _m else None
+                if _t and _t.startswith("/"):
+                    _cmd = _t.split()[0][1:].split("@")[0].lower()
+            except Exception:
+                _cmd = ""
+
+            if _cmd and not gateway_manager.is_command_enabled(_cmd):
+                try:
+                    await update.effective_message.reply_text(
+                        f"🚧 <b>Command turned off</b>\n\n"
+                        f"<code>/{_cmd}</code> is currently disabled by the admin.\n\n"
+                        f"Other commands keep working.",
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    pass
+                return
+
             # Tag the running gateway so proxy lookups honour /offproxy.
             _gw_token = _CURRENT_GATEWAY.set(gateway_name)
             try:
@@ -13248,6 +13376,10 @@ async def off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Example: <code>/off aumc</code>\n"
             "Example: <code>/off paypal</code>\n"
             "Example: <code>/off all</code> - Turn off ALL gateways\n\n"
+            "One command only: <code>/off msy</code> — turns off <b>/msy</b> "
+            "while <b>/sy</b> keeps working.\n"
+            "Whole gateway   : <code>/off coustom_charged</code> — turns off "
+            "both /sy and /msy.\n\n"
             "Use <code>/gateways</code> to see all gateways.",
             parse_mode=ParseMode.HTML
         )
@@ -13271,7 +13403,25 @@ async def off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Turn off specific gateway
+    # ── Command-level switch: /off msy disables ONLY /msy ───────────────
+    # Any alias that maps to a different gateway key is a COMMAND
+    # (msy -> coustom_charged, msh -> shopify), so only that command goes off
+    # while the rest of the gateway keeps working.
+    if gateway_manager.is_command_alias(gateway):
+        gateway_manager.set_command_status(gateway, False)
+        gateway_key = gateway_manager._map_gateway(gateway)
+        await update.message.reply_text(
+            f"🔴 <b>Command Turned OFF</b>\n\n"
+            f"<code>/{gateway}</code> is now <b>DISABLED</b>.\n"
+            f"Gateway <code>{gateway_key}</code> is still <b>ON</b> — "
+            f"its other commands keep working.\n\n"
+            f"Use <code>/on {gateway}</code> to turn it back on.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu()
+        )
+        return
+
+    # Turn off specific gateway (all of its commands)
     if gateway_manager.set_status(gateway, False):
         enabled, name, emoji = gateway_manager.get_status(gateway)
         await update.message.reply_text(
@@ -13303,6 +13453,9 @@ async def on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Example: <code>/on aumc</code>\n"
             "Example: <code>/on paypal</code>\n"
             "Example: <code>/on all</code> - Turn on ALL gateways\n\n"
+            "One command only: <code>/on msy</code> — re-enables just "
+            "<b>/msy</b>.\n"
+            "Whole gateway   : <code>/on coustom_charged</code>.\n\n"
             "Use <code>/gateways</code> to see all gateways.",
             parse_mode=ParseMode.HTML
         )
@@ -13316,16 +13469,35 @@ async def on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for gw in gateway_manager.gateways:
             if gateway_manager.set_status(gw, True):
                 count += 1
-        
+        # also lift every per-command switch, so /on all is a full reset
+        _cmds = len(getattr(gateway_manager, "disabled_commands", set()))
+        if _cmds:
+            gateway_manager.disabled_commands.clear()
+            gateway_manager.save_status()
+
         await update.message.reply_text(
             f"🟢 <b>All Gateways Turned ON</b>\n\n"
-            f"✅ {count} gateways enabled.",
+            f"✅ {count} gateways enabled."
+            + (f"\n✅ {_cmds} disabled command(s) re-enabled." if _cmds else ""),
             parse_mode=ParseMode.HTML,
             reply_markup=back_menu()
         )
         return
     
-    # Turn on specific gateway
+    # ── Command-level switch: /on msy re-enables ONLY /msy ──────────────
+    if gateway_manager.is_command_alias(gateway):
+        gateway_manager.set_command_status(gateway, True)
+        gateway_key = gateway_manager._map_gateway(gateway)
+        await update.message.reply_text(
+            f"🟢 <b>Command Turned ON</b>\n\n"
+            f"<code>/{gateway}</code> is <b>ENABLED</b> again "
+            f"(gateway <code>{gateway_key}</code>).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu()
+        )
+        return
+
+    # Turn on specific gateway (all of its commands)
     if gateway_manager.set_status(gateway, True):
         enabled, name, emoji = gateway_manager.get_status(gateway)
         await update.message.reply_text(
@@ -13363,6 +13535,28 @@ def check_gateway(gateway_name: str):
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+            # ── Per-command switch: /off msy disables ONLY /msy ──────────
+            _cmd = ""
+            try:
+                _m = update.effective_message
+                _t = getattr(_m, "text", None) if _m else None
+                if _t and _t.startswith("/"):
+                    _cmd = _t.split()[0][1:].split("@")[0].lower()
+            except Exception:
+                _cmd = ""
+
+            if _cmd and not gateway_manager.is_command_enabled(_cmd):
+                try:
+                    await update.effective_message.reply_text(
+                        f"🚧 <b>Command turned off</b>\n\n"
+                        f"<code>/{_cmd}</code> is currently disabled by the admin.\n\n"
+                        f"Other commands keep working.",
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    pass
+                return
+
             # Tag the running gateway so proxy lookups honour /offproxy.
             _gw_token = _CURRENT_GATEWAY.set(gateway_name)
             try:
