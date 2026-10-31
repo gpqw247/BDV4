@@ -772,6 +772,12 @@ session_recovery = SessionRecovery()
 
 GLOBAL_PROXY_ONLY_MODE = True
 
+# Hot-path debug switch. The per-card Shopify worker used to print 4-6 lines
+# for EVERY attempt; with several users mass-checking at high concurrency that
+# is thousands of blocking stdout writes per second and shows up as event-loop
+# lag for interactive commands. Turn on only while debugging a single card.
+HOT_PATH_DEBUG = False
+
 # ============ AUTO-RETRY MANAGER ============
 class AutoRetryManager:
     """Automatically retry failed cards with different proxies"""
@@ -14919,11 +14925,12 @@ class ShopifyAPIPool:
                 # /sh and /msh both rotate through the bot's global proxy
                 # pool here (round-robin, a different proxy per attempt).
                 current_proxy = global_proxy_pool.get_next_proxy()
-                if current_proxy:
+                if current_proxy and HOT_PATH_DEBUG:
                     print(f"🔄 [GLOBAL PROXY] {mask_proxy(current_proxy)}")
 
-            print(f"\n🔍 [API POOL] Attempt {attempt} — site: {current_site}")
-            print(f"📊 Sites tried: {len(tried_sites)}/{len(autosopi_site_manager.sites)}")
+            if HOT_PATH_DEBUG:
+                print(f"\n🔍 [API POOL] Attempt {attempt} — site: {current_site}")
+                print(f"📊 Sites tried: {len(tried_sites)}/{len(autosopi_site_manager.sites)}")
 
             api = await self.get_next_api()
             api_name = api["name"]
@@ -15218,8 +15225,9 @@ class ShopifyAPIPool:
                 "site": f"https://{site_clean}",
                 "cc": formatted_card
             }
-            print(f"📤 [BLADESARKS API] {api['url']}")
-            print(f"📤 Params: site=https://{site_clean}, cc={formatted_card[:20]}...")
+            if HOT_PATH_DEBUG:
+                print(f"📤 [BLADESARKS API] {api['url']}")
+                print(f"📤 Params: site=https://{site_clean}, cc={formatted_card[:20]}...")
 
             client_kwargs = {
                 'timeout': httpx.Timeout(45.0, connect=15.0, read=40.0),
@@ -15241,11 +15249,13 @@ class ShopifyAPIPool:
                                 int(port)
                                 client_kwargs['proxy'] = formatted_proxy
                                 using_proxy = True
-                                print(f"🔧 Client proxy: {mask_proxy(formatted_proxy)}")
+                                if HOT_PATH_DEBUG:
+                                    print(f"🔧 Client proxy: {mask_proxy(formatted_proxy)}")
                                 if ':' in auth:
                                     user, password = auth.split(':', 1)
                                     params["proxy"] = f"{host}:{port}:{user}:{password}"
-                                    print(f"🔧 API proxy param: {mask_proxy(params['proxy'])}")
+                                    if HOT_PATH_DEBUG:
+                                        print(f"🔧 API proxy param: {mask_proxy(params['proxy'])}")
                         elif ':' in clean_for_param:
                             p = clean_for_param.split(':')
                             if len(p) == 2 and p[1].isdigit():
@@ -15273,7 +15283,8 @@ class ShopifyAPIPool:
                 )
 
             elapsed = time.time() - start_req
-            print(f"📥 Response: {elapsed:.2f}s | Status: {response.status_code}")
+            if HOT_PATH_DEBUG:
+                print(f"📥 Response: {elapsed:.2f}s | Status: {response.status_code}")
 
             # ============ 407 PROXY AUTH ============
             if response.status_code == 407:
@@ -70231,9 +70242,18 @@ async def autosopi_mass_check_logic(update: Update, context: ContextTypes.DEFAUL
         # ══════════════════════════════════════════════════════════════
         #  PROGRESS UPDATER
         # ══════════════════════════════════════════════════════════════
+        _progress_state = {"last": 0.0}
+
         async def update_progress(current: int, force: bool = False):
-            if not force and current > 0 and current < total and current % 20 != 0:
-                return
+            # Throttled: at most one Telegram edit every 3 s, and only every
+            # 25 cards. Edits used to fire every 20 cards *inside* a held card
+            # slot, flooding the Bot API and delaying interactive replies.
+            if not force:
+                if current > 0 and current < total and current % 25 != 0:
+                    return
+                if time.time() - _progress_state["last"] < 3.0:
+                    return
+            _progress_state["last"] = time.time()
 
             elapsed = int(time.time() - start_time)
             minutes = elapsed // 60
@@ -70307,9 +70327,6 @@ async def autosopi_mass_check_logic(update: Update, context: ContextTypes.DEFAUL
                     elapsed = 0
 
                 processed_count += 1
-                if processed_count % 50 == 0 or processed_count == total:
-                    await update_progress(processed_count)
-
                 return {
                     "idx": idx,
                     "card": card,
@@ -70546,6 +70563,13 @@ async def autosopi_mass_check_logic(update: Update, context: ContextTypes.DEFAUL
 
                 if u_id not in autosopi_active_tasks:
                     break
+
+                # Progress edits happen here — outside the per-card semaphore —
+                # and are time-throttled inside update_progress(). stats
+                # ["processed"] was never incremented, so the "All" counter on
+                # the live keyboard always showed 0.
+                stats["processed"] += 1
+                await update_progress(processed_count)
 
                 card = result_data["card"]
                 result = result_data["result"]
@@ -88955,14 +88979,39 @@ def main():
             print(f"⚠️ Event loop setup: {e}")
     
     # ============ Build application with concurrent updates ============
-    app = Application.builder() \
-        .token(BOT_TOKEN) \
-        .concurrent_updates(True) \
-        .connect_timeout(60.0) \
-        .read_timeout(300.0) \
-        .write_timeout(300.0) \
-        .pool_timeout(60.0) \
-        .build()
+    # Telegram HTTP client tuning.
+    # The default pool (256) was the real bottleneck: while several mass
+    # checks were running, outbound sends (progress edits + hit messages)
+    # occupied every connection, so the long-poll getUpdates had to wait and
+    # new commands were *received* 3-5 s late. A bigger pool plus a proactive
+    # rate limiter (fewer 429s -> fewer RetryAfter sleeps) fixes that.
+    _tg_builder = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .connection_pool_size(512)
+        .get_updates_connection_pool_size(64)
+        .connect_timeout(60.0)
+        .read_timeout(300.0)
+        .write_timeout(300.0)
+        .pool_timeout(20.0)
+    )
+    try:
+        from telegram.ext import AIORateLimiter  # needs the `aiolimiter` package
+
+        _tg_builder = _tg_builder.rate_limiter(
+            AIORateLimiter(
+                overall_max_rate=28,      # Telegram allows ~30 req/s globally
+                overall_time_period=1.0,
+                group_max_rate=0,         # no per-chat queueing: it would
+                group_time_period=0,      # delay /start behind its own edits
+                max_retries=3,            # survive RetryAfter instead of failing
+            )
+        )
+        print("✅ Telegram rate limiter active (28 req/s, retry-aware)")
+    except Exception as _rl_err:
+        print(f"⚠️ Rate limiter unavailable ({_rl_err}) — continuing without it")
+    app = _tg_builder.build()
     
     # ============ CRITICAL: Create and store flood control in bot_data ============
     flood_control = SafeFloodControlManager()
@@ -89100,8 +89149,12 @@ def main():
     app.add_handler(CommandHandler("dork", dork_command))
     
 
-    app.add_handler(CommandHandler("msh", aumc_command))
-    app.add_handler(CommandHandler("sh", single_check_shopify_pool_command))
+    # Heavy, long-running handlers MUST be non-blocking: with block=True each
+    # /msh held an update slot for its whole run, so other commands (and the
+    # next /start) waited behind it. Every other mass gateway already used
+    # block=False — these two were the only exceptions.
+    app.add_handler(CommandHandler("msh", aumc_command, block=False))
+    app.add_handler(CommandHandler("sh", single_check_shopify_pool_command, block=False))
     
 
     
