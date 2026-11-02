@@ -134,6 +134,100 @@ def data_path(filename: str) -> Path:
     return DATA_DIR / filename
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  DEBOUNCED JSON PERSISTENCE  (keeps the event loop free of disk I/O)
+#
+#  WHY: counters like users.json / user_credits.json used to be re-serialised
+#  and rewritten in FULL on every checked card (increment_checks,
+#  increment_hits, deduct_user_credits, ...). With several users mass-checking
+#  at once that is dozens of multi-hundred-KB json.dump() calls per second on
+#  the event loop, so every incoming command sat behind them -> 3-5 s replies.
+#
+#  NOW: mutating code just marks the file dirty. One background thread writes
+#  it at most once per _JSON_WRITE_INTERVAL seconds (atomic tmp + os.replace),
+#  coalescing every update from that window into a single write. Reads never
+#  touch the disk - they use the in-memory dict.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_JSON_WRITE_INTERVAL = 1.0   # seconds; batches bursts of counter updates
+
+
+def _atomic_write_json(path, payload, indent=None) -> None:
+    """Serialise + write one JSON file without ever leaving a half file."""
+    if indent:
+        text = json.dumps(payload, indent=indent)
+    else:
+        # Compact form: ~2-3x faster to serialise and a smaller file.
+        text = json.dumps(payload, separators=(",", ":"))
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+class _DebouncedJSONWriter:
+    """Background, coalescing writer for the bot's JSON state files."""
+
+    def __init__(self, interval: float = _JSON_WRITE_INTERVAL):
+        self._interval = float(interval)
+        self._pending: Dict[str, tuple] = {}
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._thread = threading.Thread(
+            target=self._loop, name="json-persist", daemon=True)
+        self._thread.start()
+        try:
+            atexit.register(self.flush)
+        except Exception:
+            pass
+
+    # -- public API -------------------------------------------------
+    def schedule(self, path, getter, indent=None) -> None:
+        """Queue `path` to be written from the result of `getter()`."""
+        with self._lock:
+            self._pending[str(path)] = (getter, indent)
+        self._wake.set()
+
+    def flush(self) -> None:
+        """Write everything pending right now (shutdown / hard sync)."""
+        with self._lock:
+            items = list(self._pending.items())
+            self._pending.clear()
+        for path, (getter, indent) in items:
+            try:
+                _atomic_write_json(path, getter(), indent)
+            except Exception as e:
+                print(f"⚠️ [PERSIST] flush {path}: {e}")
+
+    # -- internals --------------------------------------------------
+    def _loop(self) -> None:
+        while True:
+            try:
+                self._wake.wait(0.5)
+                self._wake.clear()
+                with self._lock:
+                    if not self._pending:
+                        continue
+                # Coalesce the whole burst into one write.
+                time.sleep(self._interval)
+                with self._lock:
+                    items = list(self._pending.items())
+                    self._pending.clear()
+                for path, (getter, indent) in items:
+                    try:
+                        _atomic_write_json(path, getter(), indent)
+                    except Exception as e:
+                        print(f"⚠️ [PERSIST] {path}: {e}")
+                        with self._lock:
+                            self._pending.setdefault(path, (getter, indent))
+            except Exception as e:  # never let the writer thread die
+                print(f"⚠️ [PERSIST] writer loop: {e}")
+                time.sleep(0.5)
+
+
+_json_writer = _DebouncedJSONWriter()
+
+
 async def download_document_bytes(document, attempts: int = 5, base_delay: float = 2.0):
     """Download a Telegram document's raw bytes as reliably as possible.
 
@@ -321,6 +415,23 @@ MASS_CHECK_BUTTON_ICONS = {
     "all":     "6210757863770426951",  # 🍏 checked
     "stop":    "6282641460093260838",  # 🔴 error
 }
+
+# ══════════════════════════════════════════════════════════════════
+#  RANDOM BUTTON COLOURS for hit notifications
+#  Telegram only allows 3 button colours: success (green),
+#  primary (blue) and danger (red). Everything else is client-side.
+# ══════════════════════════════════════════════════════════════════
+BUTTON_STYLES = ("success", "primary", "danger")
+
+
+def random_button_style(exclude=None) -> str:
+    """Return a random Telegram button colour (green / blue / red).
+
+    exclude: a style to leave out (e.g. the previous colour, so two
+    consecutive buttons in the same row never look identical).
+    """
+    pool = tuple(s for s in BUTTON_STYLES if s != exclude) or BUTTON_STYLES
+    return random.choice(pool)
 
 # ══════════════════════════════════════════════════════════════════
 #  SHARED SINGLE-CHECK RESULT UI  (matches the Braintree Auth style)
@@ -1578,7 +1689,18 @@ if sys.version_info >= (3, 14):
 
 # ============ USER MANAGEMENT ============
 def load_users():
-    """Load users from users.json file"""
+    """Return the live users dict (falls back to reading the file).
+
+    Saves are debounced now, so reading users.json here could return stale
+    data (a user created a second ago would look unknown). The manager's
+    in-memory dict is authoritative.
+    """
+    _um = globals().get("user_manager")
+    if _um is not None:
+        try:
+            return _um.users
+        except Exception:
+            pass
     if Path(USER_DATA_FILE).exists():
         try:
             with open(USER_DATA_FILE, 'r') as f:
@@ -2442,31 +2564,39 @@ async def check_group_membership(update: Update, context: ContextTypes.DEFAULT_T
 
     missing_groups = []
 
-    for group in REQUIRED_GROUPS:
+    # ── Run every get_chat_member CONCURRENTLY ────────────────────────
+    # These used to run one after another, so a single command could wait
+    # 3-5 sequential round-trips (~300 ms each) before the bot even started
+    # working. They are independent, so fire them together.
+    async def _check_one(group):
         try:
             member = await context.bot.get_chat_member(
                 chat_id=group["id"], user_id=user_id
             )
             if member.status not in ("member", "administrator", "creator"):
-                missing_groups.append(group)
                 print(f"🔍 [GroupCheck] {group['name']}: NOT a member")
-            else:
-                print(f"✅ [GroupCheck] {group['name']}: member")
-
+                return group
+            print(f"✅ [GroupCheck] {group['name']}: member")
+            return None
         except Exception as e:
             err = str(e).lower()
             print(f"❌ [GroupCheck] {group['name']} (id={group['id']}): {e}")
-
-            # Treat ANY error as "user might not be a member" → show the button
             if "chat not found" in err:
                 print(f"   ⚠️ Bot is NOT in group '{group['name']}' "
                       f"or the id is wrong. Fix REQUIRED_GROUPS.")
-                # Still show the button — user may still need to join
-                missing_groups.append(group)
-            elif "user not found" in err:
-                missing_groups.append(group)
-            else:
-                missing_groups.append(group)
+            # Treat ANY error as "user might not be a member" → show the button
+            return group
+
+    _results = await asyncio.gather(
+        *(_check_one(g) for g in REQUIRED_GROUPS), return_exceptions=True
+    )
+    for _res in _results:
+        if isinstance(_res, Exception):
+            # gather() itself should not raise, but never let it break a command
+            print(f"❌ [GroupCheck] unexpected error: {_res}")
+            continue
+        if _res is not None:
+            missing_groups.append(_res)
 
     if not missing_groups:
         if len(_MEMBERSHIP_CACHE) > 5000:
@@ -3616,18 +3746,21 @@ async def redeem_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_manager.cache[user_id] = user_data
     
     # ============ BUILD RESPONSE ============
-    remaining_text = f"🔋 <b>Remaining Uses:</b> {remaining_uses}/{max_uses}" if remaining_uses > 0 else "🔋 <b>Key Fully Used</b>"
-    
-    # Add note about one-time use per user
-    one_time_note = "\n\n📌 <i>This key can only be used once per user.</i>"
-    
+    # Premium-emoji icons (ids already used elsewhere in the bot).
+    _check_ic = premium_emoji("6266787022111773140", "✅")   # ✅ approved
+    _clock_ic = premium_emoji("6267229004311303657", "⏱️")   # ⌛ clock
+    _user_ic  = premium_emoji("5307905813451397794", "👤")   # 👤 user
+
+    if remaining_uses > 0:
+        remaining_text = f"🔋 <b>Remaining Uses:</b> {remaining_uses}/{max_uses}"
+    else:
+        remaining_text = "🔋 <b>Key Fully Used</b>"
+
     await update.message.reply_text(
-        f"✅ <b>Successfully activated {tier.upper()} for {duration_text}!</b>\n\n"
-        f"⏱️ <b>Duration:</b> {duration_text}\n"
+        f"{_check_ic} <b>Successfully activated {tier.upper()} for {duration_text}!</b>\n\n"
+        f"{_clock_ic} <b>Duration:</b> {duration_text}\n"
         f"{remaining_text}\n"
-        f"👤 <b>Redeemed By:</b> @{user.username or user.first_name}\n"
-        f"{one_time_note}\n"
-        f"💀 <b>Bot</b> ➛ @BLADESARKS_v4_bot",
+        f"{_user_ic} <b>Redeemed By:</b> @{user.username or user.first_name}",
         parse_mode=ParseMode.HTML
     )
     
@@ -21433,6 +21566,8 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Examples:\n"
             "   <code>/tn paypal 2</code>\n"
             "   <code>/tn Stripe SK Charge 3</code>\n"
+            "   <code>/tn Whop Checkout 1</code>\n"
+            "   <code>/tn Whop Checkout insufficient 1</code>\n"
             "   <code>/tn Shopify Payments VIPER_SNKE 1</code>\n"
             "   <code>/tn Shopify Payments 🎁 1 10m</code>  (auto-repeat 10 min)\n\n"
             "Duration suffix (optional): <code>30s</code> · <code>10m</code> · <code>1h</code>\n"
@@ -21465,10 +21600,22 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Count is the LAST remaining token.
-    try:
+    # Count is the LAST remaining token. As a courtesy, also accept it
+    # sitting one place earlier (e.g. "/tn Whop 1 Checkout") as long as
+    # there is exactly ONE number in the middle, so word order can't
+    # silently break a test send.
+    count = None
+    count_index = None
+    if args and args[-1].isdigit():
         count = int(args[-1])
-    except ValueError:
+        count_index = len(args) - 1
+    else:
+        _nums = [i for i, a in enumerate(args[:-1]) if a.isdigit()]
+        if len(_nums) == 1:
+            count = int(args[_nums[0]])
+            count_index = _nums[0]
+
+    if count is None:
         await message.reply_text(
             "❌ The last value must be a number (the count).\n"
             "Example: <code>/tn Shopify Payments VIPER_SNKE 1</code>",
@@ -21476,7 +21623,7 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    middle = args[:-1]  # everything between /tn and the count
+    middle = args[:count_index] + args[count_index + 1:]  # everything else
 
     # ── Premium emoji handling ─────────────────────────────────────────
     # Pull custom-emoji tokens out of the args before resolving the gateway.
@@ -21489,7 +21636,11 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     custom_emoji_tags = []   # premium <tg-emoji> tags, in the order typed
     gateway_tokens = []      # middle tokens with emoji / ID tokens removed
+    whop_status_override = None   # /tn Whop Checkout insufficient 1
     for tok in middle:
+        if tok.lower() in ("insufficient", "insufficient_funds", "insuff", "funds"):
+            whop_status_override = "INSUFFICIENT FUNDS"
+            continue
         if tok in emoji_lookup:
             custom_emoji_tags.append(tn_premium_emoji_tag(tok, emoji_lookup[tok]))
             continue
@@ -21575,12 +21726,18 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return f'<tg-emoji emoji-id="{eid(key)}">{fallback}</tg-emoji>'
     
     
-    keyboard = [
-        [
-            InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_v4_bot", style='primary', icon_custom_emoji_id="5427168083074628963")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    def build_keyboard() -> InlineKeyboardMarkup:
+        """Fresh BLADESARKS keyboard with a NEW random colour on every hit."""
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "BLADESARKS",
+                    url="https://t.me/BLADESARKS_v4_bot",
+                    style=random_button_style(),
+                    icon_custom_emoji_id="5427168083074628963",
+                )
+            ]
+        ])
 
     # ═══════════════════════════════════════════════════════════════════
     #  Build message body — same format as real hits
@@ -21598,6 +21755,35 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'{sparkle_emoji} <b>Price</b> ➛ {price_display}\n'
             f'{sparkle_emoji} <b>Response</b> ➛ {response_text}\n'
             f'{sparkle_emoji} <b>User</b> ➛ {user_emoji_display or username}\n'
+        )
+
+    # ═══════════════════════════════════════════════════════════════
+    #  WHOP CHECKOUT — its own card, identical to the real Whop hit
+    #  notification sent by send_whop_hit_notification():
+    #      📍 Gateway ➛ Whop Checkout
+    #      💎 Status ➛ CHARGED
+    #      🌸 Response ➛ Payment successful
+    #      👤 User ➛ lencax
+    # ═══════════════════════════════════════════════════════════════
+    is_whop = (gateway_display == "Whop Checkout")
+
+    # Default is the CHARGED card; add the word "insufficient" anywhere
+    # before the count to preview the INSUFFICIENT FUNDS card instead:
+    #     /tn Whop Checkout insufficient 1
+    WHOP_CARDS = {
+        "CHARGED":              ("diamond", "💎", "Payment successful"),
+        "INSUFFICIENT FUNDS":   ("money", "💰", "Insufficient funds"),
+    }
+
+    def build_whop_message(username: str) -> str:
+        """Whop hit card — CHARGED by default, Insufficient Funds on request."""
+        status_text = whop_status_override or "CHARGED"
+        icon_key, icon_fallback, response_text = WHOP_CARDS[status_text]
+        return (
+            f'{pe("toy", "📍")} <b>Gateway</b> ➛ Whop Checkout\n'
+            f'{pe(icon_key, icon_fallback)} <b>Status</b> ➛ {status_text}\n'
+            f'{pe("flower", "🌸")} <b>Response</b> ➛ {response_text}\n'
+            f'{pe("id", "👤")} <b>User</b> ➛ {user_emoji_display or username}\n'
         )
         
        
@@ -21631,8 +21817,10 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         price_display = f"${price_val:.2f}"
         response_text = random.choice(RESPONSES)
 
-        hit_message = build_hit_message(
-            target_username, price_display, response_text
+        hit_message = (
+            build_whop_message(target_username)
+            if is_whop
+            else build_hit_message(target_username, price_display, response_text)
         )
 
         try:
@@ -21640,7 +21828,7 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=HIT_NOTIFICATION_GROUP_ID,
                 text=hit_message,
                 parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup,
+                reply_markup=build_keyboard(),
                 disable_web_page_preview=True,
             )
             sent_ok += 1
@@ -21663,7 +21851,7 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=HIT_NOTIFICATION_GROUP_ID,
                         text=hit_message,
                         parse_mode=ParseMode.HTML,
-                        reply_markup=reply_markup,
+                        reply_markup=build_keyboard(),
                     )
                     sent_ok += 1
                     sent_fail -= 1
@@ -23462,11 +23650,13 @@ def load_user_credits():
     user_credits_loaded = True
 
 
-def save_user_credits():
-    """Save user credits to file"""
+def save_user_credits(immediately: bool = False):
+    """Persist the credits file (debounced - see _DebouncedJSONWriter)."""
     try:
-        with open(CREDITS_FILE, 'w') as f:
-            json.dump(user_credits, f, indent=2)
+        if immediately:
+            _atomic_write_json(CREDITS_FILE, user_credits)
+            return
+        _json_writer.schedule(CREDITS_FILE, lambda: user_credits)
     except Exception as e:
         print(f"⚠️ Error saving credits: {e}")
 
@@ -24736,7 +24926,7 @@ async def send_hit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         keyboard = [
         [
-            InlineKeyboardButton("BUY NOW", url="https://t.me/BLADESARKS_v4_bot", style='success', icon_custom_emoji_id="5197434882321567830")
+            InlineKeyboardButton("BUY NOW", url="https://t.me/BLADESARKS_v4_bot", style=random_button_style(), icon_custom_emoji_id="5197434882321567830")
         ]
 
     ]
@@ -24746,7 +24936,8 @@ async def send_hit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=HIT_NOTIFICATION_GROUP_ID,
                 text=notification,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
             )
             print(f"📢 Manual hit notification sent for user {user_id}")
         
@@ -25016,13 +25207,13 @@ async def send_hit_notification(context: ContextTypes.DEFAULT_TYPE,
     if is_charged:
         keyboard = [
             [
-                InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_v4_bot", style='primary', icon_custom_emoji_id="5427168083074628963"),
+                InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_v4_bot", style=random_button_style(), icon_custom_emoji_id="5427168083074628963"),
             ]
         ]
     else:
         keyboard = [
             [
-                InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_v4_bot", style='primary', icon_custom_emoji_id="5427168083074628963")
+                InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_v4_bot", style=random_button_style(), icon_custom_emoji_id="5427168083074628963")
             ]
         ]
     
@@ -25779,10 +25970,19 @@ class UserManager:
                 return {}
         return {}
 
-    def save_users(self):
+    def save_users(self, immediately: bool = False):
+        """Persist users.json.
+
+        Default is DEBOUNCED: a background thread writes the file at most once
+        per second, so the per-card counter updates (increment_checks /
+        increment_hits / credits_used) never block the event loop.
+        Pass immediately=True for the rare caller that must hit disk now.
+        """
         try:
-            with open(self.data_file, "w", encoding="utf-8") as f:
-                json.dump(self.users, f, indent=2)
+            if immediately:
+                _atomic_write_json(self.data_file, self.users)
+                return
+            _json_writer.schedule(self.data_file, lambda: self.users)
         except Exception as e:
             print(f"\u26A0\uFE0F Error saving users: {e}")
 
@@ -59477,17 +59677,29 @@ async def genkey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Build response with max uses
         max_uses_display = f"🔋 𝗠𝗮𝘅 𝗨𝘀𝗲𝘀 ⌁ {max_uses}"
-        
+
+        # Premium-emoji icons (ids already used elsewhere in the bot).
+        _check_ic = premium_emoji("6266787022111773140", "✅")   # ✅ approved
+        _plan_ic  = premium_emoji("5377336227533969892", "🎯")   # 🎯 target
+        _clock_ic = premium_emoji("6267229004311303657", "⏱️")   # ⌛ clock
+        _tier_ic  = premium_emoji(
+            {
+                "premium": "5427168083074628963",   # 💎 diamond
+                "ultimate": "6235252066554484059",  # 👑 crown
+                "admin": "6235252066554484059",     # 👑 crown
+            }.get(tier, ""),
+            plan_emoji,
+        ) if tier in ("premium", "ultimate", "admin") else plan_emoji
+
         await update.message.reply_text(
-            f"✅ <b>Key Generated!</b>\n\n"
+            f"{_check_ic} <b>Key Generated!</b>\n\n"
             f"🔑 Key: <code>{key}</code>\n"
-            f"🎯 Plan: {plan_emoji} {tier.upper()}\n"
-            f"⏱️ Duration: {duration_text}\n"
-            f"{max_uses_display}\n"
-            f"📅 Expires: {expiry_date}\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"{_plan_ic} Plan: {_tier_ic} {tier.upper()}\n"
+            f"{_clock_ic} Duration: {duration_text}\n"
+            f"{max_uses_display}\n\n"
             f"User can redeem with: <code>/redeem {key}</code>\n\n"
-            f"<i>🔑 This key can be used <b>{max_uses}</b> time{'s' if max_uses > 1 else ''}.</i>",
+            f"<i>🔑 This key can be used <b>{max_uses}</b> "
+            f"time{'s' if max_uses > 1 else ''}.</i>",
             parse_mode=ParseMode.HTML
         )
         
@@ -64347,7 +64559,7 @@ async def send_gift_notification(context: ContextTypes.DEFAULT_TYPE,
     # Add keyboard with BLADESARKS button
     keyboard = [
         [
-            InlineKeyboardButton("BUY NOW", url="https://t.me/BLADESARKS_v4_bot", style='success', icon_custom_emoji_id="5197434882321567830"),
+            InlineKeyboardButton("BUY NOW", url="https://t.me/BLADESARKS_v4_bot", style=random_button_style(), icon_custom_emoji_id="5197434882321567830"),
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -76482,7 +76694,7 @@ async def send_whop_hit_notification(
             f'{pe("id")} <b>User</b> ➛ {user_display}\n'
         )
 
-    keyboard = [[InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_v4_bot", style='primary', icon_custom_emoji_id="5427168083074628963")]]
+    keyboard = [[InlineKeyboardButton("BLADESARKS", url="https://t.me/BLADESARKS_v4_bot", style=random_button_style(), icon_custom_emoji_id="5427168083074628963")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     try:
@@ -79307,6 +79519,31 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
     command = command_text.lower().split()[0].split('@')[0] if command_text else ''
 
     # ══════════════════════════════════════════════════════════════════════
+    # ── PER-COMMAND SWITCH (/off msy) ────────────────────────────────────
+    # Reply commands run from group=1 and therefore never pass through the
+    # @check_gateway decorator. Enforce the same switch here, otherwise
+    # replying to a file with /msy keeps working after /off msy.
+    # ══════════════════════════════════════════════════════════════════════
+    _cmd_name = command.lstrip('/').split('@')[0]
+    if _cmd_name and hasattr(gateway_manager, "is_command_enabled"):
+        try:
+            _cmd_on = gateway_manager.is_command_enabled(_cmd_name)
+        except Exception:
+            _cmd_on = True
+        if not _cmd_on:
+            print(f"🚧 [REPLY] /{_cmd_name} is switched OFF — ignoring reply")
+            try:
+                await update.message.reply_text(
+                    f"🚧 <b>Command turned off</b>\n\n"
+                    f"<code>/{_cmd_name}</code> is currently disabled by the admin.\n\n"
+                    f"Other commands keep working.",
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
+            return True
+
+    # ══════════════════════════════════════════════════════════════════════
     # ── SPECIAL: /stco and /co expect a URL + card ───────────────────────
     # MUST come before the gateway_map lookup, because /stco is not in the map.
     # ══════════════════════════════════════════════════════════════════════
@@ -79752,6 +79989,23 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
         access_gateway = 'stripe_charge'
     elif gateway == 'st1':
         access_gateway = 'st1'
+
+    # ── Gateway switch (/off coustom_charged) — mirrored from check_gateway ──
+    if update.effective_user.id != OWNER_ID:
+        for _gw in {gateway, access_gateway}:
+            try:
+                _gw_on = gateway_manager.is_enabled(_gw)
+            except Exception:
+                _gw_on = True
+            if not _gw_on:
+                print(f"🚧 [REPLY] Gateway '{_gw}' is switched OFF — ignoring reply")
+                await update.message.reply_text(
+                    f"🚧 <b>Gate under maintenance</b>\n\n"
+                    f"The <code>{_gw}</code> gateway is currently disabled.\n\n"
+                    f"Please try again later or use another gateway.",
+                    parse_mode=ParseMode.HTML
+                )
+                return True
 
     if not user_manager.can_access_gateway(user_id, access_gateway):
         tier = user_manager.get_tier(user_id)
@@ -83475,11 +83729,13 @@ def load_user_credits():
     user_credits_loaded = True
 
 
-def save_user_credits():
-    """Save user credits to file"""
+def save_user_credits(immediately: bool = False):
+    """Persist the credits file (debounced - see _DebouncedJSONWriter)."""
     try:
-        with open(CREDITS_FILE, 'w') as f:
-            json.dump(user_credits, f, indent=2)
+        if immediately:
+            _atomic_write_json(CREDITS_FILE, user_credits)
+            return
+        _json_writer.schedule(CREDITS_FILE, lambda: user_credits)
     except Exception as e:
         print(f"⚠️ Error saving credits: {e}")
 
@@ -88150,7 +88406,10 @@ async def perf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for delta, name in rows:
             if delta <= 0.01 or shown >= 6:
                 continue
-            lines.append(f"  {name[:26]} — <b>{delta / window * 100:.0f}%</b>")
+            lines.append(
+                f"  {html.escape(str(name)[:26])} — "
+                f"<b>{delta / window * 100:.0f}%</b>"
+            )
             shown += 1
         if shown == 0:
             lines.append("  <i>all idle</i>")
@@ -88159,21 +88418,32 @@ async def perf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines += [bar, "<b>Child processes (Chromium etc.)</b>"]
         for delta, cname, rss in kids[:6]:
             lines.append(
-                f"  {cname[:22]} — <b>{delta / window * 100:.0f}%</b> · "
+                f"  {html.escape(str(cname)[:22])} — "
+                f"<b>{delta / window * 100:.0f}%</b> · "
                 f"{rss / 1048576:.0f} MB"
             )
 
     lines += [bar, "<b>Top coroutines</b>"]
     if top_coros:
         for q, n in top_coros:
-            lines.append(f"  {q[:34]} ×{n}")
+            # qualnames look like 'Class.method.<locals>.inner' — the '<locals>'
+            # part is an HTML start tag as far as Telegram's parser is
+            # concerned, so it MUST be escaped.
+            lines.append(f"  {html.escape(str(q)[:34])} ×{n}")
     else:
         lines.append("  <i>none</i>")
 
     lines += [bar, f"⚡ {_resp_stats()}"]
     lines += ["💡 90%+ in one thread → that loop; high child procs → stray browser"]
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    text = "\n".join(lines)
+    try:
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        # Never let a formatting quirk kill the command: resend as plain text.
+        print(f"⚠️ [PERF] HTML send failed ({e}); retrying as plain text")
+        plain = html.unescape(re.sub(r"<[^>]+>", "", text))
+        await update.message.reply_text(plain[:4000])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -88850,6 +89120,30 @@ def main():
     # ============ SHUTDOWN HANDLER ============
     import atexit
     atexit.register(lambda: asyncio.run(shutdown()))
+
+    # ============ GLOBAL ERROR HANDLER ============
+    # Without this PTB only prints "No error handlers are registered" and the
+    # update dies silently (e.g. a BadRequest on an odd HTML tag).
+    async def _global_error_handler(update, context):
+        err = context.error
+        print(f"❌ [UNHANDLED] {type(err).__name__}: {err}")
+        try:
+            traceback.print_exception(type(err), err, err.__traceback__)
+        except Exception:
+            pass
+        # A malformed-HTML reply is the most common case: tell the user
+        # instead of leaving them with silence.
+        try:
+            msg = update.effective_message if update else None
+            if msg is not None and "parse entities" in str(err).lower():
+                await msg.reply_text(
+                    "⚠️ This reply contained unsupported formatting and "
+                    "could not be sent. Please report it to the owner."
+                )
+        except Exception:
+            pass
+
+    app.add_error_handler(_global_error_handler)
     
     print("✅ Bot is running! Press Ctrl+C to stop.")
     print("=" * 80)
