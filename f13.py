@@ -14444,6 +14444,87 @@ async def getapi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"✅ Admin {user_id} exported {len(working_apis)} working Shopify APIs via /getapi")
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  /getproxy — download every WORKING proxy of the global pool as .txt
+#  Admin only command.
+#
+#  A proxy counts as WORKING unless the health tracker has marked it dead
+#  (3+ consecutive failures) or it has 10+ failures in a row with no success.
+#  The file is a plain list — one raw proxy per line — so it can be pasted
+#  straight into another bot / checker / proxy manager.
+# ═══════════════════════════════════════════════════════════════════════
+async def getproxy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Export every working proxy from the global pool to a .txt file."""
+    # Silent for non-admins — this command must not even acknowledge itself.
+    if update.effective_user.id != OWNER_ID:
+        return
+
+    message = update.effective_message
+    pool = list(global_proxy_pool.proxies or [])
+
+    if not pool:
+        await message.reply_text(
+            "📋 The global proxy pool is empty.\n\n"
+            "Add proxies with <code>/addglobalproxy</code> or "
+            "<code>/massglobalproxy</code>.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu(),
+        )
+        return
+
+    working, unhealthy = [], []
+    for proxy in pool:
+        stats = global_proxy_pool.proxy_stats.get(proxy, {}) or {}
+        streak = int(stats.get("consecutive_failures", 0) or 0)
+        is_working = bool(stats.get("is_working", True))
+        if is_working and streak < 10:
+            working.append(proxy)
+        else:
+            unhealthy.append(proxy)
+
+    if not working:
+        await message.reply_text(
+            "❌ No working proxies right now.\n\n"
+            f"📊 Pool: {len(pool)} total · 0 working · {len(unhealthy)} unhealthy\n\n"
+            "Run <code>/pt</code> to retest the pool, or add fresh proxies.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu(),
+        )
+        return
+
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # One raw proxy per line — nothing else, so it pastes cleanly.
+    file_content = "\n".join(working)
+    file_bytes = io.BytesIO(file_content.encode("utf-8"))
+    filename = f"working_proxies_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    file_bytes.name = filename
+
+    caption = (
+        "🌐 <b>Working Global Proxies</b>\n\n"
+        f"✅ Working: <b>{len(working)}</b>/{len(pool)}\n"
+        f"⚠️ Unhealthy (excluded): <b>{len(unhealthy)}</b>\n"
+        f"🕒 {now_str}"
+    )
+
+    try:
+        await message.reply_document(
+            document=file_bytes,
+            filename=filename,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_menu(),
+        )
+        print(f"✅ [GETPROXY] Exported {len(working)}/{len(pool)} working proxies to {filename}")
+    except Exception as e:
+        print(f"⚠️ [GETPROXY] send_document failed ({e}); falling back to chat text")
+        # Absolute last resort: send as plain text so the owner still gets them.
+        await message.reply_text(
+            f"{caption}\n\n<pre>{html.escape(file_content[:3500])}</pre>",
+            parse_mode=ParseMode.HTML,
+        )
+
+
 # ============ SET /msh TIER CONCURRENCY - /setcr ============
 async def setcr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -15564,6 +15645,16 @@ class ShopifyAPIPool:
                     "site": site_clean, "proxy_used": proxy,
                     "api_name": api.get('name', 'Unknown')
                 }
+
+            # A 200 here means the proxy tunnel itself works, no matter what
+            # the card verdict is (decline, fake gateway, ...). Recording it
+            # keeps `successes` non-zero so the pool can tell a genuinely dead
+            # proxy from a proxy that merely hit one bad request.
+            if proxy:
+                try:
+                    global_proxy_pool.record_result(proxy, True, elapsed, "connected")
+                except Exception:
+                    pass
 
             try:
                 data = response.json()
@@ -19651,16 +19742,15 @@ def _ext_mark_dead(url: str):
         shown = "proxy"
     print(f"🚫 [EXT] dead proxy blacklisted 30m: {shown}")
 
-    # Also drop it from the global pool for good, so no other flow retries it.
+    # Do NOT delete from the global pool here. Card runs fail for dozens of
+    # reasons (one timeout, a 407 hiccup, a dead API) and permanently dropping
+    # the proxy on the first stumble is what used to empty the pool.
+    # The 30-minute blacklist above is enough; the proxy stays in the pool and
+    # is simply retried later. Health stats are still recorded.
     try:
         for raw in list(global_proxy_pool.proxies):
             if _ext_norm_proxy(raw) == url:
-                global_proxy_pool.proxies.remove(raw)
-                try:
-                    global_proxy_pool.save_proxies()
-                except Exception:
-                    pass
-                print("🗑 [EXT] removed from global proxy pool")
+                global_proxy_pool.record_result(raw, False, 0.0, "ext gateway failure")
                 break
     except Exception:
         pass
@@ -26775,7 +26865,14 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text(
             "🧪 <b>Test Hit Notification</b>\n\n"
             "Usage: <code>/tn &lt;gateway&gt; [username] [emoji] &lt;count&gt; [duration]</code>\n"
-            "Examples:\n"
+            "\n<b>Auto drip</b>\n"
+            "   <code>/tn on</code>      → 1 hit every 1–3 min (Shopify Payments)\n"
+            "   <code>/tn off</code>     → stop the drip\n"
+            "   <code>/tn status</code>  → show drip status\n"
+            "   <code>/addtn 악마</code> → add a username for the drip\n"
+            "   <code>/addtn 악마 | flako</code> → add several\n"
+            "   <code>/addtn list</code> · <code>/addtn clear</code>\n"
+            "\nExamples:\n"
             "   <code>/tn paypal 2</code>\n"
             "   <code>/tn Stripe SK Charge 3</code>\n"
             "   <code>/tn Whop Checkout 1</code>\n"
@@ -26789,6 +26886,15 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     args = list(context.args)
+
+    # ── Auto-drip control: /tn on | off | status ────────────────────────
+    # "on" starts a background drip (one hit every 1–3 min, Shopify
+    # Payments only, usernames from /addtn). Anything else falls through to
+    # the original one-shot /tn behaviour below.
+    _first_arg = (args[0] or "").strip().lower()
+    if _first_arg in ("on", "start", "off", "stop", "status", "state", "info"):
+        await tn_auto_control(update, context, _first_arg)
+        return
 
     # Optional trailing duration → auto-repeat mode. Must be the LAST token
     # (e.g. /tn Shopify Payments 🎁 1 10m), so strip it before reading count.
@@ -27167,11 +27273,425 @@ async def tn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print("=" * 80)
     print(f"🏁 [TN] Done — sent={sent_ok}, failed={sent_fail}")
     print("=" * 80)
-   
-   
-   
-   
-    
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  /tn AUTO MODE  —  "hit drip"
+#
+#  /tn on   → the bot starts sending ONE hit notification at a time, with a
+#             random 1–3 minute delay between every hit, forever (until
+#             /tn off). Only Shopify Payments is used for now — add more
+#             gateways to TN_AUTO_GATEWAYS later.
+#  /tn off  → stop the drip.
+#  /tn status → show whether it is running, the next delay, totals, etc.
+#
+#  Usernames come from /addtn and are picked at random on every hit (never
+#  the same one twice in a row), so the feed looks natural:
+#      /addtn 악마          → add one
+#      /addtn 악마 | flako  → add several at once
+#      /addtn list          → show the list
+#      /addtn remove 악마   → remove one
+#      /addtn clear         → remove all
+#
+#  Everything is persisted to tn_auto_state.json, so a redeploy/restart keeps
+#  the list AND resumes the drip automatically.
+# ═══════════════════════════════════════════════════════════════════════════
+
+TN_AUTO_STATE_FILE = data_path("tn_auto_state.json")
+
+# Gateways the auto-drip is allowed to use. Shopify Payments only for now;
+# just append more names here later (they must exist in TN_GATEWAYS).
+TN_AUTO_GATEWAYS = ["Shopify Payments"]
+
+TN_AUTO_DELAY_MIN = 60    # 1 minute
+TN_AUTO_DELAY_MAX = 180   # 3 minutes
+
+TN_AUTO_STATE_LOCK = threading.Lock()
+_tn_auto_state_cache = None
+_tn_auto_task = None          # asyncio.Task of the running drip
+_tn_auto_stop_event = None    # set to wake the loop immediately on /tn off
+
+
+def tn_auto_default_state() -> dict:
+    return {
+        "running": False,
+        "usernames": [],
+        "index": 0,
+        "sent": 0,
+        "last_sent": 0.0,
+        "next_delay": 0,
+    }
+
+
+def tn_auto_load_state() -> dict:
+    """Load the drip state once and keep it in memory afterwards."""
+    global _tn_auto_state_cache
+    if _tn_auto_state_cache is not None:
+        return _tn_auto_state_cache
+
+    st = tn_auto_default_state()
+    try:
+        if TN_AUTO_STATE_FILE.exists():
+            with open(TN_AUTO_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for k in st:
+                    if k in data:
+                        st[k] = data[k]
+                if not isinstance(st.get("usernames"), list):
+                    st["usernames"] = []
+                st["usernames"] = [str(u) for u in st["usernames"] if str(u).strip()]
+                try:
+                    st["index"] = int(st.get("index") or 0)
+                    st["sent"] = int(st.get("sent") or 0)
+                except Exception:
+                    st["index"], st["sent"] = 0, 0
+    except Exception as e:
+        print(f"⚠️ [TN AUTO] Could not read {TN_AUTO_STATE_FILE}: {e}")
+
+    _tn_auto_state_cache = st
+    return st
+
+
+def tn_auto_save_state() -> None:
+    """Atomically persist the drip state (called at most once per hit)."""
+    st = tn_auto_load_state()
+    try:
+        with TN_AUTO_STATE_LOCK:
+            tmp = str(TN_AUTO_STATE_FILE) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(st, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, str(TN_AUTO_STATE_FILE))
+    except Exception as e:
+        print(f"⚠️ [TN AUTO] Could not save state: {e}")
+
+
+def tn_auto_build_shopify_message(username: str) -> str:
+    """Build a Shopify Payments hit card identical in style to real hits."""
+    price_display = f"{random.uniform(0.50, 5.00):.2f}$"
+    response_text = random.choice(["ORDER_PLACED", "INSUFFICIENT_FUNDS"])
+    sparkle = premium_emoji("5893321843149902412", "✨")
+    diamond = premium_emoji("5427168083074628963", "💎")
+    return (
+        f"<b>Shopify Payments</b> {diamond}\n"
+        f"{sparkle} <b>Price</b> ➛ {price_display}\n"
+        f"{sparkle} <b>Response</b> ➛ {response_text}\n"
+        f"{sparkle} <b>User</b> ➛ {html.escape(str(username))}"
+    )
+
+
+async def tn_auto_send_one(bot, username: str) -> bool:
+    """Send one Shopify Payments hit to the hit-notification group."""
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "BLADESARKS",
+                url="https://t.me/BLADESARKS_v4_bot",
+                style=random_button_style(),
+                icon_custom_emoji_id="5427168083074628963",
+            )
+        ]
+    ])
+
+    text = tn_auto_build_shopify_message(username)
+
+    for attempt in (1, 2):
+        try:
+            await bot.send_message(
+                chat_id=HIT_NOTIFICATION_GROUP_ID,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+            print(f"✅ [TN AUTO] Hit sent — user={username}")
+            return True
+        except Exception as e:
+            err_s = str(e).lower()
+            print(f"❌ [TN AUTO] Send failed (attempt {attempt}): {e}")
+            if attempt == 1 and ("retry after" in err_s or "flood" in err_s):
+                m = re.search(r"retry after (\d+)", err_s)
+                wait_s = int(m.group(1)) if m else 5
+                await asyncio.sleep(wait_s + 1)
+                continue
+            return False
+    return False
+
+
+async def tn_auto_loop(bot):
+    """The drip: one hit, then a random 1–3 min sleep, repeat while running."""
+    global _tn_auto_task
+    st = tn_auto_load_state()
+    print("🚀 [TN AUTO] Drip started")
+    try:
+        while st.get("running"):
+            users = st.get("usernames") or []
+            if not users:
+                print("⚠️ [TN AUTO] No usernames left — stopping drip")
+                st["running"] = False
+                tn_auto_save_state()
+                break
+
+            # Pick a username at RANDOM, but never the same one twice in a
+            # row (when more than one name is configured) — that looks much
+            # more natural than a fixed rotation.
+            idx = random.randrange(len(users))
+            if len(users) > 1:
+                last_idx = int(st.get("index") or 0) % len(users)
+                while idx == last_idx:
+                    idx = random.randrange(len(users))
+            username = users[idx]
+
+            ok = await tn_auto_send_one(bot, username)
+
+            st["index"] = idx
+            if ok:
+                st["sent"] = int(st.get("sent") or 0) + 1
+                st["last_sent"] = time.time()
+
+            delay = random.randint(TN_AUTO_DELAY_MIN, TN_AUTO_DELAY_MAX)
+            st["next_delay"] = delay
+            tn_auto_save_state()
+
+            if not st.get("running"):
+                break
+
+            print(f"⏳ [TN AUTO] Next hit in {delay}s")
+            try:
+                await asyncio.wait_for(_tn_auto_stop_event.wait(), timeout=delay)
+                break  # stop requested during the wait
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
+    except asyncio.CancelledError:
+        print("🛑 [TN AUTO] Drip cancelled")
+        raise
+    except Exception as e:
+        print(f"❌ [TN AUTO] Loop error: {e}")
+        traceback.print_exc()
+    finally:
+        # Only clear the global if it still points at THIS run — a quick
+        # /tn off → /tn on may already have started a fresh task.
+        if _tn_auto_task is asyncio.current_task():
+            _tn_auto_task = None
+        if not st.get("running"):
+            st["next_delay"] = 0
+            tn_auto_save_state()
+        print("🏁 [TN AUTO] Drip stopped")
+
+
+def tn_auto_start_task(bot) -> bool:
+    """(Re)start the background drip task. Returns True if it is running."""
+    global _tn_auto_task, _tn_auto_stop_event
+
+    st = tn_auto_load_state()
+    if not st.get("usernames"):
+        return False
+
+    st["running"] = True
+    tn_auto_save_state()
+
+    if _tn_auto_task is not None and not _tn_auto_task.done():
+        return True
+
+    _tn_auto_stop_event = asyncio.Event()
+    _tn_auto_task = asyncio.create_task(tn_auto_loop(bot))
+    return True
+
+
+def tn_auto_stop_task() -> None:
+    """Stop the drip and wake it up if it is currently sleeping."""
+    global _tn_auto_task, _tn_auto_stop_event
+
+    st = tn_auto_load_state()
+    st["running"] = False
+    st["next_delay"] = 0
+    tn_auto_save_state()
+
+    # Clear the reference FIRST so a following /tn on starts a brand-new task
+    # even if the cancelled one has not finished unwinding yet.
+    task = _tn_auto_task
+    _tn_auto_task = None
+
+    if _tn_auto_stop_event is not None:
+        try:
+            _tn_auto_stop_event.set()
+        except Exception:
+            pass
+        _tn_auto_stop_event = None
+
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def tn_auto_status_text() -> str:
+    st = tn_auto_load_state()
+    users = st.get("usernames") or []
+    running = bool(st.get("running")) and bool(users)
+
+    user_lines = "\n".join(f"   {i+1}. {html.escape(u)}" for i, u in enumerate(users)) or "   (none yet)"
+
+    if running:
+        delay = int(st.get("next_delay") or 0)
+        nxt = f"next hit in ~{delay // 60}m {delay % 60}s" if delay else "sending now…"
+        state_line = f"🟢 <b>RUNNING</b> · {nxt}"
+    else:
+        state_line = "🔴 <b>STOPPED</b>"
+
+    return (
+        "🧪 <b>/tn Auto Drip</b>\n\n"
+        f"{state_line}\n"
+        f"🌐 Gateway: <b>{', '.join(TN_AUTO_GATEWAYS)}</b>\n"
+        f"⏱️ Delay: <b>{TN_AUTO_DELAY_MIN // 60}–{TN_AUTO_DELAY_MAX // 60} min</b> (random)\n"
+        f"📤 Sent so far: <b>{int(st.get('sent') or 0)}</b>\n\n"
+        f"👤 <b>Usernames</b> (random):\n{user_lines}\n\n"
+        "<b>Commands</b>\n"
+        "   <code>/tn on</code> · <code>/tn off</code> · <code>/tn status</code>\n"
+        "   <code>/addtn name</code> · <code>/addtn name1 | name2</code>\n"
+        "   <code>/addtn list</code> · <code>/addtn remove name</code> · <code>/addtn clear</code>"
+    )
+
+
+async def tn_auto_control(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str) -> None:
+    """Handle /tn on | off | status (admin only, already checked by caller)."""
+    message = update.effective_message
+    st = tn_auto_load_state()
+
+    if action in ("status", "state", "info"):
+        await message.reply_text(tn_auto_status_text(), parse_mode=ParseMode.HTML)
+        return
+
+    if action in ("off", "stop"):
+        was_running = bool(st.get("running"))
+        tn_auto_stop_task()
+        await message.reply_text(
+            ("🛑 <b>Auto hit drip stopped.</b>" if was_running
+             else "ℹ️ Auto hit drip is already stopped.") +
+            f"\n\n📤 Total sent: <b>{int(st.get('sent') or 0)}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # action == on / start
+    if not st.get("usernames"):
+        await message.reply_text(
+            "❌ No usernames yet.\n\n"
+            "Add at least one with:\n"
+            "   <code>/addtn 악마</code>\n"
+            "   <code>/addtn 악마 | flako</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if st.get("running") and _tn_auto_task is not None and not _tn_auto_task.done():
+        await message.reply_text(
+            "🟢 Auto hit drip is <b>already running</b>.\n\n" +
+            tn_auto_status_text(),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    st["index"] = 0
+    tn_auto_start_task(context.bot)
+
+    await message.reply_text(
+        "🚀 <b>Auto hit drip started!</b>\n\n"
+        f"🌐 Gateway: <b>{', '.join(TN_AUTO_GATEWAYS)}</b>\n"
+        f"⏱️ One hit every <b>{TN_AUTO_DELAY_MIN // 60}–{TN_AUTO_DELAY_MAX // 60} min</b> (random)\n"
+        f"👤 Usernames: <b>{', '.join(html.escape(u) for u in st['usernames'])}</b>\n\n"
+        "Stop anytime with <code>/tn off</code>.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  /addtn — manage the usernames used by the /tn auto drip
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def addtn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add / list / remove usernames for the /tn auto drip (admin only)."""
+    if update.effective_user.id != OWNER_ID:
+        return  # silent for non-admins
+
+    message = update.effective_message
+    st = tn_auto_load_state()
+    args = list(context.args or [])
+
+    def _save_and_reply(prefix: str):
+        tn_auto_save_state()
+        return message.reply_text(
+            f"{prefix}\n\n" + tn_auto_status_text(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    if not args or args[0].strip().lower() in ("list", "show", "all"):
+        await message.reply_text(tn_auto_status_text(), parse_mode=ParseMode.HTML)
+        return
+
+    sub = args[0].strip().lower()
+
+    if sub in ("clear", "reset", "wipe"):
+        st["usernames"] = []
+        st["index"] = 0
+        # An empty list means nothing left to send — stop the drip too.
+        if st.get("running"):
+            tn_auto_stop_task()
+            st["usernames"] = []
+            st["index"] = 0
+        await _save_and_reply("🧹 <b>Username list cleared.</b>")
+        return
+
+    if sub in ("remove", "del", "delete", "rm"):
+        raw = " ".join(args[1:]).strip()
+        if not raw:
+            await message.reply_text(
+                "Usage: <code>/addtn remove &lt;name&gt;</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        targets = [t.strip().lstrip("@").lower() for t in re.split(r"[|,]", raw) if t.strip()]
+        before = len(st["usernames"])
+        st["usernames"] = [u for u in st["usernames"] if u.lstrip("@").lower() not in targets]
+        st["index"] = 0
+        removed = before - len(st["usernames"])
+        if removed and not st["usernames"] and st.get("running"):
+            # Last name removed — stop the drip rather than sit idle forever.
+            tn_auto_stop_task()
+            st["usernames"] = []
+            st["index"] = 0
+        await _save_and_reply(
+            f"🗑️ Removed <b>{removed}</b> username(s)." if removed
+            else "⚠️ None of those names were in the list."
+        )
+        return
+
+    # Default: add one or more names (separate with | or ,)
+    raw = " ".join(args).strip()
+    names = [n.strip().lstrip("@") for n in re.split(r"[|,]", raw) if n.strip()]
+
+    added, skipped = [], []
+    existing_lower = {u.lstrip("@").lower() for u in st["usernames"]}
+    for n in names:
+        # A single name may itself contain spaces (e.g. "Kim Chi") — only split
+        # on | or , so that stays intact.
+        if n.lower() in existing_lower:
+            skipped.append(n)
+            continue
+        st["usernames"].append(n)
+        existing_lower.add(n.lower())
+        added.append(n)
+
+    if not added:
+        await _save_and_reply("⚠️ Already in the list — nothing new added.")
+        return
+
+    msg = f"✅ Added <b>{len(added)}</b> username(s): <b>{', '.join(html.escape(a) for a in added)}</b>"
+    if skipped:
+        msg += f"\n⚠️ Skipped (already there): {', '.join(html.escape(s) for s in skipped)}"
+    await _save_and_reply(msg)
+
+
 # ============ TORR.IE AUTH GATEWAY (ST1) ============
 
 ST1_SITE_URL = "https://torr.ie"
@@ -37628,7 +38148,14 @@ class GlobalProxyPool:
         self.enabled = True
         self.last_rotation = time.time()
         self.rotation_interval = 30  # Rotate every 30 seconds by default
-        
+
+        # Stats are written at most once every STATS_SAVE_INTERVAL seconds so a
+        # busy mass-check cannot rewrite the JSON file hundreds of times a
+        # second (that used to corrupt/lose the pool).
+        self._stats_save_lock = threading.Lock()
+        self._last_stats_save = 0.0
+        self.STATS_SAVE_INTERVAL = 20.0
+
         # Load from files
         self.load_proxies()
         self.load_stats()
@@ -37636,24 +38163,57 @@ class GlobalProxyPool:
         print(f"🔌 Global Proxy Pool initialized with {len(self.proxies)} proxies")
     
     def load_proxies(self):
-        """Load global proxies from file"""
-        if Path(GLOBAL_PROXIES_FILE).exists():
-            try:
-                with open(GLOBAL_PROXIES_FILE, 'r') as f:
-                    data = json.load(f)
-                    self.proxies = data.get('proxies', [])
-                    self.enabled = data.get('enabled', True)
-                    self.rotation_interval = data.get('rotation_interval', 30)
-                print(f"📦 Loaded {len(self.proxies)} global proxies")
-            except Exception as e:
-                print(f"⚠️ Error loading global proxies: {e}")
-                self.proxies = []
-        else:
+        """Load global proxies from file.
+
+        A corrupt/unreadable file must NEVER silently wipe the pool: the old
+        copy is kept as .bak and reloaded instead of being replaced by [].
+        """
+        path = Path(GLOBAL_PROXIES_FILE)
+        backup = Path(str(GLOBAL_PROXIES_FILE) + ".bak")
+
+        def _read(p):
+            with open(p, 'r', encoding='utf-8') as f:
+                d = json.load(f)
+            if not isinstance(d, dict):
+                raise ValueError("proxy file is not a JSON object")
+            return d
+
+        if not path.exists():
+            if backup.exists():
+                try:
+                    d = _read(backup)
+                    self.proxies = list(d.get('proxies', []) or [])
+                    self.enabled = d.get('enabled', True)
+                    self.rotation_interval = d.get('rotation_interval', 30)
+                    print(f"♻️ Restored {len(self.proxies)} global proxies from .bak")
+                    self.save_proxies()
+                    return
+                except Exception as e:
+                    print(f"⚠️ Backup proxy file also unreadable: {e}")
             self.proxies = []
             self.save_proxies()
+            return
+
+        try:
+            data = _read(path)
+            self.proxies = list(data.get('proxies', []) or [])
+            self.enabled = data.get('enabled', True)
+            self.rotation_interval = data.get('rotation_interval', 30)
+            print(f"📦 Loaded {len(self.proxies)} global proxies")
+        except Exception as e:
+            print(f"⚠️ Error loading global proxies: {e}")
+            try:
+                d = _read(backup)
+                self.proxies = list(d.get('proxies', []) or [])
+                self.enabled = d.get('enabled', True)
+                self.rotation_interval = d.get('rotation_interval', 30)
+                print(f"♻️ Recovered {len(self.proxies)} global proxies from .bak")
+            except Exception as e2:
+                print(f"🚨 Proxy file unreadable and no usable backup: {e2}")
+                self.proxies = []
     
     def save_proxies(self):
-        """Save global proxies to file"""
+        """Atomically save global proxies (tmp + replace, with a .bak copy)."""
         try:
             data = {
                 'proxies': self.proxies,
@@ -37661,8 +38221,20 @@ class GlobalProxyPool:
                 'rotation_interval': self.rotation_interval,
                 'updated_at': time.time()
             }
-            with open(GLOBAL_PROXIES_FILE, 'w') as f:
+            tmp = str(GLOBAL_PROXIES_FILE) + ".tmp"
+            with open(tmp, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            # Keep the previous good file as a fallback.
+            try:
+                if Path(GLOBAL_PROXIES_FILE).exists():
+                    with open(GLOBAL_PROXIES_FILE, 'r', encoding='utf-8') as src, \
+                         open(str(GLOBAL_PROXIES_FILE) + ".bak", 'w', encoding='utf-8') as dst:
+                        dst.write(src.read())
+            except Exception:
+                pass
+            os.replace(tmp, str(GLOBAL_PROXIES_FILE))
         except Exception as e:
             print(f"⚠️ Error saving global proxies: {e}")
     
@@ -37679,12 +38251,21 @@ class GlobalProxyPool:
             self.proxy_stats = {}
     
     def save_stats(self):
-        """Save proxy stats to file"""
+        """Save proxy stats to file (atomic write)."""
         try:
-            with open(GLOBAL_PROXY_STATS_FILE, 'w') as f:
-                json.dump(self.proxy_stats, f, indent=2)
+            with self._stats_save_lock:
+                tmp = str(GLOBAL_PROXY_STATS_FILE) + ".tmp"
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    json.dump(self.proxy_stats, f, indent=2)
+                os.replace(tmp, str(GLOBAL_PROXY_STATS_FILE))
+                self._last_stats_save = time.time()
         except Exception as e:
             print(f"⚠️ Error saving proxy stats: {e}")
+
+    def _save_stats_debounced(self):
+        """Save stats at most once every STATS_SAVE_INTERVAL seconds."""
+        if time.time() - self._last_stats_save >= self.STATS_SAVE_INTERVAL:
+            self.save_stats()
     
     def add_proxy(self, proxy: str) -> bool:
         """Add a proxy to the global pool"""
@@ -37764,14 +38345,19 @@ class GlobalProxyPool:
         return False
     
     def remove_dead_proxies(self) -> int:
-        """Remove all dead proxies (5+ failures, 0 successes)"""
+        """Remove only proxies that are PROVEN dead — never working ones.
+
+        A proxy is dropped only when it failed 10+ times IN A ROW and has
+        never produced a single success since it was added. A single 407, a
+        timeout or one bad mass-check run can no longer delete proxies.
+        """
         removed = 0
         for proxy in self.proxies[:]:
             stats = self.proxy_stats.get(proxy, {})
-            failures = stats.get('failures', 0)
-            successes = stats.get('successes', 0)
-            
-            if failures >= 5 and successes == 0:
+            streak = int(stats.get('consecutive_failures', 0) or 0)
+            successes = int(stats.get('successes', 0) or 0)
+
+            if streak >= 10 and successes == 0:
                 self.proxies.remove(proxy)
                 if proxy in self.proxy_stats:
                     del self.proxy_stats[proxy]
@@ -37780,7 +38366,7 @@ class GlobalProxyPool:
         if removed > 0:
             self.save_proxies()
             self.save_stats()
-            print(f"🗑️ Removed {removed} dead global proxies")
+            print(f"🗑️ Removed {removed} dead global proxies (10+ fails, never worked)")
         
         return removed
     
@@ -37854,6 +38440,7 @@ class GlobalProxyPool:
             }
         
         stats = self.proxy_stats[proxy]
+        stats.setdefault('consecutive_failures', 0)
         stats['total_checks'] += 1
         stats['last_result'] = response_text[:100]
         stats['last_used'] = time.time()
@@ -37861,10 +38448,13 @@ class GlobalProxyPool:
         if success:
             stats['successes'] += 1
             stats['is_working'] = True
+            stats['consecutive_failures'] = 0   # a success clears the streak
         else:
             stats['failures'] += 1
-            # Mark as not working after 3 consecutive failures
-            if stats['failures'] >= 3 and stats['successes'] == 0:
+            stats['consecutive_failures'] = int(stats.get('consecutive_failures', 0)) + 1
+            # Mark as not working after 3 consecutive failures — but do NOT
+            # delete it. Deletion only happens via remove_dead_proxies()/ /pt.
+            if stats['consecutive_failures'] >= 3:
                 stats['is_working'] = False
         
         # Update average response time
@@ -37872,7 +38462,8 @@ class GlobalProxyPool:
         total = stats.get('total_checks', 1)
         stats['avg_response_time'] = ((old_avg * (total - 1)) + response_time) / total
         
-        self.save_stats()
+        # Debounced: one small file write per 20s max, not per card.
+        self._save_stats_debounced()
     
     def get_stats(self) -> str:
         """Get formatted statistics about the global proxy pool"""
@@ -38213,7 +38804,8 @@ async def globalproxy_stats_command(update: Update, context: ContextTypes.DEFAUL
     detailed_stats += "   /globalproxy_on - Enable pool\n"
     detailed_stats += "   /globalproxy_off - Disable pool\n"
     detailed_stats += "   /globalproxy_rotate - Force rotate\n"
-    detailed_stats += "   /globalproxy_clean - Remove dead proxies"
+    detailed_stats += "   /globalproxy_clean - Remove dead proxies\n"
+    detailed_stats += "   /getproxy - Download all working proxies (.txt)"
     
     await update.message.reply_text(detailed_stats, parse_mode=ParseMode.HTML, reply_markup=back_menu())
 
@@ -38329,6 +38921,21 @@ PROXY_TEST_CONCURRENCY = 30
 # visible without reading the server console.
 LAST_PROXY_TEST_ERRORS = {}
 
+# Consecutive failed daily tests per proxy (shared by user lists + tracker).
+# A proxy is only dropped after 3 failed runs IN A ROW — one unlucky run, a
+# rate-limited ip-api or a busy proxy can no longer delete anything.
+_PROXY_TEST_FAIL_STREAK = {}
+
+
+def _test_streak_says_dead(proxy: str, alive: bool) -> bool:
+    """Return True only when this proxy has failed 3 test runs in a row."""
+    if alive:
+        _PROXY_TEST_FAIL_STREAK.pop(proxy, None)
+        return False
+    n = int(_PROXY_TEST_FAIL_STREAK.get(proxy, 0) or 0) + 1
+    _PROXY_TEST_FAIL_STREAK[proxy] = n
+    return n >= 3
+
 
 async def test_single_proxy(proxy: str, timeout: int = PROXY_TEST_TIMEOUT) -> bool:
     """Return True if the proxy routes a request to ANY test target."""
@@ -38382,16 +38989,38 @@ async def run_full_proxy_test() -> dict:
     }
 
     # 1) Global proxy pool ------------------------------------------------
+    # A single failed test NEVER deletes a proxy any more. It has to fail 3
+    # daily tests in a row AND never have worked; otherwise it is only marked
+    # unhealthy so the next run can retest it.
     gp = list(global_proxy_pool.proxies)
     if gp:
         ok, dead = await _test_proxy_list(gp)
-        for d in dead:
+        truly_dead = []
+        for p in dead:
+            stats = global_proxy_pool.proxy_stats.setdefault(p, {})
+            fails = int(stats.get("daily_test_fails", 0) or 0) + 1
+            stats["daily_test_fails"] = fails
+            stats["is_working"] = False
+            if fails >= 3 and int(stats.get("successes", 0) or 0) == 0:
+                truly_dead.append(p)
+        for p in ok:
+            stats = global_proxy_pool.proxy_stats.setdefault(p, {})
+            stats["daily_test_fails"] = 0
+            stats["is_working"] = True
+            stats["consecutive_failures"] = 0
+        try:
+            global_proxy_pool.save_stats()
+        except Exception:
+            pass
+
+        for d in truly_dead:
             try:
                 global_proxy_pool.remove_proxy(d)
             except Exception:
                 pass
         result["global"]["ok"] = len(ok)
-        result["global"]["dead"] = len(dead)
+        result["global"]["dead"] = len(truly_dead)
+        result["global"]["held"] = len(dead) - len(truly_dead)
         result["global"]["errors"] = {
             d: LAST_PROXY_TEST_ERRORS.get(d, "unknown") for d in dead
         }
@@ -38407,6 +39036,9 @@ async def run_full_proxy_test() -> dict:
         if not plist:
             continue
         ok, dead = await _test_proxy_list(plist)
+        for p in ok:
+            _test_streak_says_dead(p, True)
+        dead = [p for p in dead if _test_streak_says_dead(p, False)]
         if dead:
             dead_set = set(dead)
             proxy_manager.user_proxies[uid] = [
@@ -38435,6 +39067,9 @@ async def run_full_proxy_test() -> dict:
         if not plist:
             continue
         ok, dead = await _test_proxy_list(plist)
+        for p in ok:
+            _test_streak_says_dead(p, True)
+        dead = [p for p in dead if _test_streak_says_dead(p, False)]
         if dead:
             dead_set = set(dead)
             autosopi_proxy_tracker.working_proxies[uid] = [
@@ -38453,7 +39088,8 @@ def _proxy_test_summary_text(res: dict) -> str:
     total_dead = g["dead"] + u["dead"] + t["dead"]
     return (
         "✅ <b>Proxy Test Complete</b>\n\n"
-        f"🌐 <b>Global pool</b> ➛ {g['ok']} live · {g['dead']} removed\n"
+        f"🌐 <b>Global pool</b> ➛ {g['ok']} live · {g['dead']} removed · "
+        f"{g.get('held', 0)} kept for retry\n"
         f"👥 <b>User proxies</b> ➛ {u['ok']} live · {u['dead']} removed "
         f"({u['users_touched']} users cleaned)\n"
         f"🧭 <b>Working tracker</b> ➛ {t['ok']} live · {t['dead']} removed\n\n"
@@ -38725,7 +39361,10 @@ async def get_rotating_global_proxy() -> Optional[str]:
         # Check if proxy is marked as dead
         if proxy in global_proxy_pool.proxy_stats:
             stats = global_proxy_pool.proxy_stats[proxy]
-            if stats.get('failures', 0) >= 5 and stats.get('successes', 0) == 0:
+            streak = int(stats.get('consecutive_failures', 0) or 0)
+            # Same conservative rule as remove_dead_proxies: only a proxy that
+            # failed 10+ times in a row and never worked is dropped.
+            if streak >= 10 and int(stats.get('successes', 0) or 0) == 0:
                 print(f"🗑️ [GLOBAL] Removing dead proxy: {mask_proxy(proxy)}")
                 global_proxy_pool.remove_proxy(proxy)
                 continue
@@ -94679,6 +95318,15 @@ def main():
         except Exception as e:
             print(f"⚠️ Scheduler start error: {e}")
         print("✅ Flood control started")
+
+        # Resume the /tn auto drip if it was running before the restart.
+        try:
+            _st = tn_auto_load_state()
+            if _st.get("running") and _st.get("usernames"):
+                tn_auto_start_task(application.bot)
+                print(f"🔁 [TN AUTO] Resumed drip for {len(_st['usernames'])} username(s)")
+        except Exception as _e:
+            print(f"⚠️ [TN AUTO] Resume failed: {_e}")
     
     app.post_init = post_init
     
@@ -94915,6 +95563,7 @@ def main():
     app.add_handler(CommandHandler("bulkaddapi", bulkaddapi_command))
     app.add_handler(CommandHandler("listapis", listapis_command))
     app.add_handler(CommandHandler("getapi", getapi_command))
+    app.add_handler(CommandHandler("getproxy", getproxy_command))
     app.add_handler(CommandHandler("setcr", setcr_command))
     app.add_handler(CommandHandler("cmd", cmd_command))
     app.add_handler(CommandHandler("addcmd", addcmd_command))
@@ -95104,6 +95753,7 @@ def main():
     app.add_handler(CommandHandler("giftstats", gift_stats_command))
     
     app.add_handler(CommandHandler("tn", tn_command))
+    app.add_handler(CommandHandler("addtn", addtn_command))
     app.add_handler(CommandHandler("debugemoji", debugemoji_command))
     
     app.add_handler(CommandHandler("scanfakes", scanfakes_command))
